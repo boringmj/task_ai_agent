@@ -25,7 +25,7 @@ MAX_STEPS = 30
 # 护栏:列目录时最多返回多少项,避免超大目录把上下文撑爆
 MAX_ENTRIES = 200
 # 护栏:单次写入的字节上限,防止模型一口气写爆磁盘
-MAX_WRITE_BYTES = 256 * 1024
+MAX_WRITE_BYTES = 3 * 1024 * 1024
 # 即使在沙箱内,这些文件也禁止读取 —— 纵深防御,防止沙箱里混入密钥文件
 DENY_READ = {".env"}
 
@@ -85,7 +85,7 @@ def read_file(path: str, with_line_numbers: bool = False) -> str:
     target = safe_path(path)
     if target.name in DENY_READ:
         raise PermissionError(f"{target.name} 属于敏感文件,禁止读取")
-    text = target.read_text(encoding="utf-8")[:4000]
+    text = target.read_text(encoding="utf-8")[:3*1024*1024]
     if not with_line_numbers:
         return text
     return "\n".join(f"{i:>4} | {line}" for i, line in enumerate(text.splitlines(), 1))
@@ -306,7 +306,7 @@ TOOLS = [
         "function": {
             "name": "read_file",
             "description": (
-                "读取一个文本文件的内容(最多返回前 4000 个字符)。只能读取工作区内的文件。"
+                "读取一个文本文件的内容(最多返回前 3145728 个字符)。只能读取工作区内的文件。"
                 "准备用 edit_lines 或 insert_lines 按行修改文件前,先带 with_line_numbers=true 读一遍确认行号。"
             ),
             "parameters": {
