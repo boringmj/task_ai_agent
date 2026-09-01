@@ -39,10 +39,10 @@ DENY_READ = {".env"}
 
 # ---- 联网相关的护栏 ----
 FETCH_TIMEOUT = 10.0  # 单次请求超时(秒)
-MAX_FETCH_BYTES = 2 * 1024 * 1024  # 最多下载多少字节,超出直接截断
-MAX_FETCH_CHARS = 20_000  # 正文进上下文的字符上限,别把窗口撑爆
+MAX_FETCH_BYTES = 3 * 1024 * 1024  # 最多下载多少字节,超出直接截断
+MAX_FETCH_CHARS = 3 * 1024 * 1024  # 正文进上下文的字符上限,别把窗口撑爆
 MAX_REDIRECTS = 5  # 最多跟几次跳转,每一跳都要重新校验
-USER_AGENT = "task-ai-agent/0.1 (+https://github.com/boringmj)"
+USER_AGENT = "task-ai-agent/0.1"
 
 # ---- 搜索相关 ----
 # 换搜索服务只改这两个环境变量,不用动代码
@@ -468,11 +468,13 @@ def _search_bocha(query: str, count: int) -> list[dict]:
 
 
 def _search_duckduckgo(query: str, count: int) -> list[dict]:
+    # ddgs 是可选依赖,没装也不影响其他功能,所以放在函数里按需导入。
+    # type: ignore 是给编辑器看的:未安装时的"无法解析导入"属于预期情况。
     try:  # 包名换过几次,新旧都兼容一下
-        from ddgs import DDGS
+        from ddgs import DDGS  # type: ignore[import-not-found]
     except ImportError:
         try:
-            from duckduckgo_search import DDGS
+            from duckduckgo_search import DDGS  # type: ignore[import-not-found]
         except ImportError:
             raise RuntimeError("未安装 DuckDuckGo 依赖,请先执行:pip install ddgs") from None
 
