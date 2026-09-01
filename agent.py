@@ -21,6 +21,8 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from dotenv import load_dotenv
 from openai import OpenAI
+from rich.console import Console
+from rich.markdown import Markdown
 
 load_dotenv()
 
@@ -81,6 +83,9 @@ client = OpenAI(
     api_key=os.environ["DEEPSEEK_API_KEY"],
     base_url="https://api.deepseek.com",
 )
+
+# 负责终端渲染:Markdown 排版、代码高亮,以及 Windows 老控制台的 ANSI 支持
+console = Console()
 
 
 # ---------------- 工具:普通函数 + 一段 JSON Schema 描述 ----------------
@@ -854,7 +859,13 @@ def run(user_input: str, messages: list[dict]) -> str:
             return msg.content or ""
 
         for call in msg.tool_calls:
-            print(f"  ⚙ {call.function.name}({call.function.arguments})")
+            # markup=False:工具参数里的 [ ] 不该被 rich 当成样式标记解析
+            console.print(
+                f"  ⚙ {call.function.name}({call.function.arguments})",
+                style="dim",
+                markup=False,
+                highlight=False,
+            )
             messages.append(
                 {
                     "role": "tool",
@@ -876,11 +887,12 @@ def load_system_prompt() -> str:
 
 def main() -> None:
     messages: list[dict] = [{"role": "system", "content": load_system_prompt()}]
-    print("Agent 已启动,输入 exit 退出。\n")
+    console.print("Agent 已启动,输入 exit 退出。", style="bold")
+    console.print(f"工作区:{ROOT}\n", style="dim")
 
     while True:
         try:
-            user_input = input("你 > ").strip()
+            user_input = console.input("[bold cyan]你 >[/] ").strip()
         except (EOFError, KeyboardInterrupt):
             break
         if not user_input:
@@ -888,7 +900,11 @@ def main() -> None:
         if user_input in {"exit", "quit"}:
             break
 
-        print(f"AI > {run(user_input, messages)}\n")
+        reply = run(user_input, messages)
+        console.print("AI >", style="bold green")
+        # Markdown 要拿到完整文本才能正确解析,所以是等模型说完再一次性渲染
+        console.print(Markdown(reply) if reply.strip() else "(模型没有返回内容)")
+        console.print()
 
 
 if __name__ == "__main__":
