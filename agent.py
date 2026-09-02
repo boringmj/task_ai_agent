@@ -62,6 +62,10 @@ IMG_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
 IMG_MAX_BYTES = 3 * 1024 * 1024  # 单张图片的字节上限,超出拒绝(避免 base64 后撑爆上下文)
 _pending_images: list[str] = []  # 本轮待注入的图片 data URL,img 工具有效时会填一个
 
+# 截屏:最长边会被压缩到这个像素数。视觉模型对大图会内部缩小,原样送 4K 截图
+# 只会浪费图像 token 甚至被拒,所以发送前自己压成小数。
+SCREEN_MAX_DIM = 1280
+
 PROJECT_DIR = Path(__file__).parent.resolve()
 # 系统提示词跟着代码走,不放进沙箱 —— 模型不能读自己的提示词,更不能改
 PROMPT_FILE = PROJECT_DIR / "system_prompt.md"
@@ -1020,6 +1024,50 @@ def img(path: str) -> str:
     return f"图片 {target.name} 已加载({size} 字节),将在下一轮作为图像信息交给模型。"
 
 
+def _image_to_data_url(image) -> str:
+    """把 PIL Image 压缩到最长边不超过 SCREEN_MAX_DIM,再转成 PNG data URL。
+
+    这是回答"大图"问题的核心:屏幕截图通常远超视力模型能接受的分辨率,
+    先在本地压小再发,而不是原样送一个 4K 图给模型内部缩小。
+    """
+    from PIL import Image  # 延迟导入,只在真用到时加载
+
+    if image.mode not in ("RGB", "RGBA"):
+        image = image.convert("RGB")
+    if max(image.size) > SCREEN_MAX_DIM:
+        scale = SCREEN_MAX_DIM / max(image.size)
+        image = image.resize(
+            (max(1, int(image.size[0] * scale)), max(1, int(image.size[1] * scale))),
+            Image.LANCZOS,
+        )
+    from io import BytesIO
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def screen() -> str:
+    """截取整个屏幕,压缩后作为图像交给视觉模型。
+
+    截取的是用户自己的屏幕,属于敏感操作 —— 务必只在用户明确要求查看屏幕、
+    或任务确实依赖当前屏幕内容时才调用。
+    """
+    global _pending_images
+    try:
+        from PIL import ImageGrab  # Windows 原生截屏;延迟导入,非截屏场景不背依赖
+    except ImportError as exc:
+        raise RuntimeError("截屏需要 Pillow,请先执行:pip install Pillow") from exc
+
+    image = ImageGrab.grab()
+    url = _image_to_data_url(image)
+    _pending_images.append(url)
+    size = image.size  # 原始尺寸,用于说明压了多少
+    return (
+        f"已截取全屏(img {size[0]}×{size[1]} → 最长边 {SCREEN_MAX_DIM})。"
+        f"将在下一轮作为图像信息交给模型。"
+    )
+
+
 def _inject_pending_images(messages: list[dict]) -> None:
     """把本轮登记的图片作为 image_url 内容段注入对话,让视觉模型能真正看到。
 
@@ -1058,6 +1106,7 @@ TOOL_FUNCS = {
     "read_memory": read_memory,
     "git": git,
     "img": img,
+    "screen": screen,
     "fetch_url": fetch_url,
     "web_search": web_search,
 }
@@ -1441,6 +1490,18 @@ TOOLS = [
                 },
                 "required": ["path"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "screen",
+            "description": (
+                "截取用户的整个屏幕,压缩后作为图像交给视觉模型。"
+                "只在用户明确要求查看屏幕、或任务确实依赖当前屏幕内容时才调用 —— 这是敏感操作,不要自作主张。"
+                "截图会自动压缩到最长边 1280 像素,不会拿原图超大的分辨率去撑模型。"
+            ),
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
