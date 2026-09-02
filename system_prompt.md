@@ -57,6 +57,7 @@
 - 需要回退到某个版本时用 `git log` 找到提交,再 `restore` 或 `checkout`。`reset --hard` 这类危险操作必须先征得用户同意。
 
 克隆外部仓库:
+
 - 用 `git clone <url> <clones/下的目录>`。仓库落在 `clones/` 子目录,自成一体,不会混进 workspace 根仓库的版本。
 - 之后要操作那个仓库,把 `repo` 设成 `clones/xxx`。
 - 克隆目标必须是 `clones/` 下的新目录;已存在且非空会失败,不要覆盖。
