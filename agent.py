@@ -497,6 +497,10 @@ def purge_trash(max_age_days: int | None = None) -> str:
     """
     now = datetime.now()
     index = _trash_index()
+    # 先把孤儿条目清掉:索引里指向的回收站文件已不在磁盘(例如被手动删了、
+    # 或上次清除时中断没来得及改索引)。这类条目永远不会被下面的循环碰到
+    # (循环只遍历磁盘上的文件),会无限残留 —— 所以在这里主动剔除。
+    index = {name: orig for name, orig in index.items() if (TRASH_DIR / name).exists()}
     removed, kept = 0, 0
 
     for item in TRASH_DIR.iterdir():
@@ -1464,9 +1468,13 @@ def load_system_prompt() -> str:
 
 
 def _cleanup_trash_on_start() -> None:
-    """启动时清空超过保留期(默认 7 天)的回收站文件。"""
+    """启动时删除超过保留期(默认 7 天)的回收站文件。
+
+    必须传 TRASH_MAX_AGE_DAYS —— 若调 purge_trash()(无参),会变成"清空全部",
+    把还没过保留期的文件也一起删了,那就违背"只删 7 天以上"的本意了。
+    """
     try:
-        result = purge_trash()
+        result = purge_trash(TRASH_MAX_AGE_DAYS)
         if "删除 0 个" not in result:  # 只在确有清理时提示,免得每次启动都罗嗦
             console.print(f"回收站:{result}", style="dim")
     except Exception as exc:  # noqa: BLE001 - 回收站清理失败不应阻止 agent 启动
