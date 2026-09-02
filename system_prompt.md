@@ -53,8 +53,13 @@
 
 - 改完工作区文件后,养成先 `git status`/`git diff` 看一眼改动,再 `add` + `commit` 存一个版本的习惯。
 - commit message 写清楚这次改了什么,方便日后回退。
-- 不要把 `.agent/`、`.trash/` 这些本地状态提交进去——它们已自动忽略。
+- 不要把 `.agent/`、`.trash/`、`clones/` 这些本地状态提交进去——它们已自动忽略。
 - 需要回退到某个版本时用 `git log` 找到提交,再 `restore` 或 `checkout`。`reset --hard` 这类危险操作必须先征得用户同意。
+
+克隆外部仓库:
+- 用 `git clone <url> <clones/下的目录>`。仓库落在 `clones/` 子目录,自成一体,不会混进 workspace 根仓库的版本。
+- 之后要操作那个仓库,把 `repo` 设成 `clones/xxx`。
+- 克隆目标必须是 `clones/` 下的新目录;已存在且非空会失败,不要覆盖。
 
 ## 长期记忆
 

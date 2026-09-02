@@ -92,15 +92,19 @@ MEMORY_FILE = ROOT / ".agent" / "memory.md"
 # 仓库建在 workspace 内部(独立于项目根的 .git),元数据在 .git/ 里,整体不出沙箱
 GIT_DIR = ROOT / ".git"
 GIT_MAX_OUTPUT = 20_000  # 单次命令输出进上下文的字符上限
+# 克隆进来的外部仓库统一放这里,每个自成一体,不干扰 workspace 根仓库的自管版本
+CLONES_DIR = ROOT / "clones"
+CLONES_DIR.mkdir(exist_ok=True)
 # 正常管理版本所需的安全指令;不在白名单里的指令一律拒绝(不管 confirm)
 GIT_SAFE = {
     "status", "add", "commit", "log", "diff", "show", "rm", "mv",
-    "branch", "switch", "checkout", "stash", "restore", "ls-files", "init",
+    "branch", "switch", "checkout", "stash", "restore", "ls-files",
+    "init", "rev-parse", "tag",
 }
 # 会改写工作区或历史的:威力中等,执行前必须 confirm=true
 GIT_RISKY = {"reset", "revert", "merge", "pull", "push"}
 # 彻底不可逆或对纯本地版本管理无用:即使用户确认也拒绝
-GIT_FORBIDDEN = {"gc", "clean", "rebase", "clone", "fetch", "remote", "filter-branch"}
+GIT_FORBIDDEN = {"gc", "clean", "rebase", "filter-branch"}
 
 # DeepSeek 兼容 OpenAI 协议,只需要换 base_url
 client = OpenAI(
@@ -278,6 +282,11 @@ def move_file(source: str, destination: str, overwrite: bool = False) -> str:
     if dest.is_dir() and dest != src:
         dest = dest / src.name
 
+    # 源或目标都不能是 agent 的系统目录(.trash/.git/.agent/clones),否则能挪走
+    # 回收站、版本库、记忆,把整个 agent 搞致残 —— move_file 之前漏了这个检查。
+    if _is_system_dir(src) or _is_system_dir(dest):
+        raise PermissionError("不允许移动或重命名 agent 的系统目录(.trash/.git/.agent/clones)。")
+
     if src == dest:
         return f"错误:源路径和目标路径相同({src}),无需移动"
     if src.is_dir() and dest.is_relative_to(src):
@@ -328,8 +337,19 @@ def delete_file(path: str) -> str:
     return f"已把 {target.name} 移入回收站:{dest}(可用 restore_file 还原)"
 
 
-# agent 赖以运作、绝不能删的目录。比"只在递归时检查"严格 —— 任何时候都不许碰
-PROTECTED_DIRS = (ROOT, TRASH_DIR, GIT_DIR, MEMORY_FILE.parent)
+# agent 赖以运作、绝不能删/挪的目录。比"只在递归时检查"严格 —— 任何时候都不许碰
+PROTECTED_DIRS = (ROOT, TRASH_DIR, GIT_DIR, MEMORY_FILE.parent, CLONES_DIR)
+
+
+def _is_system_dir(path: Path) -> bool:
+    """判断一个路径是否是(或位于)agent 的系统目录内。
+
+    注意不能拿 is_relative_to(ROOT) 来判 —— 工作区里每个普通文件都在 ROOT 下,
+    那样会误挡。所以 ROOT 单独用相等判断,其余系统目录用"等于或位于其内"判断。
+    """
+    if path == ROOT:
+        return True
+    return any(path == p or path.is_relative_to(p) for p in PROTECTED_DIRS if p != ROOT)
 
 
 def _trash_dest(name: str) -> Path:
@@ -355,14 +375,12 @@ def delete_dir(path: str, recursive: bool = False) -> str:
     if not target.is_dir():
         raise IsADirectoryError(f"{target} 不是目录,删单个文件请用 delete_file")
 
-    # 用 resolve() 展开后比较,防止 .. 拼出假保护路径。ROOT 本身禁止删
+    # 用 resolve() 展开后比较,防止 .. 拼出假保护路径。系统目录一律拒绝(含 clones/)
     resolved = (ROOT / path).resolve()
     if resolved == ROOT:
         raise PermissionError("不允许删除工作区根目录")
-    if any(resolved.is_relative_to(p) for p in (TRASH_DIR, GIT_DIR, MEMORY_FILE.parent)):
-        raise PermissionError(
-            f"{target} 是 agent 的系统目录(.trash/.git/.agent),不允许删除。"
-        )
+    if _is_system_dir(resolved):
+        raise PermissionError(f"{target} 是 agent 的系统目录(.trash/.git/.agent/clones),不允许删除。")
 
     if not recursive:
         if any(target.iterdir()):
@@ -370,13 +388,6 @@ def delete_dir(path: str, recursive: bool = False) -> str:
                 f"{target} 不是空目录,直接删除会连带删除里面的一切。"
                 f"确认要删除就带 recursive=true 重新调用。"
             )
-    else:
-        # 防止级联删到回收站/系统目录:目标必须是上一层才可比;直接看目标本身或其直接子级
-        # 是否含受保护目录。受保护目录都在工作区根,所以非根目标天然不含它们,这里作为兜底。
-        if resolved in PROTECTED_DIRS:
-            raise PermissionError(f"{target} 是受保护目录,不允许删除。")
-        if any(p.parent == resolved for p in PROTECTED_DIRS):
-            raise PermissionError("目标下包含受保护的子目录,已拒绝。")
 
     dest = _trash_dest(target.name)
     target.rename(dest)
@@ -387,8 +398,9 @@ def delete_dir(path: str, recursive: bool = False) -> str:
 
 # ---------------- 回收站:还原 / 清空 / 自动清理 ----------------
 
-# 回收站里文件的命名是 {原名}.{YYYYMMDD-HHMMSS}[-NN]{后缀},据此解析删除时刻
-_TRASH_TIME_RE = re.compile(r"\.(\d{8}-\d{6})(?:-(\d+))?\.[^.]*$")
+# 回收站条目的命名是 {原名}.{YYYYMMDD-HHMMSS}[-NN][后缀]。目录没有后缀,
+# 所以把 .{后缀} 设成可选的 —— 否则目录的时间戳解析不出来,进了回收站就出不来。
+_TRASH_TIME_RE = re.compile(r"\.(\d{8}-\d{6})(?:-\d+)?(?:\.[^.]*)?$")
 
 
 def _trash_index() -> dict[str, str]:
@@ -452,13 +464,16 @@ def restore_file(trashed_name: str, overwrite: bool = False) -> str:
     这是不可逆的,所以要像 write_file 覆盖那样要求显式声明意图。
     """
     trash_path = safe_path(TRASH_DIR / trashed_name)
-    if not trash_path.is_file():
+    if not trash_path.exists():  # 目录和文件都能还原,不能只看 is_file()
         raise FileNotFoundError(f"回收站里没有 {trashed_name},可先 list_files(.trash, show_hidden=true) 看看")
 
     original = _trash_original_of(trash_path)
     if original.exists():
         if original.is_dir():
-            raise IsADirectoryError(f"原位置 {original} 现在是一个目录,不能覆盖")
+            return (
+                f"原位置 {original} 现在是一个目录,不能覆盖。"
+                f"如果确定旧文件不要了,请先删除或移走当前目录,再还原。"
+            )
         if not overwrite:
             return (
                 f"原位置 {original} 已有同名文件,直接覆盖会丢掉它当前的内容。"
@@ -487,8 +502,6 @@ def purge_trash(max_age_days: int | None = None) -> str:
     for item in TRASH_DIR.iterdir():
         if item.name == TRASH_INDEX_FILE.name:
             continue
-        if item.is_dir():
-            continue
 
         should_remove = False
         if max_age_days is None:
@@ -499,7 +512,11 @@ def purge_trash(max_age_days: int | None = None) -> str:
             should_remove = ts is not None and (now - ts).days >= max_age_days
 
         if should_remove:
-            item.unlink()
+            # 目录和文件都要能删 —— delete_dir 会把目录放进回收站,不能只处理文件
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
             index.pop(item.name, None)
             removed += 1
         else:
@@ -560,7 +577,7 @@ def read_memory() -> str:
 
 
 def _git_run(*args: str) -> subprocess.CompletedProcess:
-    """统一调用 git:固定 --git-dir/--work-tree,并强制英文输出。
+    """在 workspace 根仓库里跑 git:固定工作区,并强制英文输出。
 
     强制 LC_ALL=C 很重要 —— Windows 中文系统下 git 默认按 GBK 输出,和 Python
     的 UTF-8 对不上,内容会被 errors=replace 替换成乱码。英文输出是稳定的。
@@ -569,6 +586,19 @@ def _git_run(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", "-c", "core.quotepath=false",
          "--git-dir", str(GIT_DIR), "--work-tree", str(ROOT), *args],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=env,
+    )
+
+
+def _git_run_in(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    """在任意仓库(克隆进来的或 workspace 根)里跑 git。
+
+    用 -C 让 git 自行发现该目录下的 .git,不预先假定仓库结构。
+    """
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    return subprocess.run(
+        ["git", "-c", "core.quotepath=false", "-C", str(repo), *args],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         env=env,
     )
@@ -589,7 +619,7 @@ def _git_ensure_repo() -> None:
     """
     if _git_is_repo():
         return
-    exclude = ".agent/\n.trash/\n__pycache__/\n"
+    exclude = ".agent/\n.trash/\nclones/\n__pycache__/\n"
     if GIT_DIR.exists():
         # 清掉残缺的 .git(先去掉只读属性,否则 Windows 删不掉)
         for root, dirs, files in os.walk(GIT_DIR, topdown=False):
@@ -611,13 +641,70 @@ def _git_ensure_repo() -> None:
     (GIT_DIR / "info" / "exclude").write_text(exclude, encoding="utf-8")
 
 
-def git(command: str, confirm: bool = False) -> str:
-    """在 workspace 里执行 git 子命令,只能操作工作区内容。
+def _git_clone(repo: Path, *args: str) -> str:
+    """把外部仓库克隆进 CLONES_DIR 下的一个新子目录。
+
+    clone 自带 .git,不需要 workspace 根仓库预先 init —— 这正是之前"自动初始化
+    导致冲突"的根源。所以克隆走这条路,并在克隆后再检查目标是否是个有效仓库。
+    """
+    if not args:
+        raise ValueError("clone 需要一个仓库 URL。")
+
+    url = next((a for a in args[1:] if a.startswith(("http://", "https://"))), None)
+    if url is None:
+        raise PermissionError("clone 只接受以 http:// 或 https:// 开头的 URL。")
+    _assert_public_url(url)  # 复用抓取那套 SSRF 防护:公网才可,不许打内网
+
+    # 目标目录必须显式给出,且落在 CLONES_DIR 下;缺省则直接用仓库名,头、尾都按 URL 来
+    parts = list(args)
+    given_dest = next((i for i, a in enumerate(parts) if a == url), None)
+    dest_arg = parts[given_dest + 1] if given_dest is not None and given_dest + 1 < len(parts) else ""
+
+    if dest_arg:
+        dest = safe_path(dest_arg)
+        if dest == CLONES_DIR or not dest.is_relative_to(CLONES_DIR):
+            raise PermissionError(f"克隆目标必须位于 clones/ 目录内(不能是工作区根),收到:{dest}")
+    else:
+        # 没给目标目录,就按 URL 的仓库名落到 clones/ 下
+        name = url.rstrip("/").split("/")[-1]
+        dest = CLONES_DIR / name
+        parts.append(str(dest))
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and any(dest.iterdir()):
+        raise FileExistsError(f"克隆目标 {dest} 已存在且非空,不能覆盖。换一个名字。")
+
+    result = _git_run_in(repo, *parts)
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        return f"git clone 失败(exit {result.returncode}):\n{output}"
+    return f"已克隆到 {dest}(外部仓库,独立于 workspace 根仓库)。"
+
+
+def git(command: str, confirm: bool = False, repo: str = ".") -> str:
+    """在某个 git 仓库里执行 git 子命令。默认仓库是 workspace 根(自管版本);
+    操作克隆进来的外部仓库时,把 repo 设成如 "clones/adminservice-collaboration"。
 
     不给 shell,只做 argv 级调用,所以不存在命令注入。"命令"是你要执行的 git
     子命令,例如 "status" 或 "commit -am '更新配置'"。
     """
-    _git_ensure_repo()
+    target = (ROOT / repo).resolve()
+    if target == ROOT:
+        # 工作区根仓库:确保已初始化,再走固定的 --git-dir/--work-tree
+        _git_ensure_repo()
+        is_root_repo = True
+    else:
+        # 操作克隆进来的外部仓库:必须是 clones/ 下的、且确认是有效仓库
+        if not target.is_relative_to(CLONES_DIR):
+            raise PermissionError(f"git 只能操作工作区根或 clones/ 下的仓库,收到:{target}")
+        if not target.is_dir():
+            raise FileNotFoundError(f"仓库 {target} 不存在;若是要克隆外部仓库,请用 git clone <url> <clones/下的目录>")
+        check = _git_run_in(target, "rev-parse", "--git-dir")
+        if check.returncode != 0:
+            raise ValueError(f"{target} 不是一个有效的 git 仓库(可能还未完成克隆)。")
+        target = target.resolve()  # 记录真实路径供后续 -C 使用
+        is_root_repo = False
+
     parts = shlex.split(command)  # 转义交给 shlex 处理,别手写 split
     if not parts:
         raise ValueError("git 命令不能为空")
@@ -628,6 +715,12 @@ def git(command: str, confirm: bool = False) -> str:
             f"git {sub} 被禁止:它对纯本地的工作区版本管理无用,或不可逆。"
             f"需要的版本操作优先用 status/add/commit/log/branch/stash。"
         )
+    if sub == "clone":
+        # 克隆只在工作区根做(它往 clones/ 写新仓库),不能在克隆出来的仓库里再克隆
+        if not is_root_repo:
+            raise PermissionError("只能在工作区根仓库里执行 clone,不能嵌套克隆。")
+        return _git_clone(target, *parts)  # 不调用 _git_ensure_repo,避免抢占目标目录
+
     if sub not in GIT_SAFE and sub not in GIT_RISKY:
         # 白名单之外的一律不接受 —— 宁可不放行,也不靠黑名单逐个封
         raise PermissionError(
@@ -639,7 +732,7 @@ def git(command: str, confirm: bool = False) -> str:
             f"请先征求用户同意,确认后再带 confirm=true 重新调用。"
         )
 
-    result = _git_run(*parts)
+    result = _git_run_in(target, *parts) if not is_root_repo else _git_run(*parts)
     output = (result.stdout + result.stderr).strip()
     if result.returncode != 0:
         return f"git {sub} 失败(exit {result.returncode}):\n{output}"
@@ -1227,10 +1320,11 @@ TOOLS = [
         "function": {
             "name": "git",
             "description": (
-                "在工作区里执行 git 子命令,管理工作区内容的版本。这个仓库独立于项目根,只覆盖 workspace 内的文件。"
-                "常用:status 看改动、diff 看具体变更、log 看历史、add 暂存、commit 提交、branch 分支。"
-                "只白名单放行安全指令;reset/merge/pull/push 这类会改动历史或连远程的必须 confirm=true,"
-                "gc/clean/rebase 等被禁止。改完工作区文件后可以先 status 看看改了什么,再 add + commit 存个版本。"
+                "执行 git 子命令。默认(不给 repo)操作工作区根仓库,管 workspace 内容自己的版本。"
+                "clone 外部仓库时用 'clone <url> <clones/下的目录>',仓库会落在 clones/ 下,独立于根仓库。"
+                "操作克隆进来的仓库时,把 repo 设成 'clones/xxx'。"
+                "常用:status、diff、log、add、commit、branch。只白名单放行安全指令;"
+                "reset/merge/pull/push 等会改动历史或连远程的必须 confirm=true。改完文件先 status 看看,再 add + commit 存版本。"
             ),
             "parameters": {
                 "type": "object",
@@ -1242,6 +1336,10 @@ TOOLS = [
                     "confirm": {
                         "type": "boolean",
                         "description": "仅用于会改动 git 历史或连远程的命令(reset/merge/pull/push)。是否已获得用户确认,默认 false",
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "要操作哪个仓库:默认 '.' 是工作区根仓库;操作克隆进来的外部仓库时填 'clones/仓库名'",
                     },
                 },
                 "required": ["command"],
