@@ -18,6 +18,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -1940,6 +1941,33 @@ def _cleanup_trash_on_start() -> None:
         console.print(f"回收站清理失败(不影响使用):{exc}", style="dim")
 
 
+def _read_multiline(prompt: str = "你 > ") -> str:
+    """读取一段多行输入,空行提交 —— 支持粘贴多行并保留换行。
+
+    console.input() 只读单行,没法粘贴多行代码/文本。改为逐行读取,
+    用户输入完(或粘贴完)按一个空行结束。空行只作提交信号,不会进消息。
+    """
+    lines: list[str] = []
+    console.print(prompt, style="bold cyan", end="")
+    while True:
+        try:
+            line = sys.stdin.readline()
+        except KeyboardInterrupt:
+            # 空闲时按 Ctrl+C = 退出程序(而不是反复"已取消")。
+            # None 是退出信号;exec 执行中的 Ctrl+C 由 main 单独处理。
+            console.print()
+            return None
+        except EOFError:
+            break
+        if line == "":  # EOF(Ctrl+D / Ctrl+Z),停止
+            break
+        if line in {"\n", "\r\n"}:  # 空行 = 提交
+            break
+        lines.append(line.rstrip("\r\n"))
+        console.print("… ", style="dim", end="")
+    return "\n".join(lines)
+
+
 def main() -> None:
     messages: list[dict] = [{"role": "system", "content": load_system_prompt()}]
     memory = _read_memory().strip()  # 跨会话记住的关键事实最先注入,始终在场
@@ -1958,20 +1986,31 @@ def main() -> None:
         if n:
             console.print(f"已清理 {n} 个上次残留的容器", style="dim")
     console.print(f"Docker:{'✅ ' if ok else '⚠ 不可用 —— '}{msg}", style="dim" if ok else "yellow")
-    console.print("Agent 已启动,输入 exit 退出。", style="bold")
+    console.print("Agent 已启动。", style="bold")
+    console.print("输入多行:连续输入,最后一个空行提交(支持粘贴)。", style="dim")
+    console.print("执行中 Ctrl+C=取消本轮;空闲时 Ctrl+C=退出;exit 退出。", style="dim")
     console.print(f"工作区:{ROOT}\n", style="dim")
 
     while True:
-        try:
-            user_input = console.input("[bold cyan]你 >[/] ").strip()
-        except (EOFError, KeyboardInterrupt):
+        user_input = _read_multiline()  # 多行读取,空行提交
+        if user_input is None:  # 空闲时 Ctrl+C = 退出
+            console.print("再见。", style="dim")
             break
-        if not user_input:
+        text = user_input.rstrip()  # 去掉粘贴时多带的结尾空行,保留行内缩进
+        if not text.strip():
             continue
-        if user_input in {"exit", "quit"}:
+        if text in {"exit", "quit"}:
             break
 
-        reply = run(user_input, messages)
+        start = len(messages)  # 快照:用于取消时回滚本轮半截改动
+        try:
+            reply = run(text, messages)
+        except KeyboardInterrupt:
+            # Ctrl+C 打断:回滚本轮已写进 messages 的半截内容,回到提示,会话不退出
+            del messages[start:]
+            console.print("\n[已取消]", style="bold red")
+            continue
+
         console.print("AI >", style="bold green")
         # Markdown 要拿到完整文本才能正确解析,所以是等模型说完再一次性渲染
         console.print(Markdown(reply) if reply.strip() else "(模型没有返回内容)")
