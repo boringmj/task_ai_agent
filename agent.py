@@ -75,8 +75,14 @@ def _resolve_workspace() -> Path:
 
 # 沙箱:所有文件操作都被限制在这个目录内
 ROOT = _resolve_workspace()
-# 回收站:删除的文件移到这里,不做真删除
+# 回收站:删除的文件移到这里,不做真删除,超过 MAX_AGE_DAYS 天后启动时自动清空
 TRASH_DIR = ROOT / ".trash"
+TRASH_INDEX_FILE = TRASH_DIR / "index.jsonl"  # 记录 回收站文件名 -> 原路径,支撑还原
+TRASH_MAX_AGE_DAYS = 7
+TRASH_DIR.mkdir(exist_ok=True)
+
+# 长期记忆:agent 在这个文件里记录跨会话保留的关键事实,启动时注入系统提示词
+MEMORY_FILE = ROOT / "memory.md"
 
 # DeepSeek 兼容 OpenAI 协议,只需要换 base_url
 client = OpenAI(
@@ -292,7 +298,6 @@ def delete_file(path: str) -> str:
         raise PermissionError("该文件已在回收站中,不能重复删除")
 
     # 软删除:移进回收站而不是真删,给用户留后悔的余地
-    TRASH_DIR.mkdir(exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     dest = TRASH_DIR / f"{target.stem}.{stamp}{target.suffix}"
     seq = 1
@@ -301,7 +306,176 @@ def delete_file(path: str) -> str:
         seq += 1
 
     target.rename(dest)
-    return f"已把 {target.name} 移入回收站:{dest}(并未真正删除,用户可自行恢复)"
+    _trash_record(dest, target)  # 记下原路径,否则没法还原到原位置
+    return f"已把 {target.name} 移入回收站:{dest}(可用 restore_file 还原)"
+
+
+# ---------------- 回收站:还原 / 清空 / 自动清理 ----------------
+
+# 回收站里文件的命名是 {原名}.{YYYYMMDD-HHMMSS}[-NN]{后缀},据此解析删除时刻
+_TRASH_TIME_RE = re.compile(r"\.(\d{8}-\d{6})(?:-(\d+))?\.[^.]*$")
+
+
+def _trash_index() -> dict[str, str]:
+    """读回 <回收站文件名> -> <原相对路径> 的映射。索引坏了就当作没有,别因此崩掉。"""
+    index: dict[str, str] = {}
+    if TRASH_INDEX_FILE.exists():
+        for line in TRASH_INDEX_FILE.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+                index[entry["trash"]] = entry["original"]
+            except (json.JSONDecodeError, KeyError):
+                continue  # 单条损坏不影响整体
+    return index
+
+
+def _trash_record(trash_path: Path, original: Path) -> None:
+    """把一次删除记进索引:回收站文件名 -> 原路径(相对工作区)。"""
+    index = _trash_index()
+    index.pop(trash_path.name, None)  # 同一名可能被删过多次,后进为准
+    try:
+        index[trash_path.name] = str(original.relative_to(ROOT))
+    except ValueError:
+        index[trash_path.name] = str(original)  # 理论上不该发生,兜底存绝对路径
+    _trash_save(index)
+
+
+def _trash_save(index: dict[str, str]) -> None:
+    lines = [json.dumps({"trash": k, "original": v}, ensure_ascii=False) for k, v in index.items()]
+    TRASH_INDEX_FILE.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _trash_original_of(trash_path: Path) -> Path:
+    """按索引还原原路径;索引缺失时从文件名挽回(stem 是原文件名)。"""
+    original_rel = _trash_index().get(trash_path.name)
+    if original_rel:
+        return (ROOT / original_rel).resolve()
+    match = _TRASH_TIME_RE.search(trash_path.name)
+    if match:
+        stem = trash_path.name[: match.start()]
+        return (ROOT / stem).resolve()
+    return ROOT / trash_path.stem
+
+
+def _trash_timestamp(trash_path: Path) -> datetime | None:
+    """从回收站文件名解析删除时刻,用于判断是否过期。解析不出来返回 None。"""
+    match = _TRASH_TIME_RE.search(trash_path.name)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y%m%d-%H%M%S")
+    except ValueError:
+        return None
+
+
+def restore_file(trashed_name: str, overwrite: bool = False) -> str:
+    """把回收站里的文件还原到它的原路径。
+
+    还原前必须检查原位置是否已有文件 —— 直接覆盖会丢掉用户当前的内容,
+    这是不可逆的,所以要像 write_file 覆盖那样要求显式声明意图。
+    """
+    trash_path = safe_path(TRASH_DIR / trashed_name)
+    if not trash_path.is_file():
+        raise FileNotFoundError(f"回收站里没有 {trashed_name},可先 list_files(.trash, show_hidden=true) 看看")
+
+    original = _trash_original_of(trash_path)
+    if original.exists():
+        if original.is_dir():
+            raise IsADirectoryError(f"原位置 {original} 现在是一个目录,不能覆盖")
+        if not overwrite:
+            return (
+                f"原位置 {original} 已有同名文件,直接覆盖会丢掉它当前的内容。"
+                f"确认要覆盖,就带 overwrite=true 重新调用。"
+            )
+
+    # 先移出来再删索引:如果这一步异常了,索引还在,还能再试一次
+    original.parent.mkdir(parents=True, exist_ok=True)
+    trash_path.replace(original)
+    index = _trash_index()
+    index.pop(trashed_name, None)
+    _trash_save(index)
+    return f"已还原 {trashed_name} -> {original}"
+
+
+def purge_trash(max_age_days: int | None = None) -> str:
+    """永久删除回收站里的文件。
+
+    max_age_days 给定 -> 只删超过该天数的(启动清理用);
+    max_age_days 为空 -> 清空全部,不设保留规则。
+    """
+    now = datetime.now()
+    index = _trash_index()
+    removed, kept = 0, 0
+
+    for item in TRASH_DIR.iterdir():
+        if item.name == TRASH_INDEX_FILE.name:
+            continue
+        if item.is_dir():
+            continue
+
+        should_remove = False
+        if max_age_days is None:
+            should_remove = True  # 显式清空全部
+        else:
+            ts = _trash_timestamp(item)
+            # 只在能确认过期时才删;解析不出时间的文件宁可保留,避免误删
+            should_remove = ts is not None and (now - ts).days >= max_age_days
+
+        if should_remove:
+            item.unlink()
+            index.pop(item.name, None)
+            removed += 1
+        else:
+            kept += 1
+    _trash_save(index)
+
+    note = "全部" if max_age_days is None else f"超过 {max_age_days} 天的"
+    return f"已永久删除回收站{note}文件 {removed} 个,保留 {kept} 个。"
+
+
+# ---------------- 长期记忆 ----------------
+# memory.md 是一次重启时也记得住的关键信息。区别于 messages(只活一个会话),
+# 它会持久化到工作区,下次启动时读回并注入系统提示词。
+# 原理和这个 agent 的记录方式一致:信息人可读、可编辑、可回退。
+
+
+def _read_memory() -> str:
+    if not MEMORY_FILE.exists():
+        return ""
+    return MEMORY_FILE.read_text(encoding="utf-8")
+
+
+def remember(content: str) -> str:
+    """把一条关键事实写进长期记忆。每条追加一行,不覆盖已有记录。"""
+    content = content.strip()
+    if not content:
+        raise ValueError("要记住的内容不能为空")
+    if len(content) > MAX_WRITE_BYTES:
+        raise ValueError("内容过大,单次写入上限由 MAX_WRITE_BYTES 决定")
+
+    # 记内容前先洗一遍:去掉空行,也去掉纯分隔符行(===、--- 这类),
+    # 否则会把记忆文件的结构弄脏
+    lines = [
+        line.strip()
+        for line in content.splitlines()
+        if line.strip() and set(line.strip()) != {"="} and set(line.strip()) != {"-"}
+    ]
+    bullets = "\n".join(f"- {line}" for line in lines)
+    MEMORY_FILE.touch(exist_ok=True)
+
+    with MEMORY_FILE.open("a", encoding="utf-8") as fp:
+        if fp.tell() == 0:  # 第一次写时补个标题
+            fp.write("# 长期记忆\n\n")
+        fp.write(bullets + "\n")
+    return f"已记住 {len(lines)} 行。"
+
+
+def read_memory() -> str:
+    """读取当前的全部长期记忆。"""
+    content = _read_memory().strip()
+    return content if content else "(长期记忆目前是空的,还没有记录任何东西。记住重要信息请用 remember)。"
 
 
 # ---------------- 联网工具 ----------------
@@ -538,6 +712,10 @@ TOOL_FUNCS = {
     "insert_lines": insert_lines,
     "move_file": move_file,
     "delete_file": delete_file,
+    "restore_file": restore_file,
+    "purge_trash": purge_trash,
+    "remember": remember,
+    "read_memory": read_memory,
     "fetch_url": fetch_url,
     "web_search": web_search,
 }
@@ -773,6 +951,80 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "restore_file",
+            "description": (
+                "把回收站里的一个文件还原到它原来的路径。还原前会先检查原位置是否有同名文件:"
+                "如果原位置已被占用,调用会失败并告诉你,此时应当先征求用户同意再带 overwrite=true 重试。"
+                "先用 list_files(path=\".trash\", show_hidden=true) 找到回收站里的确切的文件名再还原。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "trashed_name": {
+                        "type": "string",
+                        "description": "回收站里那个文件的名字(含时间戳后缀),不是原路径",
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "原位置已被同名文件占用时,是否允许覆盖。覆盖不可逆,务必先得到用户确认",
+                    },
+                },
+                "required": ["trashed_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "purge_trash",
+            "description": (
+                "永久删除回收站里的文件。默认清空全部,过期的文件本来也会在启动时自动清理。"
+                "永久删除不可恢复,调用前务必先让用户确认不再需要,不要自作主张。"
+                "只删单个文件的话,应先用 delete_file 删掉,或者先还原再处理。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "max_age_days": {
+                        "type": "integer",
+                        "description": "只删除超过这个天数的文件(用于启动清理);不填则清空回收站",
+                    }
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": (
+                "把一条需要跨会话记住的关键事实写进长期记忆,每次追加,不覆盖已有记录。"
+                "当遇到用户偏好、重要约定、项目背景这类以后还用得到的信息时使用;"
+                "一次性、随风而去的临时信息不要记。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "要记住的内容,支持多行;每行会存成一条记忆",
+                    }
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_memory",
+            "description": "读取当前的全部长期记忆。需要回忆以前记下的关键信息、或确认自己记住了什么时使用。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "fetch_url",
             "description": (
                 "访问一个 http/https 网址并取回内容。HTML 会自动转成纯文本再返回。"
@@ -887,8 +1139,27 @@ def load_system_prompt() -> str:
         raise SystemExit(f"找不到系统提示词文件:{PROMPT_FILE}") from None
 
 
+def _cleanup_trash_on_start() -> None:
+    """启动时清空超过保留期(默认 7 天)的回收站文件。"""
+    try:
+        result = purge_trash()
+        if "删除 0 个" not in result:  # 只在确有清理时提示,免得每次启动都罗嗦
+            console.print(f"回收站:{result}", style="dim")
+    except Exception as exc:  # noqa: BLE001 - 回收站清理失败不应阻止 agent 启动
+        console.print(f"回收站清理失败(不影响使用):{exc}", style="dim")
+
+
 def main() -> None:
     messages: list[dict] = [{"role": "system", "content": load_system_prompt()}]
+    memory = _read_memory().strip()  # 跨会话记住的关键事实最先注入,始终在场
+    if memory:
+        messages.append(
+            {
+                "role": "system",
+                "content": f"以下是跨会话保留的长期记忆,和你的对话无关,仅供参考:\n{memory}",
+            }
+        )
+    _cleanup_trash_on_start()
     console.print("Agent 已启动,输入 exit 退出。", style="bold")
     console.print(f"工作区:{ROOT}\n", style="dim")
 
