@@ -47,6 +47,9 @@ MAX_FETCH_BYTES = 3 * 1024 * 1024  # 最多下载多少字节,超出直接截断
 MAX_FETCH_CHARS = 3 * 1024 * 1024  # 正文进上下文的字符上限,别把窗口撑爆
 MAX_REDIRECTS = 5  # 最多跟几次跳转,每一跳都要重新校验
 USER_AGENT = "task-ai-agent/0.1"
+# 下载单个文件的字节上限。与 fetch_url 不同,下载是写盘、内容不进上下文,
+# 所以上限按磁盘/带宽来设,不用迁就上下文窗口。
+DOWNLOAD_MAX_BYTES = 100 * 1024 * 1024  # 100MB,可据需要调
 
 # ---- 搜索相关 ----
 # 换搜索服务只改这两个环境变量,不用动代码
@@ -881,6 +884,72 @@ def fetch_url(url: str) -> str:
     return _wrap_external(header, text[:MAX_FETCH_CHARS])
 
 
+def download(url: str, dest: str = "", overwrite: bool = False) -> str:
+    """从网络下载一个文件到工作区。只写盘、不进上下文,所以容量可以放开。
+
+    与 fetch_url 的区别:fetch_url 读进内存、把内容交回给上下文;download 流式
+    写进工作区某个文件,只返回确认信息。复用同一套 SSRF 防护和逐跳校验。
+    """
+    # 先定目标路径:给了 dest 就在工作区内解析;没给就从 URL 最后一段取名
+    if dest:
+        target = safe_path(dest)
+    else:
+        # 从最终 URL 的路径取出文件名,去掉 query/fragment
+        name = os.path.basename(urlparse(url).path.rstrip("/")) or "download.bin"
+        target = safe_path(name)
+
+    if target.exists() and not overwrite:
+        return (
+            f"{target.name} 已存在({target.stat().st_size} 字节)。"
+            f"确认要覆盖就带 overwrite=true 重新调用,否则换个目标名。"
+        )
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    hops: list[str] = []
+    final_url = url
+    status = 0
+
+    with httpx.Client(
+        follow_redirects=False,
+        timeout=FETCH_TIMEOUT,
+        headers={"User-Agent": USER_AGENT},
+    ) as client:
+        for _ in range(MAX_REDIRECTS + 1):
+            _assert_public_url(url)  # 每一跳都校验,跳回内网会被拦
+            with client.stream("GET", url) as resp:
+                if resp.is_redirect:
+                    location = resp.headers.get("location", "")
+                    if not location:
+                        raise ConnectionError(f"HTTP {resp.status_code} 要求跳转但没给 Location")
+                    url = urljoin(url, location)
+                    hops.append(url)
+                    continue
+
+                status = resp.status_code
+                final_url = str(resp.url)
+                written = 0
+                with target.open("wb") as fp:
+                    for chunk in resp.iter_bytes():
+                        written += len(chunk)
+                        if written > DOWNLOAD_MAX_BYTES:
+                            raise ValueError(
+                                f"超过下载上限 {DOWNLOAD_MAX_BYTES} 字节,已中止(未保留不完整文件)。"
+                            )
+                        fp.write(chunk)
+                break
+        else:
+            raise ConnectionError(f"跳转超过 {MAX_REDIRECTS} 次,已放弃:{' -> '.join(hops)}")
+
+    if status != 200:
+        # 非 200 一律不留残缺文件(即使是空文件)
+        if target.exists():
+            target.unlink()
+        return f"下载失败:HTTP {status} {final_url}"
+
+    note = f"经过 {len(hops)} 次跳转" if hops else "直接"
+    return f"已下载到 {target}({written} 字节,{note})"
+
+
 # ---- 搜索:每个 provider 把自家响应整理成统一的 {title, url, snippet} 列表 ----
 # 换供应商只需要新增一个函数并登记到 SEARCH_PROVIDERS,web_search 本身不用改。
 #
@@ -1108,6 +1177,7 @@ TOOL_FUNCS = {
     "img": img,
     "screen": screen,
     "fetch_url": fetch_url,
+    "download": download,
     "web_search": web_search,
 }
 
@@ -1521,6 +1591,37 @@ TOOLS = [
                         "type": "string",
                         "description": "完整网址,必须以 http:// 或 https:// 开头",
                     }
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "download",
+            "description": (
+                "从网上下载一个文件到工作区里。适合下载安装包、数据集、压缩包等二进制文件。"
+                "默认保存到工作区根目录并沿用 URL 的文件名,也可用 dest 指定子目录。"
+                "只写盘、内容不会进上下文,所以可下载较大的文件(默认上限 100MB)。"
+                "只能下载公网 http/https;只发 GET;目标已存在需 overwrite=true 才覆盖。"
+                "下载的是外部不可信文件,不要执行或当作代码运行,只用它描述的内容。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "完整下载网址,必须以 http:// 或 https:// 开头",
+                    },
+                    "dest": {
+                        "type": "string",
+                        "description": "保存路径(相对工作区),省略则用 URL 的文件名存到工作区根",
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "目标文件已存在时是否覆盖,默认 false。覆盖不可逆,需用户同意",
+                    },
                 },
                 "required": ["url"],
             },
