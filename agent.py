@@ -1948,23 +1948,25 @@ def _read_multiline(prompt: str = "你 > ") -> str:
     用户输入完(或粘贴完)按一个空行结束。空行只作提交信号,不会进消息。
     """
     lines: list[str] = []
-    console.print(prompt, style="bold cyan", end="")
-    while True:
-        try:
+    try:
+        console.print(prompt, style="bold cyan", end="")
+        while True:
             line = sys.stdin.readline()
-        except KeyboardInterrupt:
-            # 空闲时按 Ctrl+C = 退出程序(而不是反复"已取消")。
-            # None 是退出信号;exec 执行中的 Ctrl+C 由 main 单独处理。
-            console.print()
-            return None
-        except EOFError:
-            break
-        if line == "":  # EOF(Ctrl+D / Ctrl+Z),停止
-            break
-        if line in {"\n", "\r\n"}:  # 空行 = 提交
-            break
-        lines.append(line.rstrip("\r\n"))
-        console.print("… ", style="dim", end="")
+            if line == "":  # EOF(Ctrl+D / Ctrl+Z),停止
+                break
+            if line in {"\n", "\r\n"}:  # 空行 = 提交
+                break
+            lines.append(line.rstrip("\r\n"))
+            console.print("… ", style="dim", end="")
+    except KeyboardInterrupt:
+        # 空闲时 Ctrl+C = 退出信号(返回 None)。
+        # 必须包住整个函数(含提示打印),否则中断落在 console.print 里的
+        # os.get_terminal_size() 时(像这次的栈)会从这个函数逃逸,直接崩掉进程。
+        # 恢复打印用裸 write(不走 Rich),避免 get_terminal_size 又被中断引发二次异常。
+        sys.stdout.write("\n")
+        return None
+    except EOFError:
+        pass
     return "\n".join(lines)
 
 
@@ -1992,29 +1994,35 @@ def main() -> None:
     console.print(f"工作区:{ROOT}\n", style="dim")
 
     while True:
-        user_input = _read_multiline()  # 多行读取,空行提交
-        if user_input is None:  # 空闲时 Ctrl+C = 退出
-            console.print("再见。", style="dim")
-            break
-        text = user_input.rstrip()  # 去掉粘贴时多带的结尾空行,保留行内缩进
-        if not text.strip():
-            continue
-        if text in {"exit", "quit"}:
-            break
-
-        start = len(messages)  # 快照:用于取消时回滚本轮半截改动
         try:
-            reply = run(text, messages)
-        except KeyboardInterrupt:
-            # Ctrl+C 打断:回滚本轮已写进 messages 的半截内容,回到提示,会话不退出
-            del messages[start:]
-            console.print("\n[已取消]", style="bold red")
-            continue
+            user_input = _read_multiline()  # 多行读取,空行提交
+            if user_input is None:  # 空闲时 Ctrl+C = 退出
+                console.print("再见。", style="dim")
+                break
+            text = user_input.rstrip()  # 去掉粘贴时多带的结尾空行,保留行内缩进
+            if not text.strip():
+                continue
+            if text in {"exit", "quit"}:
+                break
 
-        console.print("AI >", style="bold green")
-        # Markdown 要拿到完整文本才能正确解析,所以是等模型说完再一次性渲染
-        console.print(Markdown(reply) if reply.strip() else "(模型没有返回内容)")
-        console.print()
+            start = len(messages)  # 快照:用于取消时回滚本轮半截改动
+            try:
+                reply = run(text, messages)
+            except KeyboardInterrupt:
+                # 执行中 Ctrl+C:回滚半截对话,回到提示,会话不退出
+                del messages[start:]
+                console.print("\n[已取消]", style="bold red")
+                continue
+
+            console.print("AI >", style="bold green")
+            # Markdown 要拿到完整文本才能正确解析,所以是等模型说完再一次性渲染
+            console.print(Markdown(reply) if reply.strip() else "(模型没有返回内容)")
+            console.print()
+        except KeyboardInterrupt:
+            # 兜底:任何没被上面捕获的 Ctrl+C(例如渲染 Markdown 那一下),
+            # 一律干净退出,而不是抛栈崩掉。
+            console.print("\n再见。", style="dim")
+            break
 
 
 if __name__ == "__main__":
