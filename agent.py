@@ -18,6 +18,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import uuid
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -50,6 +51,15 @@ USER_AGENT = "task-ai-agent/0.1"
 # 下载单个文件的字节上限。与 fetch_url 不同,下载是写盘、内容不进上下文,
 # 所以上限按磁盘/带宽来设,不用迁就上下文窗口。
 DOWNLOAD_MAX_BYTES = 100 * 1024 * 1024  # 100MB,可据需要调
+
+# ---- 容器执行(Docker 沙箱)相关 ----
+# 安全项全部硬编码在 _docker_run 里,不给 agent 配置入口。
+DOCKER_IMAGE = os.environ.get("DOCKER_IMAGE", "python:3.11-slim")
+DOCKER_TIMEOUT = 60  # 单次容器执行的超时(秒),超时按容器名 kill
+DOCKER_OUTPUT_MAX = 10_000  # 输出进上下文的字符上限
+DOCKER_MEMORY = "1g"
+DOCKER_CPUS = "2.0"
+DOCKER_PIDS = 200
 
 # ---- 搜索相关 ----
 # 换搜索服务只改这两个环境变量,不用动代码
@@ -1157,6 +1167,90 @@ def _inject_pending_images(messages: list[dict]) -> None:
     _pending_images.clear()
 
 
+# ---------------- 容器执行(Docker 沙箱) ----------------
+# 让 agent 运行任意 Python/命令,但全程关在容器里:只挂 workspace,非 root,
+# 无特权,cap-drop,资源封顶,超时强杀。网络默认开启(用户接受,便于装包干活)。
+
+
+def _docker_health() -> tuple[bool, str]:
+    """检查 Docker 是否可用:CLI 在不在、守护进程通不通。返回 (可用, 说明)."""
+    if shutil.which("docker") is None:
+        return False, "未找到 docker 命令(请确认 Docker 已安装并在 PATH 中)"
+    try:
+        r = subprocess.run(
+            ["docker", "version", "--format", "{{.Server.Version}}"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Docker 守护进程不可达:{exc}"
+    if r.returncode != 0:
+        return False, f"Docker 守护进程不可达(cmn:{r.stderr.strip()[:120]})"
+    return True, f"Docker 就绪(server {r.stdout.strip()})"
+
+
+def _docker_image_present() -> bool:
+    """镜像是否已在本地。没在的话 docker run 第一次会自动拉(需网络)。"""
+    r = subprocess.run(
+        ["docker", "image", "inspect", DOCKER_IMAGE],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
+    )
+    return r.returncode == 0
+
+
+def _docker_run(inner: list[str]) -> str:
+    """在容器里执行,安全项硬编码。inner 是镜像之后的命令(如 ['python','-c','...'])."""
+    ok, err = _docker_health()
+    if not ok:
+        return f"错误:Docker 不可用 —— {err}(启动 Docker Desktop 后重试)"
+
+    name = f"agent-exec-{uuid.uuid4().hex[:10]}"
+    cmd = [
+        "docker", "run", "--rm",
+        "--name", name,
+        "--cap-drop", "ALL",                      # 去掉内核能力,减少逃逸面
+        "--security-opt", "no-new-privileges",
+        "--user", "1000:1000",                    # 非 root
+        "--memory", DOCKER_MEMORY,
+        "--cpus", DOCKER_CPUS,
+        "--pids-limit", str(DOCKER_PIDS),
+        "--tmpfs", "/tmp",
+        "-e", "HOME=/tmp",
+        "-v", f"{ROOT}:/workspace", "-w", "/workspace",  # 唯一挂载:只给 workspace
+        DOCKER_IMAGE,
+        *inner,
+    ]
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=DOCKER_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        subprocess.run(["docker", "kill", name], capture_output=True, timeout=10)
+        return f"执行超时(>{DOCKER_TIMEOUT}s),已终止容器。"
+
+    out, err = r.stdout.strip(), r.stderr.strip()
+    # 成功只返回 stdout(真正的结果);Docker 拉镜像的进度在 stderr,不该混进结果。
+    # 失败才带上 stderr(真正的报错)。
+    if r.returncode != 0:
+        body = err or out
+        return f"执行失败(exit {r.returncode}):\n{(body[:DOCKER_OUTPUT_MAX] or '(无输出)')}"
+    return (out[:DOCKER_OUTPUT_MAX] if out else "(容器无输出)")
+
+
+def run_python(code: str) -> str:
+    """在隔离容器里执行一段 Python 代码,只能访问工作区,不碰宿主其他内容."""
+    if not code.strip():
+        raise ValueError("Python 代码不能为空")
+    return _docker_run(["python", "-c", code])
+
+
+def run_command(command: str) -> str:
+    """在隔离容器里执行一条 shell 命令,同样只访问工作区.给 agent 装包、跑工具。"""
+    if not command.strip():
+        raise ValueError("命令不能为空")
+    return _docker_run(["/bin/sh", "-c", command])
+
+
 TOOL_FUNCS = {
     "get_current_time": get_current_time,
     "read_file": read_file,
@@ -1178,6 +1272,8 @@ TOOL_FUNCS = {
     "screen": screen,
     "fetch_url": fetch_url,
     "download": download,
+    "run_python": run_python,
+    "run_command": run_command,
     "web_search": web_search,
 }
 
@@ -1630,6 +1726,56 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "run_python",
+            "description": (
+                "在安全的 Docker 隔离容器里执行一段 Python 代码。适合数据分析、计算、"
+                "处理工作区文件 —— 你已有的工具做不到的运算用这个。"
+                "容器只能访问工作区、非 root、无内核特权、资源封顶、超时强杀;"
+                "执行完容器即销毁,不会留下任何东西。"
+                "输出会截断到 1 万字符。需要第三方库时,可以先用 pip 装(容器断网则装不了,"
+                "但网络默认开启,可 pip install --user 所需库)。"
+                "注意路径:容器里的工作区在 /workspace,代码里用相对文件名或 /workspace/... 路径,"
+                "别用文件工具返回的宿主路径(如 D:\\...),那在容器里不存在。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "要执行的 Python 代码,可以多行",
+                    }
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": (
+                "在安全的 Docker 隔离容器里执行一条 shell 命令。适合在环境里跑工具、"
+                "装包、查看容器内情况。容器只能访问工作区、非 root、无内核特权、资源封顶、"
+                "超时强杀,执行完即销毁。"
+                "输出截断到 1 万字符。注意:命令里访问的工作区之外的路径,是容器自己的文件系统,"
+                "不是你宿主的 —— 它动不了宿主。容器里的工作区在 /workspace,用相对名或 /workspace/... 路径,"
+                "别用宿主路径(如 D:\\...)。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "要执行的 shell 命令,例如 'ls -la' 或 'pip install --user pandas'",
+                    }
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "web_search",
             "description": (
                 "用关键词搜索互联网,返回若干条标题、网址和摘要。"
@@ -1669,6 +1815,11 @@ def dispatch(name: str, arguments: str) -> str:
 
 
 # ---------------- 核心循环 ----------------
+
+
+# ---------------- 容器执行(Docker 沙箱) ----------------
+# 让 agent 运行任意 Python/命令,但全程关在容器里:只挂 workspace,非 root,
+# 无特权,cap-drop,资源封顶,超时强杀。网络默认开启(用户接受,便于装包干活)。
 
 
 def run(user_input: str, messages: list[dict]) -> str:
@@ -1751,6 +1902,9 @@ def main() -> None:
             }
         )
     _cleanup_trash_on_start()
+    # 预处理 Docker 健康状态(非阻断):可用则提示,不可用仅警告,agent 照常启动
+    ok, msg = _docker_health()
+    console.print(f"Docker:{'✅ ' if ok else '⚠ 不可用 —— '}{msg}", style="dim" if ok else "yellow")
     console.print("Agent 已启动,输入 exit 退出。", style="bold")
     console.print(f"工作区:{ROOT}\n", style="dim")
 
