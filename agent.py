@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import base64
 import html as html_lib
 import ipaddress
 import json
@@ -30,7 +31,7 @@ from rich.markdown import Markdown
 load_dotenv()
 
 # deepseek-chat 支持工具调用;deepseek-reasoner(R1)目前不支持 tools
-MODEL = "deepseek-v4-flash"
+MODEL = "deepseek-v4-flash-vision-exp"
 # 护栏:一次提问最多允许几轮"模型 <-> 工具"往返,防止死循环烧钱
 MAX_STEPS = 30
 # 护栏:列目录时最多返回多少项,避免超大目录把上下文撑爆
@@ -54,6 +55,12 @@ SEARCH_API_KEY = os.environ.get("SEARCH_API_KEY", "").strip()
 MAX_SEARCH_RESULTS = 10  # 单次搜索最多返回几条
 MAX_SEARCHES_PER_TURN = 5  # 单轮对话最多搜几次 —— agent 会自动循环,必须自带刹车
 MAX_SNIPPET_CHARS = 500  # 每条摘要的字符上限
+
+# ---- 图像(多模态)相关 ----
+IMG_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+            ".webp": "image/webp", ".gif": "image/gif"}
+IMG_MAX_BYTES = 3 * 1024 * 1024  # 单张图片的字节上限,超出拒绝(避免 base64 后撑爆上下文)
+_pending_images: list[str] = []  # 本轮待注入的图片 data URL,img 工具有效时会填一个
 
 PROJECT_DIR = Path(__file__).parent.resolve()
 # 系统提示词跟着代码走,不放进沙箱 —— 模型不能读自己的提示词,更不能改
@@ -970,6 +977,69 @@ def web_search(query: str, count: int = 5) -> str:
     return _wrap_external(header, "\n\n".join(lines))
 
 
+def _img_magic_ok(ext: str, data: bytes) -> bool:
+    """按扩展名校验文件头(魔数),确认真的是那种格式的图片。
+
+    只信扩展名不够 —— 一个 .jpg 的文本文件也能通过,交给视觉模型会在 API 层
+    报错,不如在这里就拦掉。零依赖,自己读文件头。
+    """
+    if ext == ".png":
+        return data.startswith(b"\x89PNG\r\n\x1a\n")
+    if ext in (".jpg", ".jpeg"):
+        return data.startswith(b"\xff\xd8\xff")
+    if ext == ".gif":
+        return data.startswith(b"GIF8")
+    if ext == ".webp":
+        return data.startswith(b"RIFF") and data[8:12] == b"WEBP"
+    return False
+
+
+def img(path: str) -> str:
+    """把工作区里的图片转成 data URL,登记到待注入队列,供下一轮模型以 image_url 查看。
+
+    工具返回值只能存文本,塞不进 image_url;所以这里不返回 base64 字符串,
+    只登记数据,由 run() 在下次调用模型前把它作为 content 里的 image_url 段注入。
+    """
+    global _pending_images
+    target = safe_path(path)
+    if not target.is_file():
+        raise FileNotFoundError(f"{target} 不存在或不是文件")
+    ext = target.suffix.lower()
+    if ext not in IMG_MIME:
+        raise ValueError(f"不支持的图片格式 {ext},支持:{'、'.join(sorted(IMG_MIME))}")
+    size = target.stat().st_size
+    if size > IMG_MAX_BYTES:
+        raise ValueError(f"图片过大({size} 字节),上限 {IMG_MAX_BYTES} 字节")
+
+    data = target.read_bytes()
+    if not _img_magic_ok(ext, data):
+        raise ValueError(f"{target.name} 的文件头与 {ext} 格式不符,可能不是有效的 {ext} 图片。")
+
+    b64 = base64.b64encode(data).decode("ascii")
+    _pending_images.append(f"data:{IMG_MIME[ext]};base64,{b64}")
+    return f"图片 {target.name} 已加载({size} 字节),将在下一轮作为图像信息交给模型。"
+
+
+def _inject_pending_images(messages: list[dict]) -> None:
+    """把本轮登记的图片作为 image_url 内容段注入对话,让视觉模型能真正看到。
+
+    图像只能出现在消息的 content 列表里(tool 结果只能是字符串),所以单独
+    追加一条带图像内容的消息,而不是塞进工具返回值。
+    """
+    if not _pending_images:
+        return
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                [{"type": "text", "text": "(以下为 img 工具加载的图片,请据此处理当前任务。)"}]
+                + [{"type": "image_url", "image_url": {"url": u}} for u in _pending_images]
+            ),
+        }
+    )
+    _pending_images.clear()
+
+
 TOOL_FUNCS = {
     "get_current_time": get_current_time,
     "read_file": read_file,
@@ -987,6 +1057,7 @@ TOOL_FUNCS = {
     "remember": remember,
     "read_memory": read_memory,
     "git": git,
+    "img": img,
     "fetch_url": fetch_url,
     "web_search": web_search,
 }
@@ -1353,6 +1424,28 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "img",
+            "description": (
+                "把工作区里的一张图片加载进来,让视觉模型真正看到它的内容。"
+                "当用户提到本地图片、或者需要你查看/分析一张图片(截图、图、图表等)时使用。"
+                "支持 jpg/png/webp/gif,单张不超过 3MB。图片会在下一轮以图像形式交给你。"
+                "加载前先确认图片在工作区内(可以用 list_files 找)。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "要加载的图片路径(相对工作区),例如 screenshot.png",
+                    }
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "fetch_url",
             "description": (
                 "访问一个 http/https 网址并取回内容。HTML 会自动转成纯文本再返回。"
@@ -1417,8 +1510,9 @@ def dispatch(name: str, arguments: str) -> str:
 
 
 def run(user_input: str, messages: list[dict]) -> str:
-    global _searches_this_turn
+    global _searches_this_turn, _pending_images
     _searches_this_turn = 0  # 搜索配额按轮重置,而不是整个会话共用一份
+    _pending_images = []  # 图像也按轮清空,避免上一轮的图带到下一轮
 
     messages.append({"role": "user", "content": user_input})
 
@@ -1455,6 +1549,9 @@ def run(user_input: str, messages: list[dict]) -> str:
                     "content": dispatch(call.function.name, call.function.arguments),
                 }
             )
+
+        # 这一轮若调用了 img,把登记好的图片作为 image_url 注入,给下一轮模型看
+        _inject_pending_images(messages)
 
     return f"(已达到最大步数 {MAX_STEPS},中止)"
 
