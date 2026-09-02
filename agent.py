@@ -13,7 +13,10 @@ import ipaddress
 import json
 import os
 import re
+import shlex
+import shutil
 import socket
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -82,7 +85,22 @@ TRASH_MAX_AGE_DAYS = 7
 TRASH_DIR.mkdir(exist_ok=True)
 
 # 长期记忆:agent 在这个文件里记录跨会话保留的关键事实,启动时注入系统提示词
-MEMORY_FILE = ROOT / "memory.md"
+# 放在 .agent/ 隐藏目录,避免出现在用户的日常浏览里(list_files 默认过滤点开头项)
+MEMORY_FILE = ROOT / ".agent" / "memory.md"
+
+# ---- git:工作区内容的版本管理 ----
+# 仓库建在 workspace 内部(独立于项目根的 .git),元数据在 .git/ 里,整体不出沙箱
+GIT_DIR = ROOT / ".git"
+GIT_MAX_OUTPUT = 20_000  # 单次命令输出进上下文的字符上限
+# 正常管理版本所需的安全指令;不在白名单里的指令一律拒绝(不管 confirm)
+GIT_SAFE = {
+    "status", "add", "commit", "log", "diff", "show", "rm", "mv",
+    "branch", "switch", "checkout", "stash", "restore", "ls-files", "init",
+}
+# 会改写工作区或历史的:威力中等,执行前必须 confirm=true
+GIT_RISKY = {"reset", "revert", "merge", "pull", "push"}
+# 彻底不可逆或对纯本地版本管理无用:即使用户确认也拒绝
+GIT_FORBIDDEN = {"gc", "clean", "rebase", "clone", "fetch", "remote", "filter-branch"}
 
 # DeepSeek 兼容 OpenAI 协议,只需要换 base_url
 client = OpenAI(
@@ -310,6 +328,63 @@ def delete_file(path: str) -> str:
     return f"已把 {target.name} 移入回收站:{dest}(可用 restore_file 还原)"
 
 
+# agent 赖以运作、绝不能删的目录。比"只在递归时检查"严格 —— 任何时候都不许碰
+PROTECTED_DIRS = (ROOT, TRASH_DIR, GIT_DIR, MEMORY_FILE.parent)
+
+
+def _trash_dest(name: str) -> Path:
+    """生成回收站里的唯一目标名,时间戳冲突时加序号。delete_file / delete_dir 共用。"""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = TRASH_DIR / f"{name}.{stamp}"
+    seq = 1
+    while dest.exists():
+        dest = TRASH_DIR / f"{name}.{stamp}-{seq}"
+        seq += 1
+    return dest
+
+
+def delete_dir(path: str, recursive: bool = False) -> str:
+    """删除工作区里的一个目录(软删除,移入 .trash/)。
+
+    目录必须为空,才能直接删;非空目录需要 recursive=true 显式确认。
+    工作区本身、agent 的系统目录(.trash/.git/.agent)一律拒绝,防止自毁。
+    """
+    target = safe_path(path)
+    if not target.exists():
+        raise FileNotFoundError(f"{target} 不存在")
+    if not target.is_dir():
+        raise IsADirectoryError(f"{target} 不是目录,删单个文件请用 delete_file")
+
+    # 用 resolve() 展开后比较,防止 .. 拼出假保护路径。ROOT 本身禁止删
+    resolved = (ROOT / path).resolve()
+    if resolved == ROOT:
+        raise PermissionError("不允许删除工作区根目录")
+    if any(resolved.is_relative_to(p) for p in (TRASH_DIR, GIT_DIR, MEMORY_FILE.parent)):
+        raise PermissionError(
+            f"{target} 是 agent 的系统目录(.trash/.git/.agent),不允许删除。"
+        )
+
+    if not recursive:
+        if any(target.iterdir()):
+            return (
+                f"{target} 不是空目录,直接删除会连带删除里面的一切。"
+                f"确认要删除就带 recursive=true 重新调用。"
+            )
+    else:
+        # 防止级联删到回收站/系统目录:目标必须是上一层才可比;直接看目标本身或其直接子级
+        # 是否含受保护目录。受保护目录都在工作区根,所以非根目标天然不含它们,这里作为兜底。
+        if resolved in PROTECTED_DIRS:
+            raise PermissionError(f"{target} 是受保护目录,不允许删除。")
+        if any(p.parent == resolved for p in PROTECTED_DIRS):
+            raise PermissionError("目标下包含受保护的子目录,已拒绝。")
+
+    dest = _trash_dest(target.name)
+    target.rename(dest)
+    _trash_record(dest, target)
+    depth = "递归" if recursive else "空"
+    return f"已把{depth}目录 {target.name} 移入回收站:{dest}(可用 restore_file 还原)"
+
+
 # ---------------- 回收站:还原 / 清空 / 自动清理 ----------------
 
 # 回收站里文件的命名是 {原名}.{YYYYMMDD-HHMMSS}[-NN]{后缀},据此解析删除时刻
@@ -463,6 +538,7 @@ def remember(content: str) -> str:
         if line.strip() and set(line.strip()) != {"="} and set(line.strip()) != {"-"}
     ]
     bullets = "\n".join(f"- {line}" for line in lines)
+    MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)  # 首次写时把隐藏目录建出来
     MEMORY_FILE.touch(exist_ok=True)
 
     with MEMORY_FILE.open("a", encoding="utf-8") as fp:
@@ -476,6 +552,102 @@ def read_memory() -> str:
     """读取当前的全部长期记忆。"""
     content = _read_memory().strip()
     return content if content else "(长期记忆目前是空的,还没有记录任何东西。记住重要信息请用 remember)。"
+
+
+# ---------------- git:工作区内容的版本管理 ----------------
+# 与项目根的那个仓库无关。它只管 workspace/ 里的东西,元数据也锁在 workspace/.git,
+# 所以整个 git 工具一条命令都不会碰到沙箱外。
+
+
+def _git_run(*args: str) -> subprocess.CompletedProcess:
+    """统一调用 git:固定 --git-dir/--work-tree,并强制英文输出。
+
+    强制 LC_ALL=C 很重要 —— Windows 中文系统下 git 默认按 GBK 输出,和 Python
+    的 UTF-8 对不上,内容会被 errors=replace 替换成乱码。英文输出是稳定的。
+    """
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    return subprocess.run(
+        ["git", "-c", "core.quotepath=false",
+         "--git-dir", str(GIT_DIR), "--work-tree", str(ROOT), *args],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=env,
+    )
+
+
+def _git_is_repo() -> bool:
+    """让 git 自己确认仓库是否有效。只看目录存在不够:Windows 上删除 .git 时
+    常因文件被锁定留下残骸,目录是有的但仓库已损坏。"""
+    result = _git_run("rev-parse", "--git-dir")
+    return result.returncode == 0
+
+
+def _git_ensure_repo() -> None:
+    """确保 workspace 是一个有效的仓库,并忽略 agent 自己的内部目录。
+
+    不能靠 GIT_DIR 是否存在来判断 —— Windows 上 rmtree 删不掉被锁定的 git 文件,
+    可能留下一个"目录还在但仓库已烂"的残骸。必须让 git 验证有效性,无效则清理重建。
+    """
+    if _git_is_repo():
+        return
+    exclude = ".agent/\n.trash/\n__pycache__/\n"
+    if GIT_DIR.exists():
+        # 清掉残缺的 .git(先去掉只读属性,否则 Windows 删不掉)
+        for root, dirs, files in os.walk(GIT_DIR, topdown=False):
+            for name in files:
+                p = Path(root) / name
+                p.chmod(0o666)
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+        try:
+            GIT_DIR.rmdir()
+        except OSError:
+            pass
+    _git_run("init")
+    _git_run("config", "user.name", "boringmj")
+    _git_run("config", "user.email", "boringmj@github")
+    (GIT_DIR / "info" / "exclude").parents[0].mkdir(parents=True, exist_ok=True)
+    (GIT_DIR / "info" / "exclude").write_text(exclude, encoding="utf-8")
+
+
+def git(command: str, confirm: bool = False) -> str:
+    """在 workspace 里执行 git 子命令,只能操作工作区内容。
+
+    不给 shell,只做 argv 级调用,所以不存在命令注入。"命令"是你要执行的 git
+    子命令,例如 "status" 或 "commit -am '更新配置'"。
+    """
+    _git_ensure_repo()
+    parts = shlex.split(command)  # 转义交给 shlex 处理,别手写 split
+    if not parts:
+        raise ValueError("git 命令不能为空")
+    sub = parts[0]
+
+    if sub in GIT_FORBIDDEN:
+        raise PermissionError(
+            f"git {sub} 被禁止:它对纯本地的工作区版本管理无用,或不可逆。"
+            f"需要的版本操作优先用 status/add/commit/log/branch/stash。"
+        )
+    if sub not in GIT_SAFE and sub not in GIT_RISKY:
+        # 白名单之外的一律不接受 —— 宁可不放行,也不靠黑名单逐个封
+        raise PermissionError(
+            f"git {sub} 不在允许的指令里。可用:{'、'.join(sorted(GIT_SAFE))}。"
+        )
+    if sub in GIT_RISKY and not confirm:
+        return (
+            f"git {sub} 会改动 git 状态或历史,属于较危险的操作。"
+            f"请先征求用户同意,确认后再带 confirm=true 重新调用。"
+        )
+
+    result = _git_run(*parts)
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        return f"git {sub} 失败(exit {result.returncode}):\n{output}"
+
+    truncated = ""
+    if len(output) > GIT_MAX_OUTPUT:
+        output, truncated = output[:GIT_MAX_OUTPUT], "\n(输出过长,已截断)"
+    return output + truncated if output else "(git 没有输出)"
 
 
 # ---------------- 联网工具 ----------------
@@ -712,10 +884,12 @@ TOOL_FUNCS = {
     "insert_lines": insert_lines,
     "move_file": move_file,
     "delete_file": delete_file,
+    "delete_dir": delete_dir,
     "restore_file": restore_file,
     "purge_trash": purge_trash,
     "remember": remember,
     "read_memory": read_memory,
+    "git": git,
     "fetch_url": fetch_url,
     "web_search": web_search,
 }
@@ -951,6 +1125,32 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "delete_dir",
+            "description": (
+                "删除工作区里的一个目录,实际是移入 .trash/ 回收站而非物理删除。"
+                "目录必须是空的才能直接删;非空目录要带 recursive=true 显式确认,表示同意连带删除里面的所有内容。"
+                "工作区根目录以及 .trash/.git/.agent 这些系统目录一律拒绝,防止 agent 自毁。"
+                "删除是破坏性操作:调用前必须先取得用户明确同意。只删单个文件请用 delete_file。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "要删除的目录路径(相对工作区)",
+                    },
+                    "recursive": {
+                        "type": "boolean",
+                        "description": "目录非空时,是否同意连带删除其中所有内容,默认 false",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "restore_file",
             "description": (
                 "把回收站里的一个文件还原到它原来的路径。还原前会先检查原位置是否有同名文件:"
@@ -1020,6 +1220,32 @@ TOOLS = [
             "name": "read_memory",
             "description": "读取当前的全部长期记忆。需要回忆以前记下的关键信息、或确认自己记住了什么时使用。",
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git",
+            "description": (
+                "在工作区里执行 git 子命令,管理工作区内容的版本。这个仓库独立于项目根,只覆盖 workspace 内的文件。"
+                "常用:status 看改动、diff 看具体变更、log 看历史、add 暂存、commit 提交、branch 分支。"
+                "只白名单放行安全指令;reset/merge/pull/push 这类会改动历史或连远程的必须 confirm=true,"
+                "gc/clean/rebase 等被禁止。改完工作区文件后可以先 status 看看改了什么,再 add + commit 存个版本。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "要执行的 git 子命令,例如 'status' 或 'add .',不含开头的 git",
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "仅用于会改动 git 历史或连远程的命令(reset/merge/pull/push)。是否已获得用户确认,默认 false",
+                    },
+                },
+                "required": ["command"],
+            },
         },
     },
     {
