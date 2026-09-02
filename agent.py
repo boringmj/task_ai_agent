@@ -133,6 +133,8 @@ GIT_SAFE = {
 GIT_RISKY = {"reset", "revert", "merge", "pull", "push"}
 # 彻底不可逆或对纯本地版本管理无用:即使用户确认也拒绝
 GIT_FORBIDDEN = {"gc", "clean", "rebase", "filter-branch"}
+# 工作区仓库要忽略的本地状态目录(含容器持久化的 .pylibs 包)
+GIT_EXCLUDE = (".agent/", ".trash/", "clones/", "__pycache__/", ".pylibs/")
 
 # DeepSeek 兼容 OpenAI 协议,只需要换 base_url
 client = OpenAI(
@@ -643,34 +645,49 @@ def _git_is_repo() -> bool:
     return result.returncode == 0
 
 
+def _git_ensure_exclude() -> None:
+    """把本地状态目录补进 .git/info/exclude(幂等,已存在的仓库也会补)。
+
+    始终写全 GIT_EXCLUDE 里缺失的项,而不是只在 init 时写一次 —— 否则后续新增
+    的忽略项(如 .pylibs/)对被忽略的旧仓库不生效。
+    """
+    exclude_file = GIT_DIR / "info" / "exclude"
+    existing = exclude_file.read_text(encoding="utf-8") if exclude_file.exists() else ""
+    have = set(existing.splitlines())
+    missing = [e for e in GIT_EXCLUDE if e not in have]
+    if missing:
+        prefix = existing if existing.rstrip() else ""
+        if prefix and not prefix.endswith("\n"):
+            prefix += "\n"
+        exclude_file.write_text(prefix + "\n".join(missing) + "\n", encoding="utf-8")
+
+
 def _git_ensure_repo() -> None:
     """确保 workspace 是一个有效的仓库,并忽略 agent 自己的内部目录。
 
     不能靠 GIT_DIR 是否存在来判断 —— Windows 上 rmtree 删不掉被锁定的 git 文件,
     可能留下一个"目录还在但仓库已烂"的残骸。必须让 git 验证有效性,无效则清理重建。
     """
-    if _git_is_repo():
-        return
-    exclude = ".agent/\n.trash/\nclones/\n__pycache__/\n"
-    if GIT_DIR.exists():
-        # 清掉残缺的 .git(先去掉只读属性,否则 Windows 删不掉)
-        for root, dirs, files in os.walk(GIT_DIR, topdown=False):
-            for name in files:
-                p = Path(root) / name
-                p.chmod(0o666)
-                try:
-                    p.unlink()
-                except OSError:
-                    pass
-        try:
-            GIT_DIR.rmdir()
-        except OSError:
-            pass
-    _git_run("init")
-    _git_run("config", "user.name", "boringmj")
-    _git_run("config", "user.email", "boringmj@github")
-    (GIT_DIR / "info" / "exclude").parents[0].mkdir(parents=True, exist_ok=True)
-    (GIT_DIR / "info" / "exclude").write_text(exclude, encoding="utf-8")
+    if not _git_is_repo():
+        if GIT_DIR.exists():
+            # 清掉残缺的 .git(先去掉只读属性,否则 Windows 删不掉)
+            for root, dirs, files in os.walk(GIT_DIR, topdown=False):
+                for name in files:
+                    p = Path(root) / name
+                    p.chmod(0o666)
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+            try:
+                GIT_DIR.rmdir()
+            except OSError:
+                pass
+        _git_run("init")
+        _git_run("config", "user.name", "boringmj")
+        _git_run("config", "user.email", "boringmj@github")
+        (GIT_DIR / "info").mkdir(parents=True, exist_ok=True)
+    _git_ensure_exclude()  # 无论新建还是已存在,都确保忽略项齐全
 
 
 def _git_clone(repo: Path, *args: str) -> str:
@@ -1239,6 +1256,9 @@ def _docker_run(inner: list[str]) -> str:
         "--pids-limit", str(DOCKER_PIDS),
         "--tmpfs", "/tmp",
         "-e", "HOME=/tmp",
+        # PYTHONPATH 指向 workspace/.pylibs:agent 用 `pip install --target /workspace/.pylibs`
+        # 装一次就永久保留(workspace 是宿主盘,不随容器销毁),之后每次 run_python 都能 import。
+        "-e", "PYTHONPATH=/workspace/.pylibs",
         "-v", f"{ROOT}:/workspace", "-w", "/workspace",  # 唯一挂载:只给 workspace
         DOCKER_IMAGE,
         # 容器内自毁:到 DOCKER_CMD_TIMEOUT 由 GNU timeout 终止,不依赖 agent 进程活着。

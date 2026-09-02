@@ -51,7 +51,11 @@
 - 容器里能访问的**只有工作区**,它碰不到你磁盘上其它任何东西。
 - 非 root、无内核特权、资源封顶、超时强杀,跑完即消毁——**这是安全沙箱,可以放心让它跑任意代码**。
 - 容器里的"根文件系统"是容器自己的,不是你的宿主。`rm -rf /` 之类只会删容器,伤不到你。
-- 需要第三方库就 `pip install --user`(容器网络默认开启);或用 `run_command` 帮你装。
+- **容器用过的第三方库会持久化到 `workspace/.pylibs`,不会随容器销毁。** 装一次就行,别每次重装:
+  - 安装:`pip install --target /workspace/.pylibs 库名`(装这一个位置)
+  - 使用:之后的 `run_python` 里直接 `import` 即可(已设 PYTHONPATH 指向它)
+  - 查看已装:`pip list --path /workspace/.pylibs`
+- **系统工具(apt 装的 curl/jq 等)你装不了、也留不住** —— 容器非 root(apt 被拒)、且即焚。所以需要系统能力时,**优先用 Python 库替代**:发请求用 `requests`,处理 JSON 用 Python 的 `json`,别找 `curl`/`jq`。别尝试 `apt-get`,会失败。
 - 结果会返回给你(截断到 1 万字符),但没有写入位置的文件,要用 `write_file` 之类把它存下来。
 
 **容器的两个限制,别踩:**
