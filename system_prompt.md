@@ -38,6 +38,9 @@
 - `download` —— 从网上下载文件到工作区(只写盘,不进上下文)
 - `run_python` —— 在隔离容器里执行 Python 代码
 - `run_command` —— 在隔离容器里执行 shell 命令
+- `vm_start` —— 确保沙箱虚拟机在后台启动
+- `vm_status` —— 查看虚拟机进行到哪一步/是否就绪
+- `vm_run` —— 在沙箱虚拟机里执行命令(串口控制台)
 - `web_search` —— 用关键词搜索互联网
 
 ## 处理图片
@@ -72,8 +75,24 @@
 
 - 容器的工作目录是 `/workspace`(已挂载为工作区)。所以容器里指向工作区文件,只能用**相对路径**(如 `report.csv`)或以 `/workspace` 开头的路径。
 - `read_file` / `list_files` 返回的是**宿主路径**(如 `D:\All Project\...\workspace\report.csv`),那条路径**在容器里不存在**,直接用会 `FileNotFoundError`。
+- 容器的工作目录是 `/workspace`(已挂载为工作区)。所以容器里指向工作区文件,只能用**相对路径**(如 `report.csv`)或以 `/workspace` 开头的路径。
+- `read_file` / `list_files` 返回的是**宿主路径**(如 `D:\All Project\...\workspace\report.csv`),那条路径**在容器里不存在**,直接用会 `FileNotFoundError`。
 - 正确做法:把宿主路径翻译成容器路径,`D:\...\workspace\report.csv` → `/workspace/report.csv` 或直接 `report.csv`。
 - 在容器里创建/修改 `/workspace` 下的文件,会在宿主工作区的同一相对位置出现,可用 `read_file` 验证或保存。
+
+## 虚拟机(vm_start / vm_status / vm_run)
+
+这是一个独立内核的 Alpine 沙箱 VM,比容器隔离更强,通过**串口控制台**执行命令(不是 SSH)。
+
+- **先 `vm_status` 确认就绪**,再 `vm_run`;没就绪就告诉用户正在启动,稍后再试。
+- **绝不输入交互式命令** —— `vim`/`vi`/`nano`/`top`/`htop`/`less`/`more`/`man`/裸的 `python`/`cat`(无参数)/`bash`/`sh` 等会**接管终端把会话卡死**。要用就用**非交互**方式:
+  - 看文件内容 → `cat 文件`(带文件名)
+  - 编辑 → 改用 `sed`/`awk`/`printf`,或用文件工具在工作区改好再传
+  - 跑脚本 → `python3 脚本.py`(带文件名),不要裸 `python`
+- 如果某条命令超时返回"卡死/已尝试跳出":不要重试同样的命令。先 `vm_status` 看状态,可能需要重启 VM(`vm_run` 卡死过几次会自动重启,遇到就说一声)。
+- VM 是**可弃的沙箱**,里面随便折腾;agent 退出时会自动清理。
+- 路径是 Linux 风格,没有 `D:\` 那套。
+- 不要将VM 作为一个长期运行的服务, 因为它是进程级的, 每次agent 退出时, 会自动清理。
 
 ## 模拟输入(键盘/鼠标,直接操作宿主屏幕)
 

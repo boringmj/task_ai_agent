@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import atexit
 import base64
 import html as html_lib
 import ipaddress
@@ -20,6 +21,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import queue
 from datetime import datetime
@@ -146,12 +148,15 @@ GIT_EXCLUDE = (".agent/", ".trash/", "clones/", "__pycache__/", ".pylibs/")
 QEMU_DIR = Path(os.environ.get("VM_QEMU_DIR", str(PROJECT_DIR / "temp")))
 QEMU_SYSTEM = Path(os.environ.get("VM_QEMU_SYSTEM", str(QEMU_DIR / "qemu-system-x86_64.exe")))
 QEMU_IMG = Path(os.environ.get("VM_QEMU_IMG", str(QEMU_DIR / "qemu-img.exe")))
-VM_BASE = Path(os.environ.get("VM_BASE", str(QEMU_DIR / "sandbox" / "alpine.qcow2")))
 VM_DIR = Path(os.environ.get("VM_DIR", str(PROJECT_DIR / "vm")))
+VM_BASE = Path(os.environ.get("VM_BASE", str(VM_DIR / "alpine-vmserver.qcow2")))  # 预装 vmserver 的新 base
 VM_ACCEL = os.environ.get("VM_ACCEL", "whpx")      # whpx 快;没开就设 tcg(慢但通用)
 VM_INSTANCE = uuid.uuid4().hex[:8]                 # 每进程唯一,决定盘和口的唯一性
 VM_DISK = VM_DIR / f"work-{VM_INSTANCE}.qcow2"     # 本实例专属 overlay;重置=删它
+VM_VMSERVER_PORT = 40000                            # vmserver 在 guest 内监听的端口(固定)
 _vm_port: int | None = None                        # 启动时动态分配,避免多开抢 2222
+_vm_token = ""                                     # 每启动随机生成、经串口注入 guest,服务端每次请求读它
+_vm_vmserver_host_port: int | None = None           # 宿主侧转发到 guest:40000 的端口
 
 # DeepSeek 兼容 OpenAI 协议,只需要换 base_url
 client = OpenAI(
@@ -1455,45 +1460,40 @@ def _inject_pending_images(messages: list[dict]) -> None:
 
 
 # ---------------- 虚拟机(QEMU)沙箱 ----------------
-# 在后台启动一个 Alpine 虚拟机作为更强隔离的沙箱。agent 只写 vm/work.qcow2(overlay),
-# 绝不碰基础盘;SSH 通过 hostfwd 2222 转发。启动幂等(SSH 口已监听就不再拉)。
+# 后台启动一个 Alpine 虚拟机作为更强隔离的沙箱。每进程一把随机 SSH 密钥,
+# 通过串口登录 root/123456 注入公钥 + 启 sshd + 关密码登录。状态机全程可查:
+# BOOTING → LOGIN → PROVISION → READY。agent 只写本实例 overlay,基础盘只读共享。
 
 _vm_proc = None
+_vm_thread: "threading.Thread | None" = None
+_vm_serial_port: int | None = None
+# 线程安全的状态:{status, step, port, error}
+_vm_state: dict = {"status": "idle", "step": "", "port": None, "error": ""}
+_vm_lock = threading.Lock()
 
 
-def _vm_port_in_use(port: int) -> bool:
-    """探测某宿主导是否已被占用(连得上说明在监听)。"""
+def _vm_state_set(status: str, step: str = "", port: int | None = None, error: str = "") -> None:
+    with _vm_lock:
+        _vm_state.update({"status": status, "step": step, "port": port, "error": error})
+
+
+def _vm_state_get() -> dict:
+    with _vm_lock:
+        return dict(_vm_state)
+
+
+def _vm_free_port(base: int) -> int:
     import socket
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.3):
-            return True
-    except OSError:
-        return False
-
-
-def _vm_alloc_port() -> int:
-    """从 2222 起找一个空闲口,确保多开 agent 不撞。"""
-    base = int(os.environ.get("VM_SSH_PORT", "2222"))
-    for port in range(base, base + 40):
-        if not _vm_port_in_use(port):
+    for port in range(base, base + 60):
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                continue
+        except OSError:
             return port
-    raise RuntimeError("SSH 端口分配失败(2222 起 40 个都被占用)")
-
-
-def _vm_is_up() -> bool:
-    """本实例的 SSH 口(动态分配)已监听说明虚拟机起来了。"""
-    if not _vm_port:
-        return False
-    import socket
-    try:
-        with socket.create_connection(("127.0.0.1", _vm_port), timeout=1.0):
-            return True
-    except OSError:
-        return False
+    raise RuntimeError(f"端口分配失败({base} 起 60 个都被占用)")
 
 
 def _vm_ensure() -> None:
-    """确保 vm/ 和本实例 overlay 存在。overlay 从基础盘建,重置=删掉重建。"""
     VM_DIR.mkdir(parents=True, exist_ok=True)
     if not VM_DISK.exists():
         if not (QEMU_IMG.exists() and VM_BASE.exists()):
@@ -1505,41 +1505,265 @@ def _vm_ensure() -> None:
         )
 
 
-def _vm_start() -> str:
-    """后台启动本实例的虚拟机(幂等)。返回状态说明。"""
-    global _vm_proc, _vm_port
-    if _vm_is_up():
-        return f"虚拟机已在运行(实例 {VM_INSTANCE[:8]},SSH 口 {_vm_port} 已监听)。"
-    if _vm_proc is not None and _vm_proc.poll() is None:
-        return "虚拟机正在启动…(进程存活)。"
-    try:
-        _vm_ensure()
-    except Exception as exc:  # noqa: BLE001
-        return f"虚拟机就绪失败:{exc}"
-    if _vm_port is None:
-        try:
-            _vm_port = _vm_alloc_port()
-        except RuntimeError as exc:  # noqa: BLE001
-            return str(exc)
+class _VmSerial:
+    """QEMU 串口控制台通道(参考 sandbox_demo):连接 sentinel 读取、发送、排空。"""
+    def __init__(self, port: int):
+        import socket
+        self.s = socket.create_connection(("127.0.0.1", port), timeout=15)
+        self.s.settimeout(0.5)
+        self.buf = b""
 
+    def read_until(self, marker: str, timeout: float = 30.0) -> str:
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                d = self.s.recv(4096)
+            except socket.timeout:
+                continue
+            if not d:
+                break
+            self.buf += d
+            if marker in self.buf.decode("utf-8", "replace"):
+                return self.buf.decode("utf-8", "replace")
+        return self.buf.decode("utf-8", "replace")
+
+    def send(self, text: str) -> None:
+        self.s.sendall(text.encode())
+
+    def drain(self) -> None:
+        self.s.settimeout(0.2)
+        try:
+            while True:
+                d = self.s.recv(4096)
+                if not d:
+                    break
+                self.buf += d
+        except socket.timeout:
+            pass
+
+    def reset_buf(self) -> None:
+        self.buf = b""
+
+
+def _vm_serial_login(port: int) -> _VmSerial:
+    """连串口,root/123456 登录,关回显。返回保持登录态的会话(不配置 sshd)。
+
+    参考 sandbox_demo:全程串口控制台执行,不用 sshd — 这是正确的通道。
+    """
+    _vm_state_set("login", "登录 root/123456…")
+    ser = None
+    for _ in range(40):
+        try:
+            ser = _VmSerial(port)
+            break
+        except OSError:
+            time.sleep(0.5)
+    if ser is None:
+        raise ConnectionError("连不上虚拟机串口")
+    ser.read_until("login:", 30)
+    ser.send("root\n")
+    ser.read_until("Password:", 15)
+    ser.send("123456\n")
+    if "#" not in ser.read_until("#", 25):  # 等 shell 提示符,确认真进入 shell
+        raise RuntimeError("串口登录未进入 shell")
+    ser.send("stty -echo\n")  # 关回显:命令输出与输入回声分离,避免误判
+    ser.drain()
+    return ser
+
+
+_vm_ser: "_VmSerial | None" = None        # 保持登录态的串口会话
+_vm_serial_lock = threading.Lock()          # vm_run 串行化,避免并发读写串口
+
+
+def _vm_spawn_and_login(serial_port: int, vmserver_host_port: int) -> None:
+    """boot QEMU(映射 guest:40000 的 vmserver)+ 串口登录,设置 _vm_proc/_vm_ser。"""
+    global _vm_proc, _vm_ser
     cmd = [
         str(QEMU_SYSTEM),
         "-drive", f"file={VM_DISK},if=virtio",
-        "-netdev", f"user,id=net0,hostfwd=tcp::{_vm_port}-:22",
-        "-device", "virtio-net-pci,netdev=net0",
-        "-display", "none", "-vga", "virtio",
-        "-m", "1024", "-smp", "2",
+        # 只把 vmserver 的 40000 口转发到宿主;其余 guest 口不暴露(vmserver 可代理)
+        "-netdev", f"user,id=n0,hostfwd=tcp::{vmserver_host_port}-:{VM_VMSERVER_PORT}",
+        "-device", "virtio-net-pci,netdev=n0",
+        "-m", "1024", "-smp", "2", "-display", "none",
+        "-serial", f"tcp:127.0.0.1:{serial_port},server=on,wait=off",
         "-accel", VM_ACCEL,
     ]
+    import subprocess as sp
+    _vm_proc = sp.Popen(cmd, creationflags=sp.CREATE_NO_WINDOW,
+                        stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+    time.sleep(1)
+    if _vm_proc.poll() is not None and _vm_proc.returncode != 0:
+        raise RuntimeError("QEMU 启动即退出,请检查 VM_ACCEL(whpx/tcg)或镜像")
+    _vm_ser = _vm_serial_login(serial_port)
+
+
+def _vm_worker() -> None:
+    """后台线程:boot → 串口登录 → 注入每启动随机 token → READY。
+
+    之后 vm_run 走 socket 到 vmserver,不再用裸串口;串口只在启动时注入 token。
+    """
+    global _vm_proc, _vm_ser, _vm_token, _vm_vmserver_host_port
     try:
-        import subprocess as sp
-        flags = sp.CREATE_NO_WINDOW | getattr(sp, "DETACHED_PROCESS", 0)
-        _vm_proc = sp.Popen(cmd, creationflags=flags,
-                            stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+        if not VM_BASE.exists():
+            raise FileNotFoundError(
+                f"缺少 vmserver 基础盘 {VM_BASE}。请先用 qemu-img convert 生成 vm/alpine-vmserver.qcow2。")
+        _vm_ensure()
+        serial_port = _vm_free_port(3000)
+        vmserver_host_port = _vm_free_port(5000)
+        global _vm_serial_port
+        _vm_serial_port = serial_port
+        _vm_vmserver_host_port = vmserver_host_port
+        _vm_state_set("booting", "启动 QEMU…", port=vmserver_host_port)
+        _vm_spawn_and_login(serial_port, vmserver_host_port)
+
+        # 生成并注入每启动随机 token(vmserver 每次请求读 /root/.vm_token,无需重启服务)
+        _vm_token = uuid.uuid4().hex + uuid.uuid4().hex
+        with _vm_serial_lock:
+            _vm_ser.send(f"echo '{_vm_token}' > /root/.vm_token\n")
+            time.sleep(0.5)
+        try:
+            _vm_ser.s.close()   # 串口只在注入 token 用,之后 vm_run 走 socket
+        except Exception:
+            pass
+        _vm_state_set("ready", "就绪,可连接 vmserver", port=vmserver_host_port)
     except Exception as exc:  # noqa: BLE001
-        _vm_proc = None
-        return f"虚拟机启动失败:{exc}"
-    return f"虚拟机已后台启动(实例 {VM_INSTANCE[:8]},SSH 口 {_vm_port},加速 {VM_ACCEL})。"
+        _vm_state_set("error", "", error=str(exc))
+
+
+def _vm_kickoff() -> None:
+    """启动后台线程(幂等)。"""
+    global _vm_thread
+    if _vm_thread is not None and _vm_thread.is_alive():
+        return
+    _vm_thread = threading.Thread(target=_vm_worker, daemon=True)
+    _vm_thread.start()
+
+
+def vm_status() -> str:
+    """查看沙箱虚拟机的当前状态(进行到哪一步、是否就绪)。"""
+    st = _vm_state_get()
+    if st["status"] == "ready":
+        return f"虚拟机就绪(实例 {VM_INSTANCE[:8]},串口 {st['port']})。"
+    if st["status"] == "error":
+        return f"虚拟机出错:{st['error']}"
+    return f"虚拟机会在后台启动, agent关闭后销毁"
+
+
+def vm_run(command: str) -> str:
+    """在沙箱虚拟机里执行一条命令 —— 连接 guest 里的 vmserver(socket, JSON 协议)。
+
+    vmserver 用无 TTY 的 subprocess 跑命令、自带超时(超时就 kill,返回 timed_out),
+    所以交互程序(vim/top)会直接秒失败、不会卡死会话;命令输出是结构化 JSON,无壳提示符。
+    """
+    st = _vm_state_get()
+    if st["status"] != "ready":
+        return f"虚拟机还没就绪,当前:{st['step'] or st['status']}。请用 vm_status 或稍后再试。"
+    if not _vm_vmserver_host_port or not _vm_token:
+        return "虚拟机 vmserver 未就绪,请稍后再试。"
+
+    import socket as sk, json
+    req = {"token": _vm_token, "cmd": "exec", "command": command, "timeout": 60}
+    try:
+        s = sk.create_connection(("127.0.0.1", _vm_vmserver_host_port), timeout=10)
+        s.settimeout(90)
+        s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+        line = s.makefile("rb").readline()
+        s.close()
+        resp = json.loads(line.decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001 - 服务端可能挂了,给提示并可尝试重启
+        return f"连接 vmserver 失败:{exc}。可尝试重启虚拟机(vm_run 会用兜底)。"
+
+    if not resp.get("ok"):
+        return f"vmserver 错误:{resp.get('error', 'unknown')}"
+    out = resp.get("output", "")
+    timed = resp.get("timed_out", False)
+    return (out[:10000] if out else "(无输出)") + ("\n[命令超时,已中断]" if timed else "")
+
+
+def _vm_reboot() -> str:
+    """最终兜底:杀 QEMU → 删 overlay → 同步重新 boot+登录 → 就绪。约 16~20s。
+
+    vm_run 里交互程序硬卡死、Ctrl+C/ESC 也跳不出时,唯一可靠的办法就是重启这台
+    可弃的沙箱 VM。这里**同步内联**执行(不依赖后台 worker 线程),避免和旧线程竞态。
+    """
+    global _vm_proc, _vm_ser, _vm_thread, _vm_serial_port
+    try:
+        if _vm_proc is not None and _vm_proc.poll() is None:
+            _vm_proc.kill()
+            try:
+                _vm_proc.wait(timeout=5)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        if _vm_ser is not None:
+            _vm_ser.s.close()
+    except Exception:
+        pass
+    time.sleep(0.2)
+    try:
+        if VM_DISK.exists():
+            VM_DISK.unlink()
+    except OSError:
+        pass
+    _vm_proc = None
+    _vm_ser = None
+    _vm_thread = None
+    try:
+        _vm_ensure()
+        serial_port = _vm_free_port(3000)
+        _vm_serial_port = serial_port
+        _vm_state_set("booting", "重启:启动 QEMU…", port=serial_port)
+        _vm_spawn_and_login(serial_port)
+        _vm_state_set("ready", "就绪(重启后)", port=serial_port)
+        return "虚拟机已重启并就绪。"
+    except Exception as exc:  # noqa: BLE001
+        _vm_state_set("error", "", error=str(exc))
+        return f"重启失败:{exc}"
+
+
+def _vm_cleanup() -> None:
+    """agent 退出时:杀掉本实例的 QEMU,删掉本实例 overlay 和密钥,不留残 VM/盘。
+
+    只动本进程的 VM_DISK(_vm_proc),不 taskkill /IM 以免误杀其它 agent/用户自己的 VM。
+    """
+    global _vm_proc
+    try:
+        if _vm_proc is not None and _vm_proc.poll() is None:
+            _vm_proc.kill()          # 仅本进程起的 QEMU
+            try:
+                _vm_proc.wait(timeout=5)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    time.sleep(0.3)  # 等 QEMU 释放对 overlay 的句柄
+    try:
+        for _ in range(4):  # 句柄释放有延迟,重试删
+            try:
+                if VM_DISK.exists():
+                    VM_DISK.unlink()
+                break
+            except OSError:
+                time.sleep(0.3)
+    except OSError:
+        pass
+    keydir = VM_DIR / f"key-{VM_INSTANCE}"
+    try:
+        if keydir.exists():
+            shutil.rmtree(keydir, ignore_errors=True)
+    except Exception:
+        pass
+
+
+atexit.register(_vm_cleanup)
+
+
+def vm_start() -> str:
+    """确保沙箱虚拟机在后台启动(已在配就返回当前状态)。"""
+    _vm_kickoff()
+    return f"虚拟机正在后台启动({VM_INSTANCE[:8]}),可查 vm_status。"
 
 
 # ---------------- 容器执行(Docker 沙箱) ----------------
@@ -1647,11 +1871,6 @@ def run_python(code: str) -> str:
     return _docker_run(["python", "-c", code])
 
 
-def vm_start() -> str:
-    """确保内部的 Alpine 虚拟机在运行(后台)。如果没起就拉起,已在跑则幂等返回。"""
-    return _vm_start()
-
-
 def run_command(command: str) -> str:
     """在隔离容器里执行一条 shell 命令,同样只访问工作区.给 agent 装包、跑工具。"""
     if not command.strip():
@@ -1688,6 +1907,8 @@ TOOL_FUNCS = {
     "run_python": run_python,
     "run_command": run_command,
     "vm_start": vm_start,
+    "vm_status": vm_status,
+    "vm_run": vm_run,
     "web_search": web_search,
 }
 
@@ -2288,11 +2509,42 @@ TOOLS = [
         "function": {
             "name": "vm_start",
             "description": (
-                "确保内置的 Alpine 虚拟机(QEMU 沙箱)在运行。如果没起就后台拉起一个,"
-                "已在跑则幂等返回。这个虚拟机比容器隔离更强(独立内核),适合让 agent"
-                "在其中做会在容器里放不开的完整系统操作。SSH 端口默认为 2222。"
+                "确保内置的 Alpine 虚拟机(QEMU 沙箱)在后台启动与配置。已在配则返回当前状态。"
+                "这个虚拟机比容器隔离更强(独立内核),适合让它做容器里放不开的完整系统操作。配置是后台进行的,可配合 vm_status 看进度。"
             ),
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vm_status",
+            "description": (
+                "查看沙箱虚拟机的当前状态:进行到哪一步(BOOTING/LONGIN/PROVISION)、"
+                "是否已就绪、SSH 端口。虚拟机在后台启动,可能没就绪;用这个确认是否能用。"
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vm_run",
+            "description": (
+                "在沙箱虚拟机里执行一条命令,通过 SSH(本进程专属密钥)进入客户机跑。"
+                "适合在隔离的完整系统里装软件、跑服务、做重活。若虚拟机还没就绪,会返回当前进度并让你稍后再试。"
+                "路径注意:客户机是 Linux,路径风格与宿主不同(没有 D:\\ 那套)。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "要在客户机里执行的 shell 命令",
+                    }
+                },
+                "required": ["command"],
+            },
         },
     },
     {
@@ -2367,7 +2619,7 @@ def run(user_input: str, messages: list[dict]) -> str:
         for call in msg.tool_calls:
             # markup=False:工具参数里的 [ ] 不该被 rich 当成样式标记解析
             console.print(
-                f"  ⚙ {call.function.name}({call.function.arguments})",
+                f"• {call.function.name}({call.function.arguments})",
                 style="dim",
                 markup=False,
                 highlight=False,
@@ -2457,8 +2709,9 @@ def main() -> None:
     console.print(f"Docker:{'✅ ' if ok else '⚠ 不可用 —— '}{msg}", style="dim" if ok else "yellow")
     # 后台拉起虚拟机(非阻断,失败仅提示,agent 照常启动)
     try:
-        vm_status = _vm_start()
-        console.print(f"VM:{vm_status}", style="dim" if _vm_is_up() else "yellow")
+        _vm_kickoff()  # 后台线程启动/配置虚拟机,不阻塞
+        ready = _vm_state_get()["status"] == "ready"
+        console.print(f"VM:{vm_status()}", style="dim" if ready else "yellow")
     except Exception as exc:  # noqa: BLE001
         console.print(f"VM:启动失败(不影响 agent)—— {exc}", style="yellow")
     console.print("Agent 已启动。", style="bold")
