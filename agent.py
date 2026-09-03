@@ -1160,13 +1160,76 @@ def screen() -> str:
         raise RuntimeError("截屏需要 Pillow,请先执行:pip install Pillow") from exc
 
     image = ImageGrab.grab()
+    orig_w, orig_h = image.size
     url = _image_to_data_url(image)
     _pending_images.append(url)
-    size = image.size  # 原始尺寸,用于说明压了多少
+    cw = max(1, int(orig_w * SCREEN_MAX_DIM / max(orig_w, orig_h)))
+    ch = max(1, int(orig_h * SCREEN_MAX_DIM / max(orig_w, orig_h)))
+    # 给出原分辨率与压缩后的换算,方便模型算真实点击坐标:
+    # click/move 用原始分辨率坐标;真实坐标 = 图坐标 × (orig/cw)。
     return (
-        f"已截取全屏(img {size[0]}×{size[1]} → 最长边 {SCREEN_MAX_DIM})。"
-        f"将在下一轮作为图像信息交给模型。"
+        f"已截取全屏:原始 {orig_w}×{orig_h},交给模型的压缩图为 {cw}×{ch}。"
+        f"click/move 请用原始分辨率坐标,换算:真实坐标 = 图坐标 × ({orig_w}/{cw})。"
     )
+
+
+# ---------------- 模拟输入(键盘/鼠标) ----------------
+# 这些工具直接作用于宿主机的真实桌面(非容器),全权限、针对当前焦点窗口。
+# 走 pyautogui;FAILSAFE 默认开启 —— 鼠标移到屏幕左上角可立即中止。
+# 注意:这一步是"直接的手",操作宿主 GUI,影响的窗口取决于焦点。
+
+
+def _pyautogui():
+    """按需导入 pyautogui;设置安全的节奏与逃生开关。"""
+    try:
+        import pyautogui
+    except ImportError:
+        raise RuntimeError("模拟输入需要 pyautogui,请先执行:pip install pyautogui") from None
+    pyautogui.PAUSE = 0.05  # 每一步间隔,避免动作过快
+    pyautogui.FAILSAFE = True  # 鼠标甩到左上角 = 紧急中止
+    return pyautogui
+
+
+def type_text(text: str) -> str:
+    """在当前焦点窗口输入一段文本(支持中文等 unicode,pyautogui 走剪贴板粘贴)。"""
+    pg = _pyautogui()
+    if not text.strip():
+        raise ValueError("要输入的文本不能为空或纯空白")
+    # pyautogui.write 对中文是"逐字剪贴板+ctrl+v",对 QQ 这类富文本输入框经常失灵。
+    # 改为"整段复制一次 + 一次 ctrl+v"更可靠,也绕开输入法(粘贴不进 IME)。
+    import pyperclip
+    pyperclip.copy(text)
+    pg.hotkey("ctrl", "v")
+    return f"已通过粘贴输入 {len(text)} 个字符到当前焦点窗口。"
+
+
+def press_keys(keys: str) -> str:
+    """按一个键或组合键,如 'enter'、'ctrl+s'、'alt+tab'。"""
+    pg = _pyautogui()
+    keys = keys.strip()
+    if not keys:
+        raise ValueError("按键不能为空")
+    if "+" in keys:
+        pg.hotkey(*keys.split("+"))
+    else:
+        pg.press(keys)
+    return f"已按下 {keys}。"
+
+
+def click(x: int, y: int, button: str = "left") -> str:
+    """在屏幕坐标 (x, y) 处点击。坐标用屏幕原始分辨率,可与 screen 的结果换算。"""
+    pg = _pyautogui()
+    if button not in ("left", "right", "middle"):
+        raise ValueError(f"button 只支持 left/right/middle,收到 {button}")
+    pg.click(int(x), int(y), button=button)
+    return f"已在 ({x}, {y}) 用 {button} 键点击。"
+
+
+def move_mouse(x: int, y: int) -> str:
+    """把光标移到屏幕坐标 (x, y),用屏幕原始分辨率。"""
+    pg = _pyautogui()
+    pg.moveTo(int(x), int(y))
+    return f"已移动光标到 ({x}, {y})。"
 
 
 def _inject_pending_images(messages: list[dict]) -> None:
@@ -1320,6 +1383,10 @@ TOOL_FUNCS = {
     "git": git,
     "img": img,
     "screen": screen,
+    "type_text": type_text,
+    "press_keys": press_keys,
+    "click": click,
+    "move_mouse": move_mouse,
     "fetch_url": fetch_url,
     "download": download,
     "run_python": run_python,
@@ -1718,6 +1785,82 @@ TOOLS = [
                 "截图会自动压缩到最长边 1280 像素,不会拿原图超大的分辨率去撑模型。"
             ),
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "type_text",
+            "description": (
+                "在当前有焦点的窗口输入一段文本。直接作用于宿主机的真实屏幕(不是容器)。"
+                "适合把文本填进输入框、搜索框等。支持中文等 unicode。"
+                "注意:作用对象取决于当前焦点窗口,输入前确认焦点是对的。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "要输入的文本,可含中文"},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "press_keys",
+            "description": (
+                "按一个键或组合键,如 enter、tab、ctrl+s、alt+tab、ctrl+shift+esc。"
+                "适合模拟快捷键确认、切换窗口、关闭弹窗等。作用于当前焦点窗口。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keys": {
+                        "type": "string",
+                        "description": "按键名或组合,组合用 + 连接,如 'ctrl+s'、'alt+tab'",
+                    }
+                },
+                "required": ["keys"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "click",
+            "description": (
+                "在屏幕坐标 (x, y) 处点击。坐标用屏幕原始分辨率。"
+                "想定位坐标时先 screen 截屏:真实坐标 = 图上的坐标 × (原宽/压缩后宽)。"
+                "作用于真实屏幕,点击前确认坐标准确。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "description": "横坐标(像素,原始分辨率)"},
+                    "y": {"type": "integer", "description": "纵坐标(像素,原始分辨率)"},
+                    "button": {
+                        "type": "string",
+                        "description": "鼠标键 left/right/middle,默认 left",
+                    },
+                },
+                "required": ["x", "y"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "move_mouse",
+            "description": "把光标移动到屏幕坐标 (x, y)。坐标用屏幕原始分辨率。配合 screen 定位后再点击。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "description": "横坐标(像素,原始分辨率)"},
+                    "y": {"type": "integer", "description": "纵坐标(像素,原始分辨率)"},
+                },
+                "required": ["x", "y"],
+            },
         },
     },
     {
