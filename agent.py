@@ -113,7 +113,7 @@ def _resolve_workspace() -> Path:
 ROOT = _resolve_workspace()
 # 回收站:删除的文件移到这里,不做真删除,超过 MAX_AGE_DAYS 天后启动时自动清空
 TRASH_DIR = ROOT / ".trash"
-TRASH_INDEX_FILE = TRASH_DIR / "index.jsonl"  # 记录 回收站文件名 -> 原路径,支撑还原
+TRASH_INDEX_FILE = TRASH_DIR / "index.json"  # 记录 回收站文件名 -> 原路径,支撑还原
 TRASH_MAX_AGE_DAYS = 7
 TRASH_DIR.mkdir(exist_ok=True)
 
@@ -1680,6 +1680,105 @@ def vm_run(command: str) -> str:
     return (out[:10000] if out else "(无输出)") + ("\n[命令超时,已中断]" if timed else "")
 
 
+def vm_fetch(guest_url: str) -> str:
+    """转发访问 guest 内的 HTTP 服务:通过 vmserver 的 proxy,把 guest 端口代理到本地。
+
+    只支持 http(geth;HTTPS 透传要 TLS,不支持)。适合访问 agent 在 guest 里起的服务。
+    """
+    st = _vm_state_get()
+    if st["status"] != "ready":
+        return f"虚拟机还没就绪,当前:{st['step'] or st['status']}。请用 vm_status 或稍后再试。"
+    if not _vm_vmserver_host_port or not _vm_token:
+        return "虚拟机 vmserver 未就绪,请稍后再试。"
+
+    from urllib.parse import urlparse
+    u = urlparse(guest_url)
+    if u.scheme != "http" or not u.netloc:
+        return "只支持 http://host:port/... 形式(HTTPS 透传暂不支持,请用 guest 内的 http 服务)。"
+    host = u.hostname or "127.0.0.1"
+    port = u.port or 80
+    path = u.path or "/"
+    if u.query:
+        path += "?" + u.query
+
+    import socket as sk
+    try:
+        s = sk.create_connection(("127.0.0.1", _vm_vmserver_host_port), timeout=10)
+        s.settimeout(30)
+        req = {"token": _vm_token, "cmd": "proxy", "host": host, "port": port}
+        s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+        ack = json.loads(s.makefile("rb").readline().decode("utf-8", "replace"))
+        if not (ack.get("ok") and ack.get("proxy")):
+            s.close()
+            return f"vmserver proxy 失败:{ack.get('error', 'unknown')}"
+        # 通过已建立的透传连接发 HTTP GET,读响应
+        s.sendall(f"GET {path} HTTP/1.1\r\nHost: {u.netloc}\r\nConnection: close\r\n\r\n".encode())
+        data = b""
+        while True:
+            c = s.recv(8192)
+            if not c:
+                break
+            data += c
+            if len(data) > 2_000_000:
+                break
+        s.close()
+    except Exception as exc:  # noqa: BLE001
+        return f"vm_fetch 失败:{exc}"
+
+    if not data:
+        return "(guest 服务无响应)"
+    status = data.split(b"\r\n", 1)[0].decode("utf-8", "replace")
+    sep = data.find(b"\r\n\r\n")
+    body = data[sep + 4:].decode("utf-8", "replace") if sep >= 0 else ""
+    return f"{status}\n--- body ---\n{body[:8000]}"
+
+
+def vm_tcp(host: str, port: int, data: str) -> str:
+    """向 guest 内任意 TCP 服务发一段字节并读回复(经 vmserver proxy)。
+
+    通用 TCP(不仅 HTTP):适合请求/答一类协议(Redis、MySQL 查询、自定协议等)。
+    注意是"发一次、收一次"的一问一答;持续会话类(SSH)不适合。
+    """
+    st = _vm_state_get()
+    if st["status"] != "ready":
+        return f"虚拟机还没就绪,当前:{st['step'] or st['status']}。请用 vm_status 或稍后再试。"
+    if not _vm_vmserver_host_port or not _vm_token:
+        return "虚拟机 vmserver 未就绪,请稍后再试。"
+
+    import socket as sk
+    try:
+        s = sk.create_connection(("127.0.0.1", _vm_vmserver_host_port), timeout=10)
+        s.settimeout(30)
+        req = {"token": _vm_token, "cmd": "proxy", "host": host, "port": int(port)}
+        s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+        ack = json.loads(s.makefile("rb").readline().decode("utf-8", "replace"))
+        if not (ack.get("ok") and ack.get("proxy")):
+            s.close()
+            return f"vmserver proxy 失败:{ack.get('error', 'unknown')}"
+        s.sendall(data.encode("utf-8"))
+        reply = b""
+        while True:
+            c = s.recv(8192)
+            if not c:
+                break
+            reply += c
+            if len(reply) > 2_000_000:
+                break
+        s.close()
+    except Exception as exc:  # noqa: BLE001
+        return f"vm_tcp 失败:{exc}"
+
+    if not reply:
+        return "(guest 服务无响应)"
+    try:
+        text = reply.decode("utf-8")
+        if all(ord(ch) >= 32 or ch in "\r\n\t" for ch in text):
+            return text[:10000]
+        raise ValueError
+    except Exception:
+        return f"(二进制 {len(reply)} 字节,前 200 字节 hex: {reply[:200].hex()})"
+
+
 def _vm_cleanup() -> None:
     """agent 退出时:杀掉本实例的 QEMU,删掉本实例 overlay 和密钥,不留残 VM/盘。
 
@@ -1866,6 +1965,8 @@ TOOL_FUNCS = {
     "vm_start": vm_start,
     "vm_status": vm_status,
     "vm_run": vm_run,
+    "vm_fetch": vm_fetch,
+    "vm_tcp": vm_tcp,
     "web_search": web_search,
 }
 
@@ -2502,6 +2603,47 @@ TOOLS = [
                     }
                 },
                 "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vm_fetch",
+            "description": (
+                "转发访问 guest(沙箱虚拟机)内的 HTTP 服务 —— 通过 vmserver 的 proxy 把 guest 端口代理到本地。"
+                "适合访问你在 guest 里起的 http 服务(如 web:8080)并拿到响应。"
+                "只支持 http,不支持 https。URL 写 guest 视角:http://127.0.0.1:端口/路径。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "guest_url": {
+                        "type": "string",
+                        "description": "guest 内部的 http 地址,如 http://127.0.0.1:8080/status",
+                    }
+                },
+                "required": ["guest_url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vm_tcp",
+            "description": (
+                "向 guest(沙箱虚拟机)内任意 TCP 服务发送一段字节并读回复 —— 经 vmserver 的 proxy 转发。"
+                "通用 TCP,不限于 HTTP:适合 Redis、MySQL 查询、自定协议等请求/答型服务。"
+                "是「发一次、收一次」的一问一答,持续会话类(SSH)不适合。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "guest 内的目标主机,通常是 127.0.0.1"},
+                    "port": {"type": "integer", "description": "guest 内的目标端口"},
+                    "data": {"type": "string", "description": "要发送的字节(把要发的请求编码成文本)"},
+                },
+                "required": ["host", "port", "data"],
             },
         },
     },
