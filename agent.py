@@ -139,6 +139,20 @@ GIT_FORBIDDEN = {"gc", "clean", "rebase", "filter-branch"}
 # 工作区仓库要忽略的本地状态目录(含容器持久化的 .pylibs 包)
 GIT_EXCLUDE = (".agent/", ".trash/", "clones/", "__pycache__/", ".pylibs/")
 
+# ---- 虚拟机(QEMU)沙箱 ----
+# QEMU 二进制目录、基础盘等均可在 .env 里配置;默认指向项目内 temp/(QEMU 完整安装)。
+# 多开隔离:每个 agent 进程一个唯一实例 —— 独立 overlay 盘 + 独立 SSH 口,
+# 基础盘只读共享。这样同时跑多个 agent,各自的虚拟机互不干扰。
+QEMU_DIR = Path(os.environ.get("VM_QEMU_DIR", str(PROJECT_DIR / "temp")))
+QEMU_SYSTEM = Path(os.environ.get("VM_QEMU_SYSTEM", str(QEMU_DIR / "qemu-system-x86_64.exe")))
+QEMU_IMG = Path(os.environ.get("VM_QEMU_IMG", str(QEMU_DIR / "qemu-img.exe")))
+VM_BASE = Path(os.environ.get("VM_BASE", str(QEMU_DIR / "sandbox" / "alpine.qcow2")))
+VM_DIR = Path(os.environ.get("VM_DIR", str(PROJECT_DIR / "vm")))
+VM_ACCEL = os.environ.get("VM_ACCEL", "whpx")      # whpx 快;没开就设 tcg(慢但通用)
+VM_INSTANCE = uuid.uuid4().hex[:8]                 # 每进程唯一,决定盘和口的唯一性
+VM_DISK = VM_DIR / f"work-{VM_INSTANCE}.qcow2"     # 本实例专属 overlay;重置=删它
+_vm_port: int | None = None                        # 启动时动态分配,避免多开抢 2222
+
 # DeepSeek 兼容 OpenAI 协议,只需要换 base_url
 client = OpenAI(
     api_key=os.environ["DEEPSEEK_API_KEY"],
@@ -1440,6 +1454,94 @@ def _inject_pending_images(messages: list[dict]) -> None:
     _pending_images.clear()
 
 
+# ---------------- 虚拟机(QEMU)沙箱 ----------------
+# 在后台启动一个 Alpine 虚拟机作为更强隔离的沙箱。agent 只写 vm/work.qcow2(overlay),
+# 绝不碰基础盘;SSH 通过 hostfwd 2222 转发。启动幂等(SSH 口已监听就不再拉)。
+
+_vm_proc = None
+
+
+def _vm_port_in_use(port: int) -> bool:
+    """探测某宿主导是否已被占用(连得上说明在监听)。"""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def _vm_alloc_port() -> int:
+    """从 2222 起找一个空闲口,确保多开 agent 不撞。"""
+    base = int(os.environ.get("VM_SSH_PORT", "2222"))
+    for port in range(base, base + 40):
+        if not _vm_port_in_use(port):
+            return port
+    raise RuntimeError("SSH 端口分配失败(2222 起 40 个都被占用)")
+
+
+def _vm_is_up() -> bool:
+    """本实例的 SSH 口(动态分配)已监听说明虚拟机起来了。"""
+    if not _vm_port:
+        return False
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", _vm_port), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
+def _vm_ensure() -> None:
+    """确保 vm/ 和本实例 overlay 存在。overlay 从基础盘建,重置=删掉重建。"""
+    VM_DIR.mkdir(parents=True, exist_ok=True)
+    if not VM_DISK.exists():
+        if not (QEMU_IMG.exists() and VM_BASE.exists()):
+            raise FileNotFoundError(f"缺少 QEMU 工具({QEMU_IMG})或基础盘({VM_BASE})")
+        subprocess.run(
+            [str(QEMU_IMG), "create", "-f", "qcow2", "-F", "qcow2",
+             "-b", str(VM_BASE), str(VM_DISK)],
+            check=True, capture_output=True,
+        )
+
+
+def _vm_start() -> str:
+    """后台启动本实例的虚拟机(幂等)。返回状态说明。"""
+    global _vm_proc, _vm_port
+    if _vm_is_up():
+        return f"虚拟机已在运行(实例 {VM_INSTANCE[:8]},SSH 口 {_vm_port} 已监听)。"
+    if _vm_proc is not None and _vm_proc.poll() is None:
+        return "虚拟机正在启动…(进程存活)。"
+    try:
+        _vm_ensure()
+    except Exception as exc:  # noqa: BLE001
+        return f"虚拟机就绪失败:{exc}"
+    if _vm_port is None:
+        try:
+            _vm_port = _vm_alloc_port()
+        except RuntimeError as exc:  # noqa: BLE001
+            return str(exc)
+
+    cmd = [
+        str(QEMU_SYSTEM),
+        "-drive", f"file={VM_DISK},if=virtio",
+        "-netdev", f"user,id=net0,hostfwd=tcp::{_vm_port}-:22",
+        "-device", "virtio-net-pci,netdev=net0",
+        "-display", "none", "-vga", "virtio",
+        "-m", "1024", "-smp", "2",
+        "-accel", VM_ACCEL,
+    ]
+    try:
+        import subprocess as sp
+        flags = sp.CREATE_NO_WINDOW | getattr(sp, "DETACHED_PROCESS", 0)
+        _vm_proc = sp.Popen(cmd, creationflags=flags,
+                            stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+    except Exception as exc:  # noqa: BLE001
+        _vm_proc = None
+        return f"虚拟机启动失败:{exc}"
+    return f"虚拟机已后台启动(实例 {VM_INSTANCE[:8]},SSH 口 {_vm_port},加速 {VM_ACCEL})。"
+
+
 # ---------------- 容器执行(Docker 沙箱) ----------------
 # 让 agent 运行任意 Python/命令,但全程关在容器里:只挂 workspace,非 root,
 # 无特权,cap-drop,资源封顶,超时强杀。网络默认开启(用户接受,便于装包干活)。
@@ -1545,6 +1647,11 @@ def run_python(code: str) -> str:
     return _docker_run(["python", "-c", code])
 
 
+def vm_start() -> str:
+    """确保内部的 Alpine 虚拟机在运行(后台)。如果没起就拉起,已在跑则幂等返回。"""
+    return _vm_start()
+
+
 def run_command(command: str) -> str:
     """在隔离容器里执行一条 shell 命令,同样只访问工作区.给 agent 装包、跑工具。"""
     if not command.strip():
@@ -1580,6 +1687,7 @@ TOOL_FUNCS = {
     "download": download,
     "run_python": run_python,
     "run_command": run_command,
+    "vm_start": vm_start,
     "web_search": web_search,
 }
 
@@ -2178,6 +2286,18 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "vm_start",
+            "description": (
+                "确保内置的 Alpine 虚拟机(QEMU 沙箱)在运行。如果没起就后台拉起一个,"
+                "已在跑则幂等返回。这个虚拟机比容器隔离更强(独立内核),适合让 agent"
+                "在其中做会在容器里放不开的完整系统操作。SSH 端口默认为 2222。"
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "web_search",
             "description": (
                 "用关键词搜索互联网,返回若干条标题、网址和摘要。"
@@ -2217,11 +2337,6 @@ def dispatch(name: str, arguments: str) -> str:
 
 
 # ---------------- 核心循环 ----------------
-
-
-# ---------------- 容器执行(Docker 沙箱) ----------------
-# 让 agent 运行任意 Python/命令,但全程关在容器里:只挂 workspace,非 root,
-# 无特权,cap-drop,资源封顶,超时强杀。网络默认开启(用户接受,便于装包干活)。
 
 
 def run(user_input: str, messages: list[dict]) -> str:
@@ -2340,6 +2455,12 @@ def main() -> None:
         if n:
             console.print(f"已清理 {n} 个上次残留的容器", style="dim")
     console.print(f"Docker:{'✅ ' if ok else '⚠ 不可用 —— '}{msg}", style="dim" if ok else "yellow")
+    # 后台拉起虚拟机(非阻断,失败仅提示,agent 照常启动)
+    try:
+        vm_status = _vm_start()
+        console.print(f"VM:{vm_status}", style="dim" if _vm_is_up() else "yellow")
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"VM:启动失败(不影响 agent)—— {exc}", style="yellow")
     console.print("Agent 已启动。", style="bold")
     console.print("输入多行:连续输入,最后一个空行提交(支持粘贴)。", style="dim")
     console.print("执行中 Ctrl+C=取消本轮;空闲时 Ctrl+C=退出;exit 退出。", style="dim")
