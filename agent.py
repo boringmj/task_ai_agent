@@ -143,7 +143,7 @@ GIT_EXCLUDE = (".agent/", ".trash/", "clones/", "__pycache__/", ".pylibs/")
 
 # ---- 虚拟机(QEMU)沙箱 ----
 # QEMU 二进制目录、基础盘等均可在 .env 里配置;默认指向项目内 temp/(QEMU 完整安装)。
-# 多开隔离:每个 agent 进程一个唯一实例 —— 独立 overlay 盘 + 独立 SSH 口,
+# 多开隔离:每个 agent 进程一个唯一实例 —— 独立 overlay 盘 + 独立 vmserver 口,
 # 基础盘只读共享。这样同时跑多个 agent,各自的虚拟机互不干扰。
 QEMU_DIR = Path(os.environ.get("VM_QEMU_DIR", str(PROJECT_DIR / "temp")))
 QEMU_SYSTEM = Path(os.environ.get("VM_QEMU_SYSTEM", str(QEMU_DIR / "qemu-system-x86_64.exe")))
@@ -1460,9 +1460,9 @@ def _inject_pending_images(messages: list[dict]) -> None:
 
 
 # ---------------- 虚拟机(QEMU)沙箱 ----------------
-# 后台启动一个 Alpine 虚拟机作为更强隔离的沙箱。每进程一把随机 SSH 密钥,
-# 通过串口登录 root/123456 注入公钥 + 启 sshd + 关密码登录。状态机全程可查:
-# BOOTING → LOGIN → PROVISION → READY。agent 只写本实例 overlay,基础盘只读共享。
+# 后台启动一个 Alpine 虚拟机作为更强隔离的沙箱。guest 内置 vmserver(socket),
+# 每启动随机 token 经串口注入。状态机:BOOTING → LOGIN → READY。
+# 执行命令走 vmserver(JSON);agent 只写本实例 overlay,基础盘只读共享。
 
 _vm_proc = None
 _vm_thread: "threading.Thread | None" = None
@@ -1572,7 +1572,7 @@ def _vm_serial_login(port: int) -> _VmSerial:
 
 
 _vm_ser: "_VmSerial | None" = None        # 保持登录态的串口会话
-_vm_serial_lock = threading.Lock()          # vm_run 串行化,避免并发读写串口
+_vm_serial_lock = threading.Lock()          # 串口只用于启动时注入 token,加锁避免冲突
 
 
 def _vm_spawn_and_login(serial_port: int, vmserver_host_port: int) -> None:
@@ -1671,56 +1671,13 @@ def vm_run(command: str) -> str:
         s.close()
         resp = json.loads(line.decode("utf-8", "replace"))
     except Exception as exc:  # noqa: BLE001 - 服务端可能挂了,给提示并可尝试重启
-        return f"连接 vmserver 失败:{exc}。可尝试重启虚拟机(vm_run 会用兜底)。"
+        return f"连接 vmserver 失败:{exc}(vmserver 可能未就绪或已退出,可稍后重试或看 vm_status)。"
 
     if not resp.get("ok"):
         return f"vmserver 错误:{resp.get('error', 'unknown')}"
     out = resp.get("output", "")
     timed = resp.get("timed_out", False)
     return (out[:10000] if out else "(无输出)") + ("\n[命令超时,已中断]" if timed else "")
-
-
-def _vm_reboot() -> str:
-    """最终兜底:杀 QEMU → 删 overlay → 同步重新 boot+登录 → 就绪。约 16~20s。
-
-    vm_run 里交互程序硬卡死、Ctrl+C/ESC 也跳不出时,唯一可靠的办法就是重启这台
-    可弃的沙箱 VM。这里**同步内联**执行(不依赖后台 worker 线程),避免和旧线程竞态。
-    """
-    global _vm_proc, _vm_ser, _vm_thread, _vm_serial_port
-    try:
-        if _vm_proc is not None and _vm_proc.poll() is None:
-            _vm_proc.kill()
-            try:
-                _vm_proc.wait(timeout=5)
-            except Exception:
-                pass
-    except Exception:
-        pass
-    try:
-        if _vm_ser is not None:
-            _vm_ser.s.close()
-    except Exception:
-        pass
-    time.sleep(0.2)
-    try:
-        if VM_DISK.exists():
-            VM_DISK.unlink()
-    except OSError:
-        pass
-    _vm_proc = None
-    _vm_ser = None
-    _vm_thread = None
-    try:
-        _vm_ensure()
-        serial_port = _vm_free_port(3000)
-        _vm_serial_port = serial_port
-        _vm_state_set("booting", "重启:启动 QEMU…", port=serial_port)
-        _vm_spawn_and_login(serial_port)
-        _vm_state_set("ready", "就绪(重启后)", port=serial_port)
-        return "虚拟机已重启并就绪。"
-    except Exception as exc:  # noqa: BLE001
-        _vm_state_set("error", "", error=str(exc))
-        return f"重启失败:{exc}"
 
 
 def _vm_cleanup() -> None:
@@ -2520,8 +2477,8 @@ TOOLS = [
         "function": {
             "name": "vm_status",
             "description": (
-                "查看沙箱虚拟机的当前状态:进行到哪一步(BOOTING/LONGIN/PROVISION)、"
-                "是否已就绪、SSH 端口。虚拟机在后台启动,可能没就绪;用这个确认是否能用。"
+                "查看沙箱虚拟机的当前状态:进行到哪一步、是否已就绪、连接端口。"
+                "虚拟机在后台启动,可能没就绪;用这个确认是否能用。"
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -2531,8 +2488,9 @@ TOOLS = [
         "function": {
             "name": "vm_run",
             "description": (
-                "在沙箱虚拟机里执行一条命令,通过 SSH(本进程专属密钥)进入客户机跑。"
+                "在沙箱虚拟机里执行一条命令,通过 socket 连 guest 内的 vmserver 执行(JSON 协议,非 SSH)。"
                 "适合在隔离的完整系统里装软件、跑服务、做重活。若虚拟机还没就绪,会返回当前进度并让你稍后再试。"
+                "命令自带超时;别用交互式命令(vim/top 等,它们没有终端会直接失败)。"
                 "路径注意:客户机是 Linux,路径风格与宿主不同(没有 D:\\ 那套)。"
             ),
             "parameters": {
