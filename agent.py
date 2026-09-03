@@ -19,7 +19,9 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import uuid
+import queue
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -1190,6 +1192,190 @@ def _pyautogui():
     return pyautogui
 
 
+# ---- 点击标记(顶层红点)----
+# 在 agent 点击处显示一个顶层、点击穿透的红色十字标记:用户可见 AI 点了哪,
+# AI 点完也能截屏核实有没有点歪。Tk 窗口跑在独立线程,避免阻塞 agent 主循环。
+# 标记通过线程安全的 queue 通信;click/move 更新位置,clear_marker 隐藏。
+
+_marker_thread = None
+_marker_queue: "queue.Queue | None" = None
+_marker_hwnd = None            # 供测试/调试读取
+_window_proc_ref = None        # 保持 Win32 回调存活,防止被 GC
+
+_WM_TIMER = 0x0113
+_WM_DESTROY = 0x0002
+_WS_EX_TRANSPARENT = 0x00000020
+_WS_EX_TOOLWINDOW = 0x00000080
+_WS_EX_LAYERED = 0x00080000
+_WS_EX_NOACTIVATE = 0x08000000
+_LWA_ALPHA = 0x00000002
+_SW_HIDE = 0
+_SW_SHOWNOACTIVATE = 4
+
+
+def _win32_setup(user32, gdi32, ctypes, wintypes) -> None:
+    """给用到的 Win32 函数设 64 位原型 —— 不设会按 32 位签名传参,句柄/参数被截断。"""
+    user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, wintypes.UINT]
+    user32.SetWindowPos.restype = wintypes.BOOL
+    user32.SetLayeredWindowAttributes.argtypes = [
+        wintypes.HWND, wintypes.COLORREF, ctypes.c_byte, wintypes.DWORD]
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.SetTimer.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p]
+    user32.SetTimer.restype = ctypes.c_void_p
+    user32.KillTimer.argtypes = [wintypes.HWND, ctypes.c_void_p]
+    user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+    user32.GetMessageW.restype = ctypes.c_int
+    user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.DispatchMessageW.restype = wintypes.LPARAM
+    user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.DefWindowProcW.restype = wintypes.LPARAM
+    user32.DestroyWindow.argtypes = [wintypes.HWND]
+    user32.PostQuitMessage.argtypes = [ctypes.c_int]
+    user32.RegisterClassW.argtypes = [ctypes.c_void_p]
+    gdi32.CreateSolidBrush.argtypes = [wintypes.COLORREF]
+    gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
+
+
+def _marker_worker(marker_queue) -> None:
+    """专属线程:纯 Win32 顶层红块窗口 + 消息循环。
+
+    之前用 Tk 在后台线程不渲染(Tk 必须跑主线程)。Win32 窗口允许在任何带消息循环
+    的线程里运行,所以改用 ctypes 自绘:顶层、半透明红块、点击穿透、不抢焦点、
+    不进任务栏。通过线程安全的 queue 接收 move/clear/quit。
+    """
+    global _marker_hwnd, _window_proc_ref
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    kernel32 = ctypes.windll.kernel32
+    _win32_setup(user32, gdi32, ctypes, wintypes)
+
+    WNDPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_longlong, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+
+    class WNDCLASSW(ctypes.Structure):
+        _fields_ = [
+            ("style", wintypes.UINT),
+            ("lpfnWndProc", WNDPROC),
+            ("cbClsExtra", ctypes.c_int),
+            ("cbWndExtra", ctypes.c_int),
+            ("hInstance", wintypes.HINSTANCE),
+            ("hIcon", wintypes.HANDLE),
+            ("hCursor", wintypes.HANDLE),
+            ("hbrBackground", wintypes.HBRUSH),
+            ("lpszMenuName", wintypes.LPCWSTR),
+            ("lpszClassName", wintypes.LPCWSTR),
+        ]
+
+    state = {"hide_deadline": None}
+
+    def _hide(hwnd):
+        user32.ShowWindow(hwnd, _SW_HIDE)
+        state["hide_deadline"] = None
+
+    def wnd_proc(hwnd, msg, wparam, lparam):
+        if msg == _WM_DESTROY:
+            user32.PostQuitMessage(0)
+            return 0
+        if msg == _WM_TIMER:
+            # 延时隐藏:到点且没被新的动作取消,就隐藏
+            if state["hide_deadline"] is not None and datetime.now().timestamp() >= state["hide_deadline"]:
+                _hide(hwnd)
+                return 0
+            try:
+                cmd = marker_queue.get_nowait()
+            except queue.Empty:
+                return 0
+            if cmd[0] == "move":
+                _, x, y = cmd
+                # SWP_NOACTIVATE|SWP_SHOWWINDOW:置顶显示但不抢焦点
+                user32.SetWindowPos(hwnd, -1, int(x) - 17, int(y) - 17, 34, 34, 0x0010 | 0x0040)
+                user32.ShowWindow(hwnd, _SW_SHOWNOACTIVATE)
+                state["hide_deadline"] = None  # 新动作取消延时隐藏
+            elif cmd[0] == "clear":
+                delay_ms = cmd[1]
+                if delay_ms > 0:
+                    state["hide_deadline"] = datetime.now().timestamp() + delay_ms / 1000.0
+                else:
+                    _hide(hwnd)
+            elif cmd[0] == "quit":
+                user32.DestroyWindow(hwnd)
+                return 0
+            return 0
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    wndproc = WNDPROC(wnd_proc)
+    _window_proc_ref = wndproc  # 保活,防 GC
+
+    hinst = kernel32.GetModuleHandleW(None)
+    red_brush = gdi32.CreateSolidBrush(0x0000FF)  # COLORREF 红
+    wc = WNDCLASSW()
+    wc.style = 0
+    wc.lpfnWndProc = wndproc
+    wc.hInstance = hinst
+    wc.hbrBackground = red_brush
+    wc.lpszClassName = "AgentClickMarkerWin"
+    user32.RegisterClassW(ctypes.byref(wc))
+
+    hwnd = user32.CreateWindowExW(
+        _WS_EX_LAYERED | _WS_EX_TRANSPARENT | _WS_EX_TOOLWINDOW | _WS_EX_NOACTIVATE,
+        "AgentClickMarkerWin", "", 0x80000000, 0, 0, 34, 34, None, None, hinst, None)
+    _marker_hwnd = hwnd
+    user32.SetLayeredWindowAttributes(hwnd, 0, 200, _LWA_ALPHA)  # 半透明
+    user32.ShowWindow(hwnd, _SW_HIDE)  # 初始隐藏
+    user32.SetTimer(hwnd, 1, 40, None)  # 40ms 轮询队列
+
+    msg = wintypes.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+        user32.TranslateMessage(ctypes.byref(msg))
+        user32.DispatchMessageW(ctypes.byref(msg))
+    user32.DestroyWindow(hwnd)
+
+
+def _ensure_marker():
+    global _marker_thread, _marker_queue
+    if _marker_thread is None or not _marker_thread.is_alive():
+        _marker_queue = queue.Queue()
+        _marker_thread = threading.Thread(target=_marker_worker, args=(_marker_queue,), daemon=True)
+        _marker_thread.start()
+    return _marker_queue
+
+
+def _show_marker(x, y) -> None:
+    """更新标记位置并置顶显示。失败不抛(不影响真实点击)。"""
+    try:
+        _ensure_marker().put(("move", int(x), int(y)))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _clear_marker(delay_seconds: float = 0.0) -> None:
+    """隐藏标记;delay_seconds>0 表示延时消失。失败不抛。"""
+    try:
+        _ensure_marker().put(("clear", int(delay_seconds * 1000)))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def clear_marker(delay_seconds: float = 0.0) -> str:
+    """隐藏点击红点。给 delay_seconds 则延时后消失,如 10 表示最后一次点击的标记 10 秒后消失。"""
+    if delay_seconds < 0:
+        raise ValueError("delay_seconds 不能为负")
+    _clear_marker(delay_seconds)
+    if delay_seconds > 0:
+        return f"将在 {delay_seconds} 秒后隐藏点击标记。"
+    return "已隐藏点击标记。"
+
+
 def type_text(text: str) -> str:
     """在当前焦点窗口输入一段文本(支持中文等 unicode,pyautogui 走剪贴板粘贴)。"""
     pg = _pyautogui()
@@ -1221,13 +1407,15 @@ def click(x: int, y: int, button: str = "left") -> str:
     pg = _pyautogui()
     if button not in ("left", "right", "middle"):
         raise ValueError(f"button 只支持 left/right/middle,收到 {button}")
+    _show_marker(x, y)  # 先显示红点(顶层可穿透),再点击,用户/AI 都能看到落点
     pg.click(int(x), int(y), button=button)
-    return f"已在 ({x}, {y}) 用 {button} 键点击。"
+    return f"已在 ({x}, {y}) 用 {button} 键点击,红点标记在终点。"
 
 
 def move_mouse(x: int, y: int) -> str:
     """把光标移到屏幕坐标 (x, y),用屏幕原始分辨率。"""
     pg = _pyautogui()
+    _show_marker(x, y)
     pg.moveTo(int(x), int(y))
     return f"已移动光标到 ({x}, {y})。"
 
@@ -1387,6 +1575,7 @@ TOOL_FUNCS = {
     "press_keys": press_keys,
     "click": click,
     "move_mouse": move_mouse,
+    "clear_marker": clear_marker,
     "fetch_url": fetch_url,
     "download": download,
     "run_python": run_python,
@@ -1860,6 +2049,26 @@ TOOLS = [
                     "y": {"type": "integer", "description": "纵坐标(像素,原始分辨率)"},
                 },
                 "required": ["x", "y"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clear_marker",
+            "description": (
+                "隐藏点击时显示的那个红色标记。给 delay_seconds 则延时后消失,"
+                "例如 10 表示最后一次点击的红点 10 秒后再隐藏。"
+                "确认 UI 交互结束时调用;点完需要截屏核实时,别急着清,先 screen 再看。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "delay_seconds": {
+                        "type": "number",
+                        "description": "延时多少秒后隐藏;0 表示立刻隐藏",
+                    }
+                },
             },
         },
     },
