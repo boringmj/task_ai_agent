@@ -157,6 +157,7 @@ VM_VMSERVER_PORT = 40000                            # vmserver 在 guest 内监�
 _vm_port: int | None = None                        # 启动时动态分配,避免多开抢 2222
 _vm_token = ""                                     # 每启动随机生成、经串口注入 guest,服务端每次请求读它
 _vm_vmserver_host_port: int | None = None           # 宿主侧转发到 guest:40000 的端口
+_vm_tunnels: dict = {}                              # host_port -> 常驻转发入口(宿主监听 + relay)
 
 # DeepSeek 兼容 OpenAI 协议,只需要换 base_url
 client = OpenAI(
@@ -1680,6 +1681,99 @@ def vm_run(command: str) -> str:
     return (out[:10000] if out else "(无输出)") + ("\n[命令超时,已中断]" if timed else "")
 
 
+def _shq(s: str) -> str:
+    """POSIX 单引号转义:把 guest 侧字符串安全地放进单引号里。"""
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _vm_exec_raw(command: str, timeout: int = 60) -> dict:
+    """发一条 exec 到 guest 里的 vmserver,返回**原始响应 dict**(不截断、不拼摘要)。
+
+    与 vm_run 的区别:这里拿的是完整响应(含任意大 output),由调用方决定怎么用;
+    vm_run 面向模型、输出会截断后回显;文件传输(读回 base64)要的是完整字节,故走这里,
+    这样文件内容只存在于工具函数内部,不会填进对话上下文。
+    """
+    st = _vm_state_get()
+    if st["status"] != "ready":
+        return {"ok": False, "error": f"虚拟机还没就绪({st['step'] or st['status']})"}
+    if not _vm_vmserver_host_port or not _vm_token:
+        return {"ok": False, "error": "vmserver 未就绪"}
+    import socket as sk, json
+    req = {"token": _vm_token, "cmd": "exec", "command": command, "timeout": timeout}
+    try:
+        s = sk.create_connection(("127.0.0.1", _vm_vmserver_host_port), timeout=10)
+        s.settimeout(timeout + 30)
+        s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+        line = s.makefile("rb").readline()
+        s.close()
+        return json.loads(line.decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"连接 vmserver 失败:{exc}"}
+
+
+def vm_push(local_path: str, guest_path: str) -> str:
+    """把工作区里的一个文件上传到虚拟机?(宿主 → guest)。
+
+    文件字节经 base64 分块走 vmserver 写入 guest,**全程在工具内部完成**,
+    只回「已上传 (n 字节)」这类摘要,不会把文件内容塞进对话上下文。
+    local_path 必须是工作区内路径(相对或绝对);guest_path 是 guest 里的绝对路径(如 /root/a.txt)。
+    """
+    import base64
+    local = safe_path(local_path)
+    if not local.is_file():
+        return f"错误:工作区里没有 {local_path}(解析为 {local})"
+    gp = _shq(guest_path)
+    data = local.read_bytes()
+    base = base64.b64encode(data).decode("ascii")  # base64 字符不含单引号,可安全放进单引号
+    if not base:
+        _vm_exec_raw(f"rm -f {gp}; mkdir -p \"$(dirname {gp})\"; : > {gp}", 30)
+        return f"已把工作区文件上传到 guest:{guest_path}(空文件,0 字节)。"
+    _vm_exec_raw(f"rm -f {gp}; mkdir -p \"$(dirname {gp})\"", 30)
+    CHUNK = 64 * 1024  # 每块 64KB 源,base64 后 ~87KB,低于 guest 参数限制
+    for i in range(0, len(base), CHUNK):
+        piece = base[i:i + CHUNK]
+        redir = ">" if i == 0 else ">>"  # 首块覆盖、其余追加
+        resp = _vm_exec_raw(f"printf '%s' '{piece}' | base64 -d {redir} {gp}", 60)
+        if not resp.get("ok"):
+            return f"错误:第 {i // CHUNK + 1} 块写入失败:{resp.get('error', '')} — {resp.get('output', '')[:200]}"
+    return f"已把工作区文件 {local_path} 上传到 guest:{guest_path}({len(data)} 字节)。"
+
+
+def vm_pull(guest_path: str, local_path: str) -> str:
+    """把虚拟机里的一个文件下载到工作区?(guest → 宿主)。
+
+    文件经 vmserver 分块 base64 读回,**在工具内部解码后写入工作区 local_path**,
+    只回「已下载 (n 字节)」摘要,文件内容不进对话上下文。
+    local_path 是工作区路径;guest_path 是 guest 里的绝对路径(如 /root/out.txt)。
+    """
+    import base64
+    local = safe_path(local_path)
+    gp = _shq(guest_path)
+    size_resp = _vm_exec_raw(f"if [ -f {gp} ]; then stat -c %s {gp}; else echo MISSING; fi", 30)
+    size_raw = (size_resp.get("output") or "").strip()
+    if size_raw == "MISSING":
+        return f"错误:虚拟机里没有 {guest_path}"
+    try:
+        total = int(size_raw.splitlines()[-1])
+    except ValueError:
+        return f"错误:无法读取 guest 文件大小({size_raw!r})"
+    BS = 64 * 1024          # 与 vmserver 200KB 输出上限对齐:base64 后 ~87KB < 200KB
+    out = bytearray()
+    blocks = (total + BS - 1) // BS
+    for b in range(blocks):
+        cmd = f"dd if={gp} bs={BS} skip={b} count=1 2>/dev/null | base64 | tr -d '\n'"
+        resp = _vm_exec_raw(cmd, 60)
+        if not resp.get("ok"):
+            return f"错误:读 guest {guest_path} 第 {b + 1}/{blocks} 块失败:{resp.get('error', '')}"
+        try:
+            out += base64.b64decode((resp.get("output") or "").strip())
+        except Exception as exc:  # noqa: BLE001
+            return f"错误:guest 第 {b + 1} 块 base64 解码失败:{exc}"
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_bytes(bytes(out))
+    return f"已把 guest {guest_path} 下载到工作区:{local_path}({len(out)} 字节)。"
+
+
 def vm_fetch(guest_url: str) -> str:
     """转发访问 guest 内的 HTTP 服务:通过 vmserver 的 proxy,把 guest 端口代理到本地。
 
@@ -1779,6 +1873,102 @@ def vm_tcp(host: str, port: int, data: str) -> str:
         return f"(二进制 {len(reply)} 字节,前 200 字节 hex: {reply[:200].hex()})"
 
 
+def _vm_proxy_relay(guest_port: int, client) -> None:
+    """把一条宿主连接经 vmserver proxy 转发到 guest:guest_port,双向泵字节。"""
+    import socket as sk, json
+    try:
+        up = sk.create_connection(("127.0.0.1", _vm_vmserver_host_port), timeout=10)
+        up.settimeout(60)
+        req = {"token": _vm_token, "cmd": "proxy", "host": "127.0.0.1", "port": guest_port}
+        up.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+        ack = json.loads(up.makefile("rb").readline().decode("utf-8", "replace"))
+        if not (ack.get("ok") and ack.get("proxy")):
+            up.close()
+            client.close()
+            return
+    except Exception:
+        try:
+            client.close()
+        except Exception:
+            pass
+        return
+
+    def pump(a, b):
+        try:
+            while True:
+                d = a.recv(8192)
+                if not d:
+                    break
+                b.sendall(d)
+        except Exception:
+            pass
+        try:
+            b.shutdown(sk.SHUT_WR)
+        except Exception:
+            pass
+
+    threading.Thread(target=pump, args=(client, up), daemon=True).start()
+    threading.Thread(target=pump, args=(up, client), daemon=True).start()
+
+
+def vm_tunnel(host_port: int, guest_port: int) -> str:
+    """把 guest 内某个端口常驻转发到宿主导 —— 浏览器等直接访问宿主口即可。
+
+    每条进来的宿主连接,都会经 vmserver proxy(带本进程 token)转到 guest:guest_port。
+    真正实现"把 VM 端口映射到宿主导、可浏览器访问"。
+    """
+    st = _vm_state_get()
+    if st["status"] != "ready":
+        return f"虚拟机还没就绪,当前:{st['step'] or st['status']}。请用 vm_status 或稍后再试。"
+    if not _vm_vmserver_host_port or not _vm_token:
+        return "虚拟机 vmserver 未就绪,请稍后再试。"
+    import socket as sk
+    sk.setdefaulttimeout(1.0)
+    if int(host_port) in _vm_tunnels:
+        vm_tunnel_stop(int(host_port))
+    srv = sk.socket(sk.AF_INET, sk.SOCK_STREAM)
+    srv.setsockopt(sk.SOL_SOCKET, sk.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", int(host_port)))
+    srv.listen(16)
+    srv.settimeout(1.0)
+
+    def accept_loop():
+        while int(host_port) in _vm_tunnels:
+            try:
+                client, _ = srv.accept()
+            except sk.timeout:
+                continue
+            except OSError:
+                break
+            if int(host_port) in _vm_tunnels:
+                threading.Thread(target=_vm_proxy_relay, args=(int(guest_port), client), daemon=True).start()
+            else:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    _vm_tunnels[int(host_port)] = {"server": srv, "thread": threading.Thread(target=accept_loop, daemon=True)}
+    _vm_tunnels[int(host_port)]["thread"].start()
+    return f"已开通宿主 127.0.0.1:{host_port} → guest:{guest_port}。浏览器访问 http://127.0.0.1:{host_port}"
+
+
+def vm_tunnel_stop(host_port: int | None = None) -> str:
+    """停止一个(或全部)常驻转发。"""
+    if host_port is not None and int(host_port) not in _vm_tunnels:
+        return f"宿主 {host_port} 没有在转发。"
+    targets = [int(host_port)] if host_port is not None else list(_vm_tunnels)
+    for hp in targets:
+        entry = _vm_tunnels.pop(hp, None)
+        if not entry:
+            continue
+        try:
+            entry["server"].close()  # 关闭监听,accept 循环退出
+        except Exception:
+            pass
+    return "已停止指定转发。" if host_port is not None else "已停止所有转发。"
+
+
 def _vm_cleanup() -> None:
     """agent 退出时:杀掉本实例的 QEMU,删掉本实例 overlay 和密钥,不留残 VM/盘。
 
@@ -1809,6 +1999,10 @@ def _vm_cleanup() -> None:
     try:
         if keydir.exists():
             shutil.rmtree(keydir, ignore_errors=True)
+    except Exception:
+        pass
+    try:
+        vm_tunnel_stop()  # 关闭所有常驻转发
     except Exception:
         pass
 
@@ -1967,6 +2161,10 @@ TOOL_FUNCS = {
     "vm_run": vm_run,
     "vm_fetch": vm_fetch,
     "vm_tcp": vm_tcp,
+    "vm_tunnel": vm_tunnel,
+    "vm_tunnel_stop": vm_tunnel_stop,
+    "vm_push": vm_push,
+    "vm_pull": vm_pull,
     "web_search": web_search,
 }
 
@@ -2644,6 +2842,79 @@ TOOLS = [
                     "data": {"type": "string", "description": "要发送的字节(把要发的请求编码成文本)"},
                 },
                 "required": ["host", "port", "data"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vm_tunnel",
+            "description": (
+                "把 guest(沙箱虚拟机)内某个端口**常驻转发**到宿主导,浏览器等程序可直接访问宿主口。"
+                "真正实现「将 VM 端口映射到宿主」,例如 vm_tunnel(8080, 8080) 后访问 http://127.0.0.1:8080。"
+                "每条连接经 vmserver proxy(带本进程 token)转发,不暴露原生 hostfwd。"
+                "用完记得 vm_tunnel_stop。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "host_port": {"type": "integer", "description": "宿主导要监听的口,如 8080"},
+                    "guest_port": {"type": "integer", "description": "guest 内的目标端口,如 8080"},
+                },
+                "required": ["host_port", "guest_port"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vm_tunnel_stop",
+            "description": "停止一个(给 host_port)或全部(不给)常驻端口转发。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "host_port": {"type": "integer", "description": "要停止的宿主导;不填则停全部"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vm_push",
+            "description": (
+                "把工作区里的一个文件上传到虚拟机(宿主 → guest)。"
+                "文件字节走 vmserver 全程在工具内部处理,只回「已上传 (n 字节)」摘要,不会把文件内容塞进上下文。"
+                "local_path 是工作区路径;guest_path 是 guest 里的绝对路径(如 /root/a.txt)。"
+                "当 guest 里要做的事需要工作区的文件(脚本、配置、素材)时用它,比 base64 手拼省事。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "local_path": {"type": "string", "description": "工作区内的文件路径(相对或绝对)"},
+                    "guest_path": {"type": "string", "description": "guest 里要写入的绝对路径,如 /root/a.txt"},
+                },
+                "required": ["local_path", "guest_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vm_pull",
+            "description": (
+                "把虚拟机里的一个文件下载到工作区(guest → 宿主)。"
+                "文件字节走 vmserver 全程在工具内部处理,只回「已下载 (n 字节)」摘要,不会把文件内容塞进上下文。"
+                "guest_path 是 guest 里的绝对路径;local_path 是工作区路径。"
+                "当 guest 里产出了要拿回工作区的文件(结果、日志、下载物)时用它。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "guest_path": {"type": "string", "description": "guest 里的绝对路径,如 /root/out.txt"},
+                    "local_path": {"type": "string", "description": "工作区内要写入的文件路径"},
+                },
+                "required": ["guest_path", "local_path"],
             },
         },
     },

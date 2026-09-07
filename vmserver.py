@@ -116,10 +116,11 @@ def handle(conn) -> None:
             return
         req = json.loads(line.decode("utf-8", "replace"))
     except Exception:
-        try:
-            respond(conn, {"ok": False, "error": "bad request"})
-        except Exception:
-            pass
+        respond(conn, {"ok": False, "error": "bad request"})
+        return
+    # 必须是 JSON 对象,否则是坏请求 —— 防非 dict(如 [1,2])让 req.get 崩掉线程
+    if not isinstance(req, dict):
+        respond(conn, {"ok": False, "error": "bad request"})
         return
     # 每次请求都读 token(改 token 立即生效,无需重启服务)
     stored = current_token()
@@ -131,8 +132,12 @@ def handle(conn) -> None:
         return
     cmd = req.get("cmd")
     if cmd == "exec":
-        handle_exec(conn, req)
+        try:
+            handle_exec(conn, req)
+        except Exception:
+            respond(conn, {"ok": False, "error": "internal error"})
     elif cmd == "proxy":
+        # proxy 连接成功后会回 "ok" 并起 relay 线程(自带错误处理),这里不包 try 以免二次 respond
         handle_proxy(conn, req)
     else:
         respond(conn, {"ok": False, "error": f"unknown cmd {cmd!r}"})
