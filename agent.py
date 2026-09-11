@@ -3146,15 +3146,18 @@ def dispatch(name: str, arguments: str) -> str:
 # ---------------- 核心循环 ----------------
 
 
-def _stream_model(messages: list[dict]) -> tuple[str, list[dict]]:
-    """流式调用模型:实时显示思考(reasoning_content),返回 (正文, tool_calls 列表)。
+def _stream_model(messages: list[dict]) -> tuple[str, list[dict], str]:
+    """流式调用模型:实时显示思考(reasoning_content),返回 (正文, tool_calls, 思考文本)。
 
     - 模型有思考就逐字显示(暗色斜体),没有就自然跳过 —— 自适应,无需开关。
-    - 思考(reasoning_content)只用于显示,**不进 messages** —— DeepSeek 要求它不能回传给下一轮。
+    - 思考文本会**随 assistant 消息回传**(见 run())。DeepSeek V4 规则:请求携带 tools 时,
+      历史所有轮的 reasoning_content 必须完整回传,否则 API 返回 400;
+      (旧模型如 deepseek-reasoner 规则相反、不该回传 —— 将来若换非 DeepSeek 提供方需注意区分。)
     - 正文不做流式渲染(攒完整段后交给调用方 Markdown 渲染),只有思考是实时刷出的。
     - tool_calls 在流式下是分片到达的,按 index 合并 id / name / arguments。
     """
     content_parts: list[str] = []
+    reason_parts: list[str] = []
     tool_slots: dict[int, dict] = {}   # index -> {"id","type","function":{"name","arguments"}}
     reasoning_open = False             # 思考区已开始且尚未闭合(还没换行)
 
@@ -3173,6 +3176,7 @@ def _stream_model(messages: list[dict]) -> tuple[str, list[dict]]:
         delta = chunk.choices[0].delta
         rc = getattr(delta, "reasoning_content", None)
         if rc:
+            reason_parts.append(rc)
             if not reasoning_open:
                 console.print("* 思考", style="dim", markup=False)
                 reasoning_open = True
@@ -3198,7 +3202,7 @@ def _stream_model(messages: list[dict]) -> tuple[str, list[dict]]:
     _close_reasoning()
 
     tool_calls = [tool_slots[i] for i in sorted(tool_slots)]
-    return "".join(content_parts), tool_calls
+    return "".join(content_parts), tool_calls, "".join(reason_parts)
 
 
 def run(user_input: str, messages: list[dict]) -> str:
@@ -3210,13 +3214,18 @@ def run(user_input: str, messages: list[dict]) -> str:
 
     for _ in range(MAX_STEPS):
         try:
-            content, tool_calls = _stream_model(messages)
+            content, tool_calls, reasoning = _stream_model(messages)
         except Exception as exc:  # noqa: BLE001 - 网络/流中断,给提示而不是崩掉
             return f"错误:调用模型失败({type(exc).__name__}: {exc})"
 
-        # 把模型这一轮的回复原样放回对话历史,messages 就是 agent 的全部记忆
-        # 注意:只放 content 和 tool_calls,不放 reasoning_content(DeepSeek 要求思考不回传)
-        assistant_msg: dict = {"role": "assistant", "content": content}
+        # 把模型这一轮的回复放回对话历史,messages 就是 agent 的全部记忆。
+        # reasoning_content 必须一并带着:DeepSeek V4 在带 tools 的请求里要求历史轮
+        # 完整回传思维链,漏了会 400 —— 即使该轮没有实际调用工具也一样。
+        assistant_msg: dict = {
+            "role": "assistant",
+            "content": content,
+            "reasoning_content": reasoning,
+        }
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
         messages.append(assistant_msg)
