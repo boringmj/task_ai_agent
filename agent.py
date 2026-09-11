@@ -1345,6 +1345,7 @@ _window_proc_ref = None        # 保持 Win32 回调存活,防止被 GC
 
 _WM_TIMER = 0x0113
 _WM_DESTROY = 0x0002
+_WS_EX_TOPMOST = 0x00000008
 _WS_EX_TRANSPARENT = 0x00000020
 _WS_EX_TOOLWINDOW = 0x00000080
 _WS_EX_LAYERED = 0x00080000
@@ -1438,8 +1439,9 @@ def _marker_worker(marker_queue) -> None:
                 return 0
             if cmd[0] == "move":
                 _, x, y = cmd
-                # SWP_NOACTIVATE|SWP_SHOWWINDOW:置顶显示但不抢焦点
-                user32.SetWindowPos(hwnd, -1, int(x) - 17, int(y) - 17, 34, 34, 0x0010 | 0x0040)
+                # SWP_NOACTIVATE|SWP_SHOWWINDOW:移动并显示,不抢焦点;HWND_TOPMOST 显式重申置顶
+                user32.SetWindowPos(hwnd, wintypes.HWND(-1),
+                                    int(x) - 17, int(y) - 17, 34, 34, 0x0010 | 0x0040)
                 user32.ShowWindow(hwnd, _SW_SHOWNOACTIVATE)
                 state["hide_deadline"] = None  # 新动作取消延时隐藏
             elif cmd[0] == "clear":
@@ -1468,7 +1470,9 @@ def _marker_worker(marker_queue) -> None:
     user32.RegisterClassW(ctypes.byref(wc))
 
     hwnd = user32.CreateWindowExW(
-        _WS_EX_LAYERED | _WS_EX_TRANSPARENT | _WS_EX_TOOLWINDOW | _WS_EX_NOACTIVATE,
+        # WS_EX_TOPMOST 在创建时就带上:窗口天生置顶,不依赖后面 SetWindowPos 的 hwndInsertAfter
+        _WS_EX_TOPMOST | _WS_EX_LAYERED | _WS_EX_TRANSPARENT
+        | _WS_EX_TOOLWINDOW | _WS_EX_NOACTIVATE,
         "AgentClickMarkerWin", "", 0x80000000, 0, 0, 34, 34, None, None, hinst, None)
     _marker_hwnd = hwnd
     user32.SetLayeredWindowAttributes(hwnd, 0, 200, _LWA_ALPHA)  # 半透明
