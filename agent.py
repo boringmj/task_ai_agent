@@ -39,7 +39,7 @@ load_dotenv()
 # deepseek-chat 支持工具调用;deepseek-reasoner(R1)目前不支持 tools
 MODEL = "deepseek-v4-flash-vision-exp"
 # 护栏:一次提问最多允许几轮"模型 <-> 工具"往返,防止死循环烧钱
-MAX_STEPS = 30
+MAX_STEPS = 50
 # 护栏:列目录时最多返回多少项,避免超大目录把上下文撑爆
 MAX_ENTRIES = 200
 # 护栏:单次写入的字节上限,防止模型一口气写爆磁盘
@@ -96,6 +96,9 @@ _pending_images: list[str] = []  # 本轮待注入的图片 data URL,img 工具�
 # 截屏:最长边会被压缩到这个像素数。视觉模型对大图会内部缩小,原样送 4K 截图
 # 只会浪费图像 token 甚至被拒,所以发送前自己压成小数。
 SCREEN_MAX_DIM = 1280
+
+# 剪贴板读进上下文的字符上限(读太长会白白占窗口)
+MAX_CLIPBOARD_CHARS = 10_000
 
 PROJECT_DIR = Path(__file__).parent.resolve()
 # 系统提示词跟着代码走,不放进沙箱 —— 模型不能读自己的提示词,更不能改
@@ -1521,17 +1524,121 @@ def clear_marker(delay_seconds: float = 0.0) -> str:
     return "已隐藏点击标记。"
 
 
-def type_text(text: str) -> str:
-    """在当前焦点窗口输入一段文本(支持中文等 unicode,pyautogui 走剪贴板粘贴)。"""
-    pg = _pyautogui()
+def _send_unicode_text(text: str) -> None:
+    """用 SendInput 逐字符**直接键入**文本(KEYEVENTF_UNICODE),完全不经过剪贴板。
+
+    支持任意 Unicode(中文、emoji —— emoji 走 UTF-16 代理对);换行/制表符用 VK_RETURN/VK_TAB。
+    少数老旧或自绘控件(部分游戏/Qt)可能不认这种输入,那时可改走 type_text(via_clipboard=True)。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    KEYEVENTF_UNICODE = 0x0004
+    KEYEVENTF_KEYUP = 0x0002
+    INPUT_KEYBOARD = 1
+    VK_RETURN, VK_TAB = 0x0D, 0x09
+    ULONG_PTR = ctypes.c_uint64 if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_uint32
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ULONG_PTR)]
+
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                    ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
+
+    class HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD),
+                    ("wParamH", wintypes.WORD)]
+
+    class _U(ctypes.Union):
+        _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT), ("hi", HARDWAREINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+    def ev(scan, flags, vk=0):
+        inp = INPUT()
+        inp.type = INPUT_KEYBOARD
+        inp.u.ki.wVk = vk
+        inp.u.ki.wScan = scan
+        inp.u.ki.dwFlags = flags
+        inp.u.ki.time = 0
+        inp.u.ki.dwExtraInfo = 0
+        return inp
+
+    events = []
+    for ch in text:
+        if ch == "\n":
+            events.append(ev(0, 0, VK_RETURN))
+            events.append(ev(0, KEYEVENTF_KEYUP, VK_RETURN))
+        elif ch == "\t":
+            events.append(ev(0, 0, VK_TAB))
+            events.append(ev(0, KEYEVENTF_KEYUP, VK_TAB))
+        elif ch == "\r":
+            continue
+        else:
+            code = ord(ch)
+            codes = [code] if code <= 0xFFFF else None
+            if codes is None:  # 非 BMP 字符(如 emoji):拆成 UTF-16 代理对
+                c = code - 0x10000
+                codes = [0xD800 + (c >> 10), 0xDC00 + (c & 0x3FF)]
+            for c in codes:
+                events.append(ev(c, KEYEVENTF_UNICODE))
+                events.append(ev(c, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
+    if not events:
+        raise ValueError("没有可输入的字符")
+
+    user32 = ctypes.windll.user32
+    user32.SendInput.argtypes = (ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int)
+    user32.SendInput.restype = ctypes.c_uint
+    BATCH = 128  # 每批 128 个事件(约 64 字符),避免一次塞过大的数组
+    for i in range(0, len(events), BATCH):
+        chunk = events[i:i + BATCH]
+        arr = (INPUT * len(chunk))(*chunk)
+        sent = user32.SendInput(len(chunk), arr, ctypes.sizeof(INPUT))
+        if sent != len(chunk):
+            raise OSError(f"SendInput 只发出 {sent}/{len(chunk)} 个事件(可能被前台窗口或 UIPI 拦截)")
+        time.sleep(0.005)  # 略等一下,让目标应用跟得上
+
+
+def read_clipboard() -> str:
+    """读取系统剪贴板里的**文本**内容(读进来进上下文,方便你说的"拿到原文再直接键入")。
+
+    只读文本;剪贴板里若是图片/文件(非文本),这里取不到。内容过长会截断,避免撑爆上下文。
+    """
+    import pyperclip
+    try:
+        text = pyperclip.paste()
+    except Exception as exc:  # noqa: BLE001
+        return f"错误:读取剪贴板失败:{exc}"
+    if not text:
+        return "剪贴板里没有文本(可能是空的,或只含图片/文件等非文本内容)。"
+    if len(text) > MAX_CLIPBOARD_CHARS:
+        return (f"剪贴板文本(共 {len(text)} 字符,已截断到前 {MAX_CLIPBOARD_CHARS}):\n"
+                + text[:MAX_CLIPBOARD_CHARS])
+    return f"剪贴板文本({len(text)} 字符):\n{text}"
+
+
+def type_text(text: str, via_clipboard: bool = False) -> str:
+    """在当前焦点窗口输入文本(支持中文等 Unicode)。
+
+    默认用 SendInput **逐字符直接键入,不碰剪贴板** —— 所以你剪贴板里复制的东西不会被覆盖。
+    via_clipboard=true 才退回"复制 + ctrl+v"的老办法(兼容性最好,但**会覆盖剪贴板**);
+    只有遇到不认直接键入的老旧/自绘控件时才用它。
+    """
     if not text.strip():
         raise ValueError("要输入的文本不能为空或纯空白")
-    # pyautogui.write 对中文是"逐字剪贴板+ctrl+v",对 QQ 这类富文本输入框经常失灵。
-    # 改为"整段复制一次 + 一次 ctrl+v"更可靠,也绕开输入法(粘贴不进 IME)。
-    import pyperclip
-    pyperclip.copy(text)
-    pg.hotkey("ctrl", "v")
-    return f"已通过粘贴输入 {len(text)} 个字符到当前焦点窗口。"
+    if via_clipboard:
+        pg = _pyautogui()
+        import pyperclip
+        pyperclip.copy(text)
+        pg.hotkey("ctrl", "v")
+        return f"已通过粘贴输入 {len(text)} 个字符(注意:剪贴板已被覆盖)。"
+    _send_unicode_text(text)
+    return f"已直接键入 {len(text)} 个字符(未使用剪贴板)。"
 
 
 def press_keys(keys: str) -> str:
@@ -2334,6 +2441,7 @@ TOOL_FUNCS = {
     "img": img,
     "screen": screen,
     "type_text": type_text,
+    "read_clipboard": read_clipboard,
     "press_keys": press_keys,
     "click": click,
     "move_mouse": move_mouse,
@@ -2815,17 +2923,35 @@ TOOLS = [
         "function": {
             "name": "type_text",
             "description": (
-                "在当前有焦点的窗口输入一段文本。直接作用于宿主机的真实屏幕(不是容器)。"
-                "适合把文本填进输入框、搜索框等。支持中文等 unicode。"
+                "在当前有焦点的窗口输入一段文本(支持中文等 unicode)。直接作用于宿主机的真实屏幕。"
+                "默认用 SendInput 逐字符直接键入,**不碰剪贴板** —— 用户自己复制的内容不会被覆盖。"
+                "只有碰到不认直接键入的老旧/自绘控件时才用 via_clipboard=true 退回粘贴(那样会覆盖剪贴板)。"
                 "注意:作用对象取决于当前焦点窗口,输入前确认焦点是对的。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "text": {"type": "string", "description": "要输入的文本,可含中文"},
+                    "via_clipboard": {
+                        "type": "boolean",
+                        "description": "true 时改用粘贴(兼容性更好但会覆盖剪贴板),默认 false",
+                    },
                 },
                 "required": ["text"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_clipboard",
+            "description": (
+                "读取系统剪贴板里的文本内容(只读,不修改剪贴板)。"
+                "当用户说「我刚复制了…」「用剪贴板里的内容」时用它把内容拿到手,"
+                "之后可直接用这部分文本(如用 type_text 键入),不必去覆盖剪贴板。"
+                "只能读文本;若剪贴板是图片/文件则读不到。"
+            ),
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
