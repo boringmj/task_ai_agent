@@ -2962,6 +2962,61 @@ def dispatch(name: str, arguments: str) -> str:
 # ---------------- 核心循环 ----------------
 
 
+def _stream_model(messages: list[dict]) -> tuple[str, list[dict]]:
+    """流式调用模型:实时显示思考(reasoning_content),返回 (正文, tool_calls 列表)。
+
+    - 模型有思考就逐字显示(暗色斜体),没有就自然跳过 —— 自适应,无需开关。
+    - 思考(reasoning_content)只用于显示,**不进 messages** —— DeepSeek 要求它不能回传给下一轮。
+    - 正文不做流式渲染(攒完整段后交给调用方 Markdown 渲染),只有思考是实时刷出的。
+    - tool_calls 在流式下是分片到达的,按 index 合并 id / name / arguments。
+    """
+    content_parts: list[str] = []
+    tool_slots: dict[int, dict] = {}   # index -> {"id","type","function":{"name","arguments"}}
+    reasoning_open = False             # 思考区已开始且尚未闭合(还没换行)
+
+    def _close_reasoning() -> None:
+        nonlocal reasoning_open
+        if reasoning_open:
+            console.print()            # 思考结束,换行
+            reasoning_open = False
+
+    stream = client.chat.completions.create(
+        model=MODEL, messages=messages, tools=TOOLS, stream=True,
+    )
+    for chunk in stream:
+        if not getattr(chunk, "choices", None):  # 可能有无 choices 的 chunk(如用量统计)
+            continue
+        delta = chunk.choices[0].delta
+        rc = getattr(delta, "reasoning_content", None)
+        if rc:
+            if not reasoning_open:
+                console.print("* 思考", style="dim", markup=False)
+                reasoning_open = True
+            # 思考文本可能含 [ ] 之类的字符,关掉 markup/highlight,原样输出
+            console.print(rc, style="dim italic", end="", markup=False,
+                          highlight=False, soft_wrap=True)
+        if delta.content:
+            _close_reasoning()
+            content_parts.append(delta.content)
+        for tcd in (delta.tool_calls or []):
+            idx = tcd.index if tcd.index is not None else 0
+            slot = tool_slots.setdefault(
+                idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+            )
+            if getattr(tcd, "id", None):
+                slot["id"] = tcd.id
+            fn = getattr(tcd, "function", None)
+            if fn is not None:
+                if getattr(fn, "name", None):
+                    slot["function"]["name"] = fn.name
+                if getattr(fn, "arguments", None):
+                    slot["function"]["arguments"] += fn.arguments
+    _close_reasoning()
+
+    tool_calls = [tool_slots[i] for i in sorted(tool_slots)]
+    return "".join(content_parts), tool_calls
+
+
 def run(user_input: str, messages: list[dict]) -> str:
     global _searches_this_turn, _pending_images
     _searches_this_turn = 0  # 搜索配额按轮重置,而不是整个会话共用一份
@@ -2970,27 +3025,28 @@ def run(user_input: str, messages: list[dict]) -> str:
     messages.append({"role": "user", "content": user_input})
 
     for _ in range(MAX_STEPS):
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            tools=TOOLS,
-        )
-        msg = response.choices[0].message
+        try:
+            content, tool_calls = _stream_model(messages)
+        except Exception as exc:  # noqa: BLE001 - 网络/流中断,给提示而不是崩掉
+            return f"错误:调用模型失败({type(exc).__name__}: {exc})"
 
         # 把模型这一轮的回复原样放回对话历史,messages 就是 agent 的全部记忆
-        assistant_msg: dict = {"role": "assistant", "content": msg.content or ""}
-        if msg.tool_calls:
-            assistant_msg["tool_calls"] = [tc.model_dump() for tc in msg.tool_calls]
+        # 注意:只放 content 和 tool_calls,不放 reasoning_content(DeepSeek 要求思考不回传)
+        assistant_msg: dict = {"role": "assistant", "content": content}
+        if tool_calls:
+            assistant_msg["tool_calls"] = tool_calls
         messages.append(assistant_msg)
 
         # 模型不再要求调用工具 —— 说明它已经能回答了,循环结束
-        if not msg.tool_calls:
-            return msg.content or ""
+        if not tool_calls:
+            return content
 
-        for call in msg.tool_calls:
+        for call in tool_calls:
+            fname = call["function"]["name"]
+            fargs = call["function"]["arguments"]
             # markup=False:工具参数里的 [ ] 不该被 rich 当成样式标记解析
             console.print(
-                f"• {call.function.name}({call.function.arguments})",
+                f"• {fname}({fargs})",
                 style="dim",
                 markup=False,
                 highlight=False,
@@ -2998,8 +3054,8 @@ def run(user_input: str, messages: list[dict]) -> str:
             messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": dispatch(call.function.name, call.function.arguments),
+                    "tool_call_id": call.get("id", ""),
+                    "content": dispatch(fname, fargs),
                 }
             )
 
