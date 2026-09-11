@@ -47,6 +47,15 @@ MAX_WRITE_BYTES = 3 * 1024 * 1024
 # 即使在沙箱内,这些文件也禁止读取 —— 纵深防御,防止沙箱里混入密钥文件
 DENY_READ = {".env"}
 
+# ---- 文件搜索(按名 / 按内容)护栏 ----
+# 搜索很容易命中一大片,和列目录同理:必须设上限,否则把上下文撑爆。
+MAX_FIND_RESULTS = 300         # find_files 最多返回多少条命中
+MAX_GREP_MATCHES = 200         # grep_files 最多返回多少条命中行
+MAX_GREP_FILE_BYTES = 2 * 1024 * 1024  # 单文件超过此大小直接跳过(避免卡在超大/二进制文件上)
+MAX_GREP_LINE_CHARS = 200      # 每条命中行的内容字符上限
+# 递归搜索时剪掉的目录:隐藏目录(.git/.trash/.agent/.venv…)与常见的依赖/缓存目录
+SEARCH_SKIP_DIRS = {"__pycache__", "node_modules", ".pylibs"}
+
 # ---- 联网相关的护栏 ----
 FETCH_TIMEOUT = 10.0  # 单次请求超时(秒)
 MAX_FETCH_BYTES = 3 * 1024 * 1024  # 最多下载多少字节,超出直接截断
@@ -220,6 +229,118 @@ def list_files(path: str = ".", show_hidden: bool = False) -> str:
     if len(entries) > MAX_ENTRIES:
         lines.append(f"…(共 {len(entries)} 项,只显示前 {MAX_ENTRIES} 项)")
     return "\n".join([f"{target}(共 {len(entries)} 项):", *lines])
+
+
+def _iter_search_paths(root: Path):
+    """递归产出 root 下的文件和子目录,剪掉隐藏目录与依赖/缓存目录。
+
+    搜索不该翻进 .git/.trash/.agent/.venv 这些地方 —— 要么是本地状态、要么是海量噪音。
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            d for d in dirnames
+            if not d.startswith(".") and d not in SEARCH_SKIP_DIRS
+        ]
+        base = Path(dirpath)
+        for d in dirnames:
+            yield base / d
+        for f in filenames:
+            yield base / f
+
+
+def _rel(path: Path) -> str:
+    """统一用相对工作区的 posix 路径回显:短、可跨平台、能直接再喂给别的工具。"""
+    try:
+        return path.relative_to(ROOT).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def find_files(name: str, path: str = ".", include_dirs: bool = False) -> str:
+    """按文件名查找工作区里的文件(递归)。
+
+    支持 * ? [ ] 通配符(不区分大小写);不含通配符时按子串匹配文件名。
+    include_dirs=true 时把目录名也纳入匹配。只搜工作区,自动跳过隐藏目录与依赖目录。
+    """
+    import fnmatch
+    root = safe_path(path)
+    if not root.exists():
+        return f"错误:{root} 不存在"
+    pat = name.lower()
+    has_glob = any(ch in name for ch in "*?[")
+    hits: list[Path] = []
+    for p in _iter_search_paths(root):
+        if p.is_dir() and not include_dirs:
+            continue
+        low = p.name.lower()
+        if fnmatch.fnmatch(low, pat) if has_glob else (pat in low):
+            hits.append(p)
+    if not hits:
+        what = "文件或目录" if include_dirs else "文件"
+        return f"没有匹配「{name}」的{what}(搜索范围:{_rel(root)})"
+    hits.sort(key=lambda p: _rel(p).lower())
+    shown = hits[:MAX_FIND_RESULTS]
+    lines = [f"{_rel(p)}{'/' if p.is_dir() else ''}" for p in shown]
+    tail = f"\n…(共 {len(hits)} 条,只显示前 {MAX_FIND_RESULTS} 条)" if len(hits) > MAX_FIND_RESULTS else ""
+    return "\n".join([f"匹配「{name}」共 {len(hits)} 条:", *lines]) + tail
+
+
+def grep_files(pattern: str, path: str = ".", ignore_case: bool = False) -> str:
+    """按内容搜索工作区里的文本文件(正则),返回命中的文件、行号与行内容。
+
+    只搜文本文件(二进制/无法按 UTF-8 解码的自动跳过),自动跳过隐藏目录与依赖目录。
+    结果上限 MAX_GREP_MATCHES 条,超出会提示截断。path 可以是文件或目录。
+    """
+    try:
+        rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+    except re.error as exc:
+        return f"错误:正则表达式无效:{exc}"
+    root = safe_path(path)
+    if not root.exists():
+        return f"错误:{root} 不存在"
+    targets = [root] if root.is_file() else [p for p in _iter_search_paths(root) if p.is_file()]
+
+    results: list[tuple[Path, int, str]] = []
+    files_hit: set[Path] = set()
+    truncated = False
+    for fp in targets:
+        if fp.name in DENY_READ:
+            continue
+        try:
+            if fp.stat().st_size > MAX_GREP_FILE_BYTES:
+                continue
+            raw = fp.read_bytes()
+        except OSError:
+            continue
+        if b"\x00" in raw[:8000]:  # 含空字节 → 视为二进制,跳过
+            continue
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if rx.search(line):
+                results.append((fp, i, line.strip()[:MAX_GREP_LINE_CHARS]))
+                files_hit.add(fp)
+                if len(results) >= MAX_GREP_MATCHES:
+                    truncated = True
+                    break
+        if truncated:
+            break
+
+    if not results:
+        return f"没有匹配「{pattern}」的内容(搜索范围:{_rel(root)})"
+    out: list[str] = []
+    last: Path | None = None
+    for fp, ln, txt in results:
+        if fp != last:
+            out.append(f"{_rel(fp)}:")
+            last = fp
+        out.append(f"  {ln}: {txt}")
+    summary = f"共 {len(results)} 处命中,{len(files_hit)} 个文件"
+    if truncated:
+        summary += f"(已达上限 {MAX_GREP_MATCHES},后续未继续)"
+    return summary + "\n" + "\n".join(out)
 
 
 def _check_writable(target: Path, content: str) -> int:
@@ -2133,6 +2254,8 @@ TOOL_FUNCS = {
     "read_file": read_file,
     "get_current_directory": get_current_directory,
     "list_files": list_files,
+    "find_files": find_files,
+    "grep_files": grep_files,
     "write_file": write_file,
     "append_file": append_file,
     "edit_lines": edit_lines,
@@ -2230,6 +2353,67 @@ TOOLS = [
                         "description": "是否包含以点开头的隐藏文件,默认 false",
                     },
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_files",
+            "description": (
+                "按文件名在工作区里递归查找(支持目录)。"
+                "name 支持 * ? [ ] 通配符,不区分大小写;不含通配符时按「文件名包含该子串」匹配。"
+                "不知道文件叫什么名字、或在某个目录树里找某类文件时用它。"
+                "只返回路径(相对工作区),要看内容还要再用 read_file。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "文件名模式,如 *.py、test*、config.json;不含通配符时按子串匹配",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "在哪个目录下搜(相对工作区),省略则为工作区根目录",
+                    },
+                    "include_dirs": {
+                        "type": "boolean",
+                        "description": "是否把目录名也纳入匹配,默认 false(只找文件)",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep_files",
+            "description": (
+                "按文件内容在工作区里搜索,返回命中的文件路径、行号和行内容。"
+                "pattern 是正则(不是通配符);ignore_case=true 可忽略大小写。"
+                "只搜文本文件(二进制自动跳过),结果是「文件:行号: 内容」的形式。"
+                "想知道某个函数/变量/字符串在哪些文件里出现过时用它,比一个个 read_file 高效得多。"
+                "命中数有上限,超出会提示截断。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "要匹配的正则表达式,如 def main、TODO|FIXME、requests\\.get",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "搜索范围(相对工作区的文件或目录),省略则为整个工作区",
+                    },
+                    "ignore_case": {
+                        "type": "boolean",
+                        "description": "是否忽略大小写,默认 false",
+                    },
+                },
+                "required": ["pattern"],
             },
         },
     },
