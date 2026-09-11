@@ -1589,9 +1589,15 @@ def drag(from_x: int, from_y: int, to_x: int, to_y: int,
             f"({button} 键,{duration}s),红点标记在终点。")
 
 
+# Windows 滚轮单位:一个"格"= WHEEL_DELTA = 120。pyautogui 在 Windows 上把 clicks
+# 原样当 dwData 传给 mouse_event(不乘 120),所以必须自己换算,否则 scroll(1) 只有 1/120 格。
+_WHEEL_DELTA = 120
+_MOUSEEVENTF_HWHEEL = 0x01000  # 水平滚轮;pyautogui 的 hscroll 在 Windows 上发的是垂直事件,故自己发
+
+
 def scroll(clicks: int, x: int | None = None, y: int | None = None,
            horizontal: bool = False) -> str:
-    """滚动鼠标滚轮。clicks 正数向上/向左,负数向下/向右;一格约 1 个滚轮刻度。
+    """滚动鼠标滚轮。clicks 是**格数**:正数向上/向左,负数向下/向右;1 格 ≈ 滚动 3 行(Windows 默认)。
 
     给了 x/y 就先把光标移到那里的再滚(滚哪个区域往往由光标位置决定);
     不给就在光标当前位置滚。horizontal=true 走水平滚轮。
@@ -1603,13 +1609,19 @@ def scroll(clicks: int, x: int | None = None, y: int | None = None,
         pg.moveTo(int(x), int(y))
     pos = pg.position()
     _show_marker(pos.x, pos.y)              # 标记滚动发生的位置
+    delta = int(clicks) * _WHEEL_DELTA      # 换算成 Windows 的滚轮位移量
     if horizontal:
-        pg.hscroll(int(clicks))
+        import ctypes
+        u = ctypes.windll.user32
+        u.mouse_event.argtypes = [ctypes.c_uint32, ctypes.c_uint32,
+                                  ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+        u.mouse_event(_MOUSEEVENTF_HWHEEL, 0, 0, delta & 0xFFFFFFFF, 0)
     else:
-        pg.scroll(int(clicks))
+        pg.scroll(delta)
     axis = "水平" if horizontal else "垂直"
     direction = "正向(上/左)" if clicks > 0 else "反向(下/右)"
-    return f"已在 ({pos.x}, {pos.y}) {axis}滚动 {abs(int(clicks))} 格,方向:{direction}。"
+    return (f"已在 ({pos.x}, {pos.y}) {axis}滚动 {abs(int(clicks))} 格"
+            f"(约 {abs(int(clicks)) * 3} 行文本),方向:{direction}。")
 
 
 def _inject_pending_images(messages: list[dict]) -> None:
@@ -2902,14 +2914,19 @@ TOOLS = [
         "function": {
             "name": "scroll",
             "description": (
-                "滚动鼠标滚轮。clicks 正数向上/向左,负数向下/向右(一格约一个滚轮刻度)。"
+                "滚动鼠标滚轮。clicks 是**格数**:正数向上/向左,负数向下/向右。"
+                "1 格 ≈ 滚动 3 行文本(Windows 默认),所以**别给 1、2 这种小值 —— 几乎看不出动静**;"
+                "滚一屏通常要 10~30 格,想直接翻到顶/底可以给 ±50 或更大。"
                 "给了 x/y 就先把光标移到那里再滚 —— 滚哪个区域通常由光标位置决定;不给则在当前光标处滚。"
                 "horizontal=true 走水平滚动(横向表格/看板)。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "clicks": {"type": "integer", "description": "滚动格数:正=向上/左,负=向下/右"},
+                    "clicks": {
+                        "type": "integer",
+                        "description": "滚动格数:正=向上/左,负=向下/右。滚一屏通常 10~30,别给 1、2 这种小值",
+                    },
                     "x": {"type": "integer", "description": "可选:滚动位置横坐标(不填则在当前光标处滚)"},
                     "y": {"type": "integer", "description": "可选:滚动位置纵坐标"},
                     "horizontal": {"type": "boolean", "description": "是否水平滚动,默认 false"},
