@@ -1565,6 +1565,53 @@ def move_mouse(x: int, y: int) -> str:
     return f"已移动光标到 ({x}, {y})。"
 
 
+def drag(from_x: int, from_y: int, to_x: int, to_y: int,
+         duration: float = 0.3, button: str = "left") -> str:
+    """按住鼠标从 (from_x, from_y) 拖到 (to_x, to_y) —— 拖窗口/拖文件/框选/拖滑块。
+
+    坐标用屏幕原始分辨率。duration 是拖动耗时(秒),给 0 是瞬间到位;
+    某些界面(拖拽排序、画布)需要平滑移动才认,给个 0.2~0.5 更稳。
+    红点先标在起点,松开后移到终点。**拖动会真实改变桌面状态(可能移动文件/窗口),执行前务必确认起点与落点。**
+    """
+    if button not in ("left", "right", "middle"):
+        raise ValueError(f"button 只支持 left/right/middle,收到 {button}")
+    pg = _pyautogui()
+    duration = max(0.0, min(float(duration), 5.0))
+    _show_marker(from_x, from_y)           # 起点先亮,让用户/AI 看到从哪开始
+    pg.moveTo(int(from_x), int(from_y))
+    pg.mouseDown(button=button)
+    try:
+        pg.moveTo(int(to_x), int(to_y), duration=duration)
+    finally:
+        pg.mouseUp(button=button)          # 无论中途是否出错(如 failsafe),都要松开,别卡住按键
+    _show_marker(to_x, to_y)               # 松手后标记停在终点
+    return (f"已从 ({from_x}, {from_y}) 拖到 ({to_x}, {to_y})"
+            f"({button} 键,{duration}s),红点标记在终点。")
+
+
+def scroll(clicks: int, x: int | None = None, y: int | None = None,
+           horizontal: bool = False) -> str:
+    """滚动鼠标滚轮。clicks 正数向上/向左,负数向下/向右;一格约 1 个滚轮刻度。
+
+    给了 x/y 就先把光标移到那里的再滚(滚哪个区域往往由光标位置决定);
+    不给就在光标当前位置滚。horizontal=true 走水平滚轮。
+    """
+    if int(clicks) == 0:
+        raise ValueError("滚动量 clicks 不能为 0(正数向上/左,负数向下/右)")
+    pg = _pyautogui()
+    if x is not None and y is not None:
+        pg.moveTo(int(x), int(y))
+    pos = pg.position()
+    _show_marker(pos.x, pos.y)              # 标记滚动发生的位置
+    if horizontal:
+        pg.hscroll(int(clicks))
+    else:
+        pg.scroll(int(clicks))
+    axis = "水平" if horizontal else "垂直"
+    direction = "正向(上/左)" if clicks > 0 else "反向(下/右)"
+    return f"已在 ({pos.x}, {pos.y}) {axis}滚动 {abs(int(clicks))} 格,方向:{direction}。"
+
+
 def _inject_pending_images(messages: list[dict]) -> None:
     """把本轮登记的图片作为 image_url 内容段注入对话,让视觉模型能真正看到。
 
@@ -2278,6 +2325,8 @@ TOOL_FUNCS = {
     "press_keys": press_keys,
     "click": click,
     "move_mouse": move_mouse,
+    "drag": drag,
+    "scroll": scroll,
     "clear_marker": clear_marker,
     "fetch_url": fetch_url,
     "download": download,
@@ -2822,6 +2871,50 @@ TOOLS = [
                     "y": {"type": "integer", "description": "纵坐标(像素,原始分辨率)"},
                 },
                 "required": ["x", "y"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "drag",
+            "description": (
+                "按住鼠标从一个坐标拖到另一个坐标 —— 用于拖窗口、拖文件、框选、拖滑块/进度条等。"
+                "坐标用屏幕原始分辨率。duration 是拖动耗时(秒),拖拽排序/画布类界面需要平滑移动,给 0.2~0.5 更稳。"
+                "红点先标在起点,松开后停在终点。**拖动会真实改变桌面状态(可能移动文件或窗口),执行前务必确认起点和落点。**"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "from_x": {"type": "integer", "description": "起点横坐标"},
+                    "from_y": {"type": "integer", "description": "起点纵坐标"},
+                    "to_x": {"type": "integer", "description": "终点横坐标"},
+                    "to_y": {"type": "integer", "description": "终点纵坐标"},
+                    "duration": {"type": "number", "description": "拖动耗时秒数,默认 0.3;0 为瞬间到位"},
+                    "button": {"type": "string", "description": "鼠标键:left(默认)/right/middle"},
+                },
+                "required": ["from_x", "from_y", "to_x", "to_y"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scroll",
+            "description": (
+                "滚动鼠标滚轮。clicks 正数向上/向左,负数向下/向右(一格约一个滚轮刻度)。"
+                "给了 x/y 就先把光标移到那里再滚 —— 滚哪个区域通常由光标位置决定;不给则在当前光标处滚。"
+                "horizontal=true 走水平滚动(横向表格/看板)。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "clicks": {"type": "integer", "description": "滚动格数:正=向上/左,负=向下/右"},
+                    "x": {"type": "integer", "description": "可选:滚动位置横坐标(不填则在当前光标处滚)"},
+                    "y": {"type": "integer", "description": "可选:滚动位置纵坐标"},
+                    "horizontal": {"type": "boolean", "description": "是否水平滚动,默认 false"},
+                },
+                "required": ["clicks"],
             },
         },
     },
