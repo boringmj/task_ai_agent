@@ -27,6 +27,7 @@ class Context:
     """
 
     messages: list[dict]
+    args: str = ""      # 指令名后面的参数(dispatch 会填),如 `/switch abc123` 里的 abc123
 
 
 def command(name: str, description: str, aliases: tuple[str, ...] = ()):
@@ -85,6 +86,7 @@ def dispatch(text: str, ctx: Context) -> str | None:
         known = "、".join(n for n, _, _ in all_commands())
         return f"没有名为 {name} 的指令。可用:{known}"
     fn, _ = entry
+    ctx.args = stripped[len(name):].strip()      # 指令名后面的部分,交给指令自己解析
     return fn(ctx)
 
 

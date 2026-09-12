@@ -162,7 +162,9 @@ def _resolve_session() -> None:
     entry = _index_load()["workspaces"].get(_workspace_key()) or {}
     last = entry.get("last")
 
-    if last and session_dir(last).exists() and not _owner_alive(last):
+    # 直接**试着原子认领**:认领成功就说明这个会话没人用,接回它。
+    # 不用"先查占用者再认领"——那两步之间照样有窗口,而 try_claim 一步到位。
+    if last and session_dir(last).exists() and try_claim(last):
         _current_session = _safe_name(last)
         register_session(_current_session)          # 顺手更新 last_used
         _resolve_note = "接回上次的会话"
@@ -170,6 +172,7 @@ def _resolve_session() -> None:
 
     _current_session = new_session_id()
     register_session(_current_session)
+    try_claim(_current_session)                     # 新会话也立刻占住
     if last and session_dir(last).exists():
         _resolve_note = (f"上一个会话 {last} 正被另一个 agent 占用,"
                          f"为免互相覆盖已另开新会话(用 /sessions 可看全部)")
@@ -349,36 +352,73 @@ def _pid_alive(pid: int) -> bool:
         return True          # 查不出来就当它活着,宁可多提醒一次
 
 
-def claim_owner(sid: str) -> str:
-    """登记本实例为占用者;若发现另一个活着的实例也在用,返回提醒文案(空串表示没冲突)。"""
-    warning = ""
+def try_claim(sid: str) -> bool:
+    """**原子地**认领这个会话;被别人活着占着就返回 False。
+
+    用独占创建(O_CREAT|O_EXCL)而不是"先读文件再写文件":后者在两个进程同时启动时
+    会让双方都读到"没人占",于是双双认领成功、一起用同一个会话。独占创建由操作
+    系统保证只有一个能成功,这是关闭那个竞态的关键。
+
+    文件已存在时再分辨:是自己的(重复认领)算成功;占用者还活着算失败;
+    占用者已死(上次崩溃/强杀留下的陈迹)就清掉重试一次。
+    """
     path = owner_file(sid)
     try:
-        if path.exists():
-            info = json.loads(path.read_text(encoding=_ENCODING) or "{}")
-            other = int(info.get("pid") or 0)
-            if other and other != os.getpid() and _pid_alive(other):
-                since = info.get("started", "?")
-                warning = (
-                    f"⚠ 这个会话正被另一个 agent 实例占用(pid {other},启动于 {since})。"
-                    f"两边会往同一个会话文件里写、还会共用同一块虚拟机磁盘,"
-                    f"历史可能互相覆盖、虚拟机也可能互相踩;"
-                    f"建议给另一个实例设不同的 AGENT_SESSIONS_DIR。"
-                )
-    except Exception:  # noqa: BLE001 - 占用者文件坏了不该挡启动
-        pass
-
-    try:
         session_dir(sid).mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({
-            "pid": os.getpid(),
-            "instance": uuid.uuid4().hex[:8],
-            "started": datetime.now().isoformat(timespec="seconds"),
-            "workspace": str(ROOT),
-        }, ensure_ascii=False), encoding=_ENCODING)
-    except Exception:  # noqa: BLE001
-        pass
-    return warning
+    except OSError:
+        return False
+
+    payload = json.dumps({
+        "pid": os.getpid(),
+        "instance": uuid.uuid4().hex[:8],
+        "started": datetime.now().isoformat(timespec="seconds"),
+        "workspace": str(ROOT),
+    }, ensure_ascii=False).encode(_ENCODING)
+
+    for _ in range(3):
+        # 先把内容写进临时文件,再用**硬链接**原子地占住目标名(os.link 在目标已存在
+        # 时失败)。这样目标文件一旦出现就是完整内容。
+        #
+        # 别改成"os.open(O_CREAT|O_EXCL) 再 write":那两步之间有窗口,并发的另一个
+        # 进程会读到**空文件**、JSON 解析失败、误判成陈迹把它删掉,于是双双抢到
+        # (实测 8 个进程抢到 2 个)。
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_bytes(payload)
+            try:
+                os.link(tmp, path)
+                return True
+            except FileExistsError:
+                pass
+            except OSError:
+                return False
+        except OSError:
+            return False
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        # 目标已存在,看看是谁占的
+        try:
+            pid = int(json.loads(path.read_text(encoding=_ENCODING) or "{}").get("pid") or 0)
+        except Exception:  # noqa: BLE001
+            pid = 0
+        if pid == os.getpid():
+            return True                     # 本来就是自己的
+        if pid and _pid_alive(pid):
+            return False                    # 别人活着占着,让
+        try:
+            path.unlink()                   # 占用者已死 → 陈迹,清掉重试
+        except OSError:
+            return False
+    return False
+
+
+def claim_owner(sid: str) -> bool:
+    """认领当前会话(启动时用)。返回是否拿到;拿不到说明正被别人用着。"""
+    return try_claim(sid)
 
 
 def release_owner(sid: str, instance: str | None = None) -> None:

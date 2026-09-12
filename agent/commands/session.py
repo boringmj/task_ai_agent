@@ -44,6 +44,76 @@ def cmd_sessions(ctx: Context) -> str:
 
 
 @command(
+    "/switch",
+    "切换活跃会话。`/switch <会话id>` 切到那个会话,`/switch new` 新开一个会话。"
+    "只能切到**没被别的 agent 占用**的会话上;切换会连带把虚拟机换成该会话自己的磁盘"
+    "(所以 VM 会重启用)。用户在几段不同主题的会话之间来回切时建议用它。",
+)
+def cmd_switch(ctx: Context) -> str:
+    """切到指定会话或新建一个,并把历史与虚拟机一并换过去。"""
+    from ..session import (current_session_id, list_sessions, load_session,
+                           new_session_id, release_owner, session_dir,
+                           set_current_session, try_claim)
+    from ..tools.vm import vm_switch_session
+
+    target = ctx.args.strip()
+    cur = current_session_id()
+
+    if not target:
+        rows = list_sessions()
+        lines = [f"当前会话:{cur}", "", "用 `/switch <id>` 切换,或 `/switch new` 新开一个。", ""]
+        lines.append("可选会话(标 ⚠ 的已被别的 agent 占用,切不过去):")
+        for s in rows:
+            busy = " ⚠被占用" if not s.get("active") and not _free(s["id"]) else ""
+            lines.append(f"  {s['id']}{'  ← 当前' if s['active'] else busy}")
+        return "\n".join(lines)
+
+    creating = target.lower() in ("new", "新")
+    if creating:
+        target = new_session_id()
+    else:
+        if not session_dir(target).exists():
+            return f"没有会话 {target}。用 /sessions 看有哪些。"
+
+    if target == cur:
+        return f"已经在会话 {target} 上了。"
+
+    # 原子认领目标:抢不到说明别人正在用,就不切
+    if not try_claim(target):
+        return f"会话 {target} 正被另一个 agent 占用,不能切过去(换一个,或 /switch new)。"
+
+    release_owner(cur)          # 先拿到新的,再放旧的 —— 反过来的话认领失败就没主了
+    set_current_session(target)
+
+    hist, note = load_session(target)
+    kept = 0
+    while kept < len(ctx.messages) and ctx.messages[kept].get("role") == "system":
+        kept += 1
+    del ctx.messages[kept:]
+    ctx.messages.extend(hist)
+    ctx.messages.append({
+        "role": "system",
+        "content": (
+            f"【程序提示】刚刚切换到了会话 {target}{'(新建的)' if creating else ''}。"
+            f"上面的对话属于这个会话,和刚才那段无关,别混在一起。\n"
+            f"- 工作区文件与长期记忆是全局的,继续有效。\n"
+            f"- **虚拟机已按本会话自己的磁盘重启**(会话之间 VM 是分开的),"
+            f"里面有什么、要装什么,先用 vm_status 看状态再动手。"
+        ),
+    })
+
+    vm_switch_session()          # 每会话一块盘,换会话就得换 VM
+    kind = "已新建并切到" if creating else "已切到"
+    return f"{kind}会话 {target}({note})。虚拟机正在按该会话的磁盘重启,可稍后用 vm_status 看。"
+
+
+def _free(sid: str) -> bool:
+    """这个会话当前有没有被别的活着的 agent 占着(供 /switch 列表标注)。"""
+    from ..session import _owner_alive
+    return not _owner_alive(sid)
+
+
+@command(
     "/compact",
     "把已有的对话历史压缩成一份摘要,释放上下文(会保留用户的偏好、已做的决定、"
     "文件改动和待办)。上下文占用偏高、对话很长,或用户问「怎么省 token / 怎么清一下上下文」时建议用它。",

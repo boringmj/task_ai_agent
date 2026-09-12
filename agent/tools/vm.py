@@ -711,6 +711,20 @@ def vm_tunnel_stop(host_port: int | None = None) -> str:
     return "已停止指定转发。" if host_port is not None else "已停止所有转发。"
 
 
+def vm_switch_session() -> None:
+    """会话切换后重启虚拟机,让它挂到**新会话自己那块盘**上。
+
+    每个会话一块磁盘,所以换会话就必须换虚拟机 —— 否则新会话的历史配着旧会话的
+    机器接着用,两边对不上(你以为在 A 的环境里,实际操作的是 B 的文件系统)。
+    收掉当前这台时会先让 guest 刷盘(见 _vm_cleanup),不会丢数据。
+    """
+    global _vm_thread
+    _vm_cleanup()                      # 刷盘 + 停掉旧会话的 VM + 关转发
+    _vm_thread = None                  # 线程已结束,允许重新拉起
+    _vm_state_set("idle", "会话已切换,虚拟机将重新启动")
+    _vm_kickoff()
+
+
 def vm_reset() -> str:
     """把本会话的虚拟机恢复成出厂状态:停掉它、删掉会话磁盘,再用基础镜像重建。
 
