@@ -38,6 +38,10 @@ load_dotenv()
 
 # deepseek-chat 支持工具调用;deepseek-reasoner(R1)目前不支持 tools
 MODEL = "deepseek-v4-flash-vision-exp"
+# 模型上下文上限(token):用于显示占用百分比、以及自动压缩阈值。按需在 .env 调 MAX_CONTEXT_TOKENS
+MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "1000000"))
+# 上下文占用达到这个比例就自动压缩(工具调用过程中也会触发)
+AUTO_COMPACT_RATIO = float(os.environ.get("AUTO_COMPACT_RATIO", "0.9"))
 # 护栏:一次提问最多允许几轮"模型 <-> 工具"往返,防止死循环烧钱
 MAX_STEPS = 50
 # 护栏:列目录时最多返回多少项,避免超大目录把上下文撑爆
@@ -3502,6 +3506,51 @@ def dispatch(name: str, arguments: str) -> str:
 
 # ---------------- 核心循环 ----------------
 
+# 最近一次请求的 token 用量(来自 API 的 usage)。prompt_tokens 就是"当前上下文多大"。
+_last_usage: dict = {}
+# 本会话累计:请求数、总输出 token(输入每轮都要重发,累计没有意义,不计)
+_total_usage: dict = {"requests": 0, "completion": 0}
+
+
+def _record_usage(usage) -> None:
+    """记录 API 返回的用量(流式要开 include_usage 才有)。"""
+    if usage is None:
+        return
+    _last_usage["prompt"] = getattr(usage, "prompt_tokens", 0) or 0
+    _last_usage["completion"] = getattr(usage, "completion_tokens", 0) or 0
+    _last_usage["cache_hit"] = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
+    _total_usage["requests"] += 1
+    _total_usage["completion"] += _last_usage["completion"]
+
+
+def _context_ratio() -> float:
+    """最近一次请求的上下文占用比例(0~1),用于判断要不要自动压缩。"""
+    if MAX_CONTEXT_TOKENS <= 0:
+        return 0.0
+    return _last_usage.get("prompt", 0) / MAX_CONTEXT_TOKENS
+
+
+def usage_line() -> str:
+    """当前上下文用量的一行摘要(还没有数据时返回空串)。"""
+    prompt = _last_usage.get("prompt")
+    if not prompt:
+        return ""
+    pct = (prompt / MAX_CONTEXT_TOKENS * 100) if MAX_CONTEXT_TOKENS else 0.0
+    text = (f"上下文 {prompt:,}/{MAX_CONTEXT_TOKENS:,} tokens({pct:.1f}%,"
+            f"本轮输出 {_last_usage.get('completion', 0):,}")
+    hit = _last_usage.get("cache_hit", 0)
+    if hit:
+        text += f",缓存命中 {hit:,}"
+    return text + ")"
+
+
+def usage_detail() -> str:
+    """给 /tokens 用的较详细用量:当前上下文 + 本会话累计。"""
+    if not _last_usage.get("prompt"):
+        return "(还没有用量数据,先聊一句再看)"
+    return (f"{usage_line()}\n"
+            f"本会话:共 {_total_usage['requests']} 次请求,累计输出 {_total_usage['completion']:,} tokens")
+
 
 def _stream_model(messages: list[dict]) -> tuple[str, list[dict], str]:
     """流式调用模型:实时显示思考(reasoning_content),返回 (正文, tool_calls, 思考文本)。
@@ -3526,9 +3575,11 @@ def _stream_model(messages: list[dict]) -> tuple[str, list[dict], str]:
 
     stream = client.chat.completions.create(
         model=MODEL, messages=messages, tools=TOOLS, stream=True,
+        stream_options={"include_usage": True},  # 让末尾那一帧带上 token 用量,供上下文统计
     )
     for chunk in stream:
-        if not getattr(chunk, "choices", None):  # 可能有无 choices 的 chunk(如用量统计)
+        _record_usage(getattr(chunk, "usage", None))
+        if not getattr(chunk, "choices", None):  # 纯用量帧等没有 choices 的 chunk
             continue
         delta = chunk.choices[0].delta
         rc = getattr(delta, "reasoning_content", None)
@@ -3562,6 +3613,53 @@ def _stream_model(messages: list[dict]) -> tuple[str, list[dict], str]:
     return "".join(content_parts), tool_calls, "".join(reason_parts)
 
 
+_COMPACT_INSTRUCTION = (
+    "请把以上我们这次对话压缩成一份紧凑的要点摘要,供之后继续对话使用。"
+    "务必保留:我的偏好与明确要求、已做出的决定与结论、涉及的文件路径与对文件的改动、"
+    "尚未完成的任务/待办、重要的具体数据;可以省略寒暄、重复的试探和被推翻的中间步骤。"
+    "用简体中文直接输出摘要本身,不要加任何评论或前后缀,也不要调用任何工具。"
+)
+
+
+def compact(messages: list[dict], keep_recent: int = 0) -> str:
+    """把较早的对话压成一段摘要、替换掉那段历史 —— 释放上下文。
+
+    省 token 的关键:压缩请求**直接在原对话后面追一条指令**(而不是另起一个新请求),
+    并带上同一套 tools —— 这样请求前缀与刚才的对话一致,能命中 DeepSeek 的前缀缓存;
+    否则整段历史都要当新输入重新计费(实测:带 tools 命中 6912 tokens,不带则 0)。
+    keep_recent > 0 时尾部保留若干条消息不动(自动压缩用,免得把刚拿到的工具结果压掉)。
+    """
+    head_start = 0
+    while head_start < len(messages) and messages[head_start].get("role") == "system":
+        head_start += 1                      # 开头的 system prompt 与长期记忆始终保留
+    cut = len(messages)
+    if keep_recent > 0:
+        cut = max(head_start, len(messages) - keep_recent)
+        while cut > head_start and messages[cut].get("role") != "user":
+            cut -= 1                         # 往前挪到 user 消息,别把 assistant/tool 配对拆开
+    head, tail = messages[head_start:cut], messages[cut:]
+    if len(head) < 2:
+        return "对话还很短,不需要压缩。"
+
+    req = head + [{"role": "user", "content": _COMPACT_INSTRUCTION}]
+    try:
+        resp = client.chat.completions.create(model=MODEL, messages=req, tools=TOOLS)
+        summary = (resp.choices[0].message.content or "").strip()
+        if not summary:                      # 模型跑去调工具了 —— 退一步,不带 tools 再试一次
+            resp = client.chat.completions.create(model=MODEL, messages=req)
+            summary = (resp.choices[0].message.content or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        return f"压缩失败:{type(exc).__name__}: {exc}"
+    if not summary:
+        return "压缩失败:模型没有返回摘要。"
+
+    messages[head_start:] = [{
+        "role": "user",
+        "content": f"(以上对话已压缩以节省上下文。以下是此前对话的摘要,请据此继续:\n{summary})",
+    }] + tail
+    return f"已压缩上下文:{len(head)} 条消息 → 1 条摘要({len(summary)} 字)"
+
+
 def run(user_input: str, messages: list[dict]) -> str:
     global _searches_this_turn, _pending_images
     _searches_this_turn = 0  # 搜索配额按轮重置,而不是整个会话共用一份
@@ -3569,7 +3667,12 @@ def run(user_input: str, messages: list[dict]) -> str:
 
     messages.append({"role": "user", "content": user_input})
 
+    auto_compressed = False
     for _ in range(MAX_STEPS):
+        # 上下文快满了就先压缩(工具调用过程中也照做),免得下一次请求超限;每轮最多压一次
+        if not auto_compressed and _context_ratio() >= AUTO_COMPACT_RATIO:
+            auto_compressed = True
+            console.print(f"[自动压缩上下文] {compact(messages, keep_recent=2)}", style="dim")
         try:
             content, tool_calls, reasoning = _stream_model(messages)
         except Exception as exc:  # noqa: BLE001 - 网络/流中断,给提示而不是崩掉
@@ -3694,6 +3797,8 @@ def main() -> None:
     console.print("Agent 已启动。", style="bold")
     console.print("输入多行:连续输入,最后一个空行提交(支持粘贴)。", style="dim")
     console.print("执行中 Ctrl+C=取消本轮;空闲时 Ctrl+C=退出;exit 退出。", style="dim")
+    console.print(f"/compact 压缩上下文(省 token);/tokens 看用量;占用达 "
+                  f"{AUTO_COMPACT_RATIO:.0%} 会自动压缩。", style="dim")
     console.print(f"工作区:{ROOT}\n", style="dim")
 
     while True:
@@ -3707,6 +3812,12 @@ def main() -> None:
                 continue
             if text in {"exit", "quit"}:
                 break
+            if text == "/compact":
+                console.print(compact(messages), style="dim")
+                continue
+            if text == "/tokens":
+                console.print(usage_detail(), style="dim")
+                continue
 
             start = len(messages)  # 快照:用于取消时回滚本轮半截改动
             try:
@@ -3720,6 +3831,9 @@ def main() -> None:
             console.print("AI >", style="bold green")
             # Markdown 要拿到完整文本才能正确解析,所以是等模型说完再一次性渲染
             console.print(Markdown(reply) if reply.strip() else "(模型没有返回内容)")
+            line = usage_line()
+            if line:
+                console.print(line, style="dim")
             console.print()
         except KeyboardInterrupt:
             # 兜底:任何没被上面捕获的 Ctrl+C(例如渲染 Markdown 那一下),
