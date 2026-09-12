@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .registry import tool
+
 import os
 import shlex
 import subprocess
@@ -144,6 +146,31 @@ def _git_clone(repo: Path, *args: str) -> str:
     return f"已克隆到 {dest}(外部仓库,独立于 workspace 根仓库)。"
 
 
+@tool(
+    description="执行 git 子命令。默认(不给 repo)操作工作区根仓库,管 workspace 内容自己的版本。"
+                "clone 外部仓库时用 'clone <url> <clones/下的目录>',仓库会落在 clones/ 下,独立于根仓库。"
+                "操作克隆进来的仓库时,把 repo 设成 'clones/xxx'。"
+                "常用:status、diff、log、add、commit、branch。只白名单放行安全指令;"
+                "reset/merge/pull/push 等会改动历史或连远程的必须 confirm=true。改完文件先 status 看看,再 add + commit 存版本。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "要执行的 git 子命令,例如 'status' 或 'add .',不含开头的 git",
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "仅用于会改动 git 历史或连远程的命令(reset/merge/pull/push)。是否已获得用户确认,默认 false",
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "要操作哪个仓库:默认 '.' 是工作区根仓库;操作克隆进来的外部仓库时填 'clones/仓库名'",
+                    },
+                },
+                "required": ["command"],
+            },
+)
 def git(command: str, confirm: bool = False, repo: str = ".") -> str:
     """在某个 git 仓库里执行 git 子命令。默认仓库是 workspace 根(自管版本);
     操作克隆进来的外部仓库时,把 repo 设成如 "clones/adminservice-collaboration"。

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .registry import tool
+
 import queue
 import threading
 import time
@@ -205,6 +207,20 @@ def _clear_marker(delay_seconds: float = 0.0) -> None:
         pass
 
 
+@tool(
+    description="隐藏点击时显示的那个红色标记。给 delay_seconds 则延时后消失,"
+                "例如 10 表示最后一次点击的红点 10 秒后再隐藏。"
+                "确认 UI 交互结束时调用;点完需要截屏核实时,别急着清,先 screen 再看。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "delay_seconds": {
+                        "type": "number",
+                        "description": "延时多少秒后隐藏;0 表示立刻隐藏",
+                    }
+                },
+            },
+)
 def clear_marker(delay_seconds: float = 0.0) -> str:
     """隐藏点击红点。给 delay_seconds 则延时后消失,如 10 表示最后一次点击的标记 10 秒后消失。"""
     if delay_seconds < 0:
@@ -295,6 +311,13 @@ def _send_unicode_text(text: str) -> None:
         time.sleep(0.005)  # 略等一下,让目标应用跟得上
 
 
+@tool(
+    description="读取系统剪贴板里的文本内容(只读,不修改剪贴板)。"
+                "当用户说「我刚复制了…」「用剪贴板里的内容」时用它把内容拿到手,"
+                "之后可直接用这部分文本(如用 type_text 键入),不必去覆盖剪贴板。"
+                "只能读文本;若剪贴板是图片/文件则读不到。",
+    parameters={"type": "object", "properties": {}},
+)
 def read_clipboard() -> str:
     """读取系统剪贴板里的**文本**内容(读进来进上下文,方便你说的"拿到原文再直接键入")。
 
@@ -313,6 +336,23 @@ def read_clipboard() -> str:
     return f"剪贴板文本({len(text)} 字符):\n{text}"
 
 
+@tool(
+    description="在当前有焦点的窗口输入一段文本(支持中文等 unicode)。直接作用于宿主机的真实屏幕。"
+                "默认用 SendInput 逐字符直接键入,**不碰剪贴板** —— 用户自己复制的内容不会被覆盖。"
+                "只有碰到不认直接键入的老旧/自绘控件时才用 via_clipboard=true 退回粘贴(那样会覆盖剪贴板)。"
+                "注意:作用对象取决于当前焦点窗口,输入前确认焦点是对的。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "要输入的文本,可含中文"},
+                    "via_clipboard": {
+                        "type": "boolean",
+                        "description": "true 时改用粘贴(兼容性更好但会覆盖剪贴板),默认 false",
+                    },
+                },
+                "required": ["text"],
+            },
+)
 def type_text(text: str, via_clipboard: bool = False) -> str:
     """在当前焦点窗口输入文本(支持中文等 Unicode)。
 
@@ -332,6 +372,20 @@ def type_text(text: str, via_clipboard: bool = False) -> str:
     return f"已直接键入 {len(text)} 个字符(未使用剪贴板)。"
 
 
+@tool(
+    description="按一个键或组合键,如 enter、tab、ctrl+s、alt+tab、ctrl+shift+esc。"
+                "适合模拟快捷键确认、切换窗口、关闭弹窗等。作用于当前焦点窗口。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "keys": {
+                        "type": "string",
+                        "description": "按键名或组合,组合用 + 连接,如 'ctrl+s'、'alt+tab'",
+                    }
+                },
+                "required": ["keys"],
+            },
+)
 def press_keys(keys: str) -> str:
     """按一个键或组合键,如 'enter'、'ctrl+s'、'alt+tab'。"""
     pg = _pyautogui()
@@ -345,6 +399,23 @@ def press_keys(keys: str) -> str:
     return f"已按下 {keys}。"
 
 
+@tool(
+    description="在屏幕坐标 (x, y) 处点击。坐标用屏幕原始分辨率。"
+                "想定位坐标时先 screen 截屏:真实坐标 = 图上的坐标 × (原宽/压缩后宽)。"
+                "作用于真实屏幕,点击前确认坐标准确。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "description": "横坐标(像素,原始分辨率)"},
+                    "y": {"type": "integer", "description": "纵坐标(像素,原始分辨率)"},
+                    "button": {
+                        "type": "string",
+                        "description": "鼠标键 left/right/middle,默认 left",
+                    },
+                },
+                "required": ["x", "y"],
+            },
+)
 def click(x: int, y: int, button: str = "left") -> str:
     """在屏幕坐标 (x, y) 处点击。坐标用屏幕原始分辨率,可与 screen 的结果换算。"""
     pg = _pyautogui()
@@ -355,6 +426,17 @@ def click(x: int, y: int, button: str = "left") -> str:
     return f"已在 ({x}, {y}) 用 {button} 键点击,红点标记在终点。"
 
 
+@tool(
+    description="把光标移动到屏幕坐标 (x, y)。坐标用屏幕原始分辨率。配合 screen 定位后再点击。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "description": "横坐标(像素,原始分辨率)"},
+                    "y": {"type": "integer", "description": "纵坐标(像素,原始分辨率)"},
+                },
+                "required": ["x", "y"],
+            },
+)
 def move_mouse(x: int, y: int) -> str:
     """把光标移到屏幕坐标 (x, y),用屏幕原始分辨率。"""
     pg = _pyautogui()
@@ -363,6 +445,23 @@ def move_mouse(x: int, y: int) -> str:
     return f"已移动光标到 ({x}, {y})。"
 
 
+@tool(
+    description="按住鼠标从一个坐标拖到另一个坐标 —— 用于拖窗口、拖文件、框选、拖滑块/进度条等。"
+                "坐标用屏幕原始分辨率。duration 是拖动耗时(秒),拖拽排序/画布类界面需要平滑移动,给 0.2~0.5 更稳。"
+                "红点先标在起点,松开后停在终点。**拖动会真实改变桌面状态(可能移动文件或窗口),执行前务必确认起点和落点。**",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "from_x": {"type": "integer", "description": "起点横坐标"},
+                    "from_y": {"type": "integer", "description": "起点纵坐标"},
+                    "to_x": {"type": "integer", "description": "终点横坐标"},
+                    "to_y": {"type": "integer", "description": "终点纵坐标"},
+                    "duration": {"type": "number", "description": "拖动耗时秒数,默认 0.3;0 为瞬间到位"},
+                    "button": {"type": "string", "description": "鼠标键:left(默认)/right/middle"},
+                },
+                "required": ["from_x", "from_y", "to_x", "to_y"],
+            },
+)
 def drag(from_x: int, from_y: int, to_x: int, to_y: int,
          duration: float = 0.3, button: str = "left") -> str:
     """按住鼠标从 (from_x, from_y) 拖到 (to_x, to_y) —— 拖窗口/拖文件/框选/拖滑块。
@@ -393,6 +492,26 @@ _WHEEL_DELTA = 120
 _MOUSEEVENTF_HWHEEL = 0x01000  # 水平滚轮;pyautogui 的 hscroll 在 Windows 上发的是垂直事件,故自己发
 
 
+@tool(
+    description="滚动鼠标滚轮。clicks 是**格数**:正数向上/向左,负数向下/向右。"
+                "1 格 ≈ 滚动 3 行文本(Windows 默认),所以**别给 1、2 这种小值 —— 几乎看不出动静**;"
+                "滚一屏通常要 10~30 格,想直接翻到顶/底可以给 ±50 或更大。"
+                "给了 x/y 就先把光标移到那里再滚 —— 滚哪个区域通常由光标位置决定;不给则在当前光标处滚。"
+                "horizontal=true 走水平滚动(横向表格/看板)。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "clicks": {
+                        "type": "integer",
+                        "description": "滚动格数:正=向上/左,负=向下/右。滚一屏通常 10~30,别给 1、2 这种小值",
+                    },
+                    "x": {"type": "integer", "description": "可选:滚动位置横坐标(不填则在当前光标处滚)"},
+                    "y": {"type": "integer", "description": "可选:滚动位置纵坐标"},
+                    "horizontal": {"type": "boolean", "description": "是否水平滚动,默认 false"},
+                },
+                "required": ["clicks"],
+            },
+)
 def scroll(clicks: int, x: int | None = None, y: int | None = None,
            horizontal: bool = False) -> str:
     """滚动鼠标滚轮。clicks 是**格数**:正数向上/向左,负数向下/向右;1 格 ≈ 滚动 3 行(Windows 默认)。

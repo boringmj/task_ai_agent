@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .registry import tool
+
 import base64
 
 from ..core import (
@@ -28,6 +30,22 @@ def _img_magic_ok(ext: str, data: bytes) -> bool:
     return False
 
 
+@tool(
+    description="把工作区里的一张图片加载进来,让视觉模型真正看到它的内容。"
+                "当用户提到本地图片、或者需要你查看/分析一张图片(截图、图、图表等)时使用。"
+                "支持 jpg/png/webp/gif,单张不超过 3MB。图片会在下一轮以图像形式交给你。"
+                "加载前先确认图片在工作区内(可以用 list_files 找)。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "要加载的图片路径(相对工作区),例如 screenshot.png",
+                    }
+                },
+                "required": ["path"],
+            },
+)
 def img(path: str) -> str:
     """把工作区里的图片转成 data URL,登记到待注入队列,供下一轮模型以 image_url 查看。
 
@@ -75,6 +93,12 @@ def _image_to_data_url(image) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+@tool(
+    description="截取用户的整个屏幕,压缩后作为图像交给视觉模型。"
+                "只在用户明确要求查看屏幕、或任务确实依赖当前屏幕内容时才调用 —— 这是敏感操作,不要自作主张。"
+                "截图会自动压缩到最长边 1280 像素,不会拿原图超大的分辨率去撑模型。",
+    parameters={"type": "object", "properties": {}},
+)
 def screen() -> str:
     """截取整个屏幕,压缩后作为图像交给视觉模型。
 

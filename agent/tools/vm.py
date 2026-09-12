@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .registry import tool
+
 import atexit
 import json
 import socket
@@ -207,6 +209,11 @@ def _vm_kickoff() -> None:
     _vm_thread.start()
 
 
+@tool(
+    description="查看沙箱虚拟机的当前状态:进行到哪一步、是否已就绪、连接端口。"
+                "虚拟机在后台启动,可能没就绪;用这个确认是否能用。",
+    parameters={"type": "object", "properties": {}},
+)
 def vm_status() -> str:
     """查看沙箱虚拟机的当前状态(进行到哪一步、是否就绪)。"""
     st = _vm_state_get()
@@ -217,6 +224,22 @@ def vm_status() -> str:
     return "虚拟机会在后台启动,agent 退出后会自动销毁。"
 
 
+@tool(
+    description="在沙箱虚拟机里执行一条命令,通过 socket 连 guest 内的 vmserver 执行(JSON 协议,非 SSH)。"
+                "适合在隔离的完整系统里装软件、跑服务、做重活。若虚拟机还没就绪,会返回当前进度并让你稍后再试。"
+                "命令自带超时;别用交互式命令(vim/top 等,它们没有终端会直接失败)。"
+                "路径注意:客户机是 Linux,路径风格与宿主不同(没有 D:\\ 那套)。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "要在客户机里执行的 shell 命令",
+                    }
+                },
+                "required": ["command"],
+            },
+)
 def vm_run(command: str) -> str:
     """在沙箱虚拟机里执行一条命令 —— 连接 guest 里的 vmserver(socket, JSON 协议)。
 
@@ -278,6 +301,20 @@ def _vm_exec_raw(command: str, timeout: int = 60) -> dict:
         return {"ok": False, "error": f"连接 vmserver 失败:{exc}"}
 
 
+@tool(
+    description="把工作区里的一个文件上传到虚拟机(宿主 → guest)。"
+                "文件字节走 vmserver 全程在工具内部处理,只回「已上传 (n 字节)」摘要,不会把文件内容塞进上下文。"
+                "local_path 是工作区路径;guest_path 是 guest 里的绝对路径(如 /root/a.txt)。"
+                "当 guest 里要做的事需要工作区的文件(脚本、配置、素材)时用它,比 base64 手拼省事。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "local_path": {"type": "string", "description": "工作区内的文件路径(相对或绝对)"},
+                    "guest_path": {"type": "string", "description": "guest 里要写入的绝对路径,如 /root/a.txt"},
+                },
+                "required": ["local_path", "guest_path"],
+            },
+)
 def vm_push(local_path: str, guest_path: str) -> str:
     """把工作区里的一个文件上传到虚拟机(宿主 → guest)。
 
@@ -306,6 +343,20 @@ def vm_push(local_path: str, guest_path: str) -> str:
     return f"已把工作区文件 {local_path} 上传到 guest:{guest_path}({len(data)} 字节)。"
 
 
+@tool(
+    description="把虚拟机里的一个文件下载到工作区(guest → 宿主)。"
+                "文件字节走 vmserver 全程在工具内部处理,只回「已下载 (n 字节)」摘要,不会把文件内容塞进上下文。"
+                "guest_path 是 guest 里的绝对路径;local_path 是工作区路径。"
+                "当 guest 里产出了要拿回工作区的文件(结果、日志、下载物)时用它。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "guest_path": {"type": "string", "description": "guest 里的绝对路径,如 /root/out.txt"},
+                    "local_path": {"type": "string", "description": "工作区内要写入的文件路径"},
+                },
+                "required": ["guest_path", "local_path"],
+            },
+)
 def vm_pull(guest_path: str, local_path: str) -> str:
     """把虚拟机里的一个文件下载到工作区(guest → 宿主)。
 
@@ -341,6 +392,21 @@ def vm_pull(guest_path: str, local_path: str) -> str:
     return f"已把 guest {guest_path} 下载到工作区:{local_path}({len(out)} 字节)。"
 
 
+@tool(
+    description="转发访问 guest(沙箱虚拟机)内的 HTTP 服务 —— 通过 vmserver 的 proxy 把 guest 端口代理到本地。"
+                "适合访问你在 guest 里起的 http 服务(如 web:8080)并拿到响应。"
+                "只支持 http,不支持 https。URL 写 guest 视角:http://127.0.0.1:端口/路径。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "guest_url": {
+                        "type": "string",
+                        "description": "guest 内部的 http 地址,如 http://127.0.0.1:8080/status",
+                    }
+                },
+                "required": ["guest_url"],
+            },
+)
 def vm_fetch(guest_url: str) -> str:
     """转发访问 guest 内的 HTTP 服务:通过 vmserver 的 proxy,把 guest 端口代理到本地。
 
@@ -394,6 +460,20 @@ def vm_fetch(guest_url: str) -> str:
     return f"{status}\n--- body ---\n{body[:8000]}"
 
 
+@tool(
+    description="向 guest(沙箱虚拟机)内任意 TCP 服务发送一段字节并读回复 —— 经 vmserver 的 proxy 转发。"
+                "通用 TCP,不限于 HTTP:适合 Redis、MySQL 查询、自定协议等请求/答型服务。"
+                "是「发一次、收一次」的一问一答,持续会话类(SSH)不适合。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "guest 内的目标主机,通常是 127.0.0.1"},
+                    "port": {"type": "integer", "description": "guest 内的目标端口"},
+                    "data": {"type": "string", "description": "要发送的字节(把要发的请求编码成文本)"},
+                },
+                "required": ["host", "port", "data"],
+            },
+)
 def vm_tcp(host: str, port: int, data: str) -> str:
     """向 guest 内任意 TCP 服务发一段字节并读回复(经 vmserver proxy)。
 
@@ -478,6 +558,20 @@ def _vm_proxy_relay(guest_port: int, client) -> None:
     threading.Thread(target=pump, args=(up, client), daemon=True).start()
 
 
+@tool(
+    description="把 guest(沙箱虚拟机)内某个端口**常驻转发**到宿主导,浏览器等程序可直接访问宿主口。"
+                "真正实现「将 VM 端口映射到宿主」,例如 vm_tunnel(8080, 8080) 后访问 http://127.0.0.1:8080。"
+                "每条连接经 vmserver proxy(带本进程 token)转发,不暴露原生 hostfwd。"
+                "用完记得 vm_tunnel_stop。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "host_port": {"type": "integer", "description": "宿主导要监听的口,如 8080"},
+                    "guest_port": {"type": "integer", "description": "guest 内的目标端口,如 8080"},
+                },
+                "required": ["host_port", "guest_port"],
+            },
+)
 def vm_tunnel(host_port: int, guest_port: int) -> str:
     """把 guest 内某个端口常驻转发到宿主导 —— 浏览器等直接访问宿主口即可。
 
@@ -520,6 +614,15 @@ def vm_tunnel(host_port: int, guest_port: int) -> str:
     return f"已开通宿主 127.0.0.1:{host_port} → guest:{guest_port}。浏览器访问 http://127.0.0.1:{host_port}"
 
 
+@tool(
+    description="停止一个(给 host_port)或全部(不给)常驻端口转发。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "host_port": {"type": "integer", "description": "要停止的宿主导;不填则停全部"},
+                },
+            },
+)
 def vm_tunnel_stop(host_port: int | None = None) -> str:
     """停止一个(或全部)常驻转发。"""
     if host_port is not None and int(host_port) not in _vm_tunnels:
@@ -576,6 +679,11 @@ def _vm_cleanup() -> None:
 atexit.register(_vm_cleanup)
 
 
+@tool(
+    description="确保内置的 Alpine 虚拟机(QEMU 沙箱)在后台启动与配置。已在配则返回当前状态。"
+                "这个虚拟机比容器隔离更强(独立内核),适合让它做容器里放不开的完整系统操作。配置是后台进行的,可配合 vm_status 看进度。",
+    parameters={"type": "object", "properties": {}},
+)
 def vm_start() -> str:
     """确保沙箱虚拟机在后台启动(已在配就返回当前状态)。"""
     _vm_kickoff()

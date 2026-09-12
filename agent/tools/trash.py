@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .registry import tool
+
 import json
 import re
 import shutil
@@ -16,6 +18,21 @@ from ..core import (
     safe_path,
 )
 
+@tool(
+    description="删除工作区内的一个文件。实际行为是移入 .trash/ 回收站而非物理删除,用户可以自行恢复。"
+                "删除是破坏性操作:调用之前必须先取得用户的明确同意,不要自作主张删文件。"
+                "本工具只能删单个文件,不能删目录。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "要删除的文件路径(相对工作区)",
+                    }
+                },
+                "required": ["path"],
+            },
+)
 def delete_file(path: str) -> str:
     target = safe_path(path)
     if not target.exists():
@@ -64,6 +81,26 @@ def _trash_dest(name: str) -> Path:
     return dest
 
 
+@tool(
+    description="删除工作区里的一个目录,实际是移入 .trash/ 回收站而非物理删除。"
+                "目录必须是空的才能直接删;非空目录要带 recursive=true 显式确认,表示同意连带删除里面的所有内容。"
+                "工作区根目录以及 .trash/.git/.agent 这些系统目录一律拒绝,防止 agent 自毁。"
+                "删除是破坏性操作:调用前必须先取得用户明确同意。只删单个文件请用 delete_file。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "要删除的目录路径(相对工作区)",
+                    },
+                    "recursive": {
+                        "type": "boolean",
+                        "description": "目录非空时,是否同意连带删除其中所有内容,默认 false",
+                    },
+                },
+                "required": ["path"],
+            },
+)
 def delete_dir(path: str, recursive: bool = False) -> str:
     """删除工作区里的一个目录(软删除,移入 .trash/)。
 
@@ -158,6 +195,25 @@ def _trash_timestamp(trash_path: Path) -> datetime | None:
         return None
 
 
+@tool(
+    description="把回收站里的一个文件还原到它原来的路径。还原前会先检查原位置是否有同名文件:"
+                "如果原位置已被占用,调用会失败并告诉你,此时应当先征求用户同意再带 overwrite=true 重试。"
+                "先用 list_files(path=\".trash\", show_hidden=true) 找到回收站里的确切的文件名再还原。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "trashed_name": {
+                        "type": "string",
+                        "description": "回收站里那个文件的名字(含时间戳后缀),不是原路径",
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "原位置已被同名文件占用时,是否允许覆盖。覆盖不可逆,务必先得到用户确认",
+                    },
+                },
+                "required": ["trashed_name"],
+            },
+)
 def restore_file(trashed_name: str, overwrite: bool = False) -> str:
     """把回收站里的文件还原到它的原路径。
 
@@ -190,6 +246,25 @@ def restore_file(trashed_name: str, overwrite: bool = False) -> str:
     return f"已还原 {trashed_name} -> {original}"
 
 
+@tool(
+    description="永久删除回收站里的内容(**不可恢复**)。给 name 就只删回收站里的那一项(不必清空全部);"
+                "不给 name 则清空全部,过期的文件本来也会在启动时自动清理。"
+                "回收站里有哪些项,用 list_files(\".trash\", show_hidden=true) 看。"
+                "永久删除不可恢复,调用前务必先让用户确认不再需要,不要自作主张。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "要永久删除的回收站项名(只删这一项);不填则清空全部",
+                    },
+                    "max_age_days": {
+                        "type": "integer",
+                        "description": "只删除超过这个天数的文件(用于启动清理);不填则清空回收站",
+                    },
+                },
+            },
+)
 def purge_trash(max_age_days: int | None = None, name: str | None = None) -> str:
     """永久删除回收站里的内容(**不可恢复**)。
 

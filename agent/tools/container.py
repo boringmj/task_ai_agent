@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .registry import tool
+
 import shutil
 import subprocess
 import uuid
@@ -114,6 +116,26 @@ def _docker_run(inner: list[str]) -> str:
     return (out[:DOCKER_OUTPUT_MAX] if out else "(容器无输出)")
 
 
+@tool(
+    description="在安全的 Docker 隔离容器里执行一段 Python 代码。适合数据分析、计算、"
+                "处理工作区文件 —— 你已有的工具做不到的运算用这个。"
+                "容器只能访问工作区、非 root、无内核特权、资源封顶、超时强杀;"
+                "执行完容器即销毁,不会留下任何东西。"
+                "输出会截断到 1 万字符。需要第三方库时,可以先用 pip 装(容器断网则装不了,"
+                "但网络默认开启,可 pip install --user 所需库)。"
+                "注意路径:容器里的工作区在 /workspace,代码里用相对文件名或 /workspace/... 路径,"
+                "别用文件工具返回的宿主路径(如 D:\\...),那在容器里不存在。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "要执行的 Python 代码,可以多行",
+                    }
+                },
+                "required": ["code"],
+            },
+)
 def run_python(code: str) -> str:
     """在隔离容器里执行一段 Python 代码,只能访问工作区,不碰宿主其他内容。"""
     if not code.strip():
@@ -121,6 +143,24 @@ def run_python(code: str) -> str:
     return _docker_run(["python", "-c", code])
 
 
+@tool(
+    description="在安全的 Docker 隔离容器里执行一条 shell 命令。适合在环境里跑工具、"
+                "装包、查看容器内情况。容器只能访问工作区、非 root、无内核特权、资源封顶、"
+                "超时强杀,执行完即销毁。"
+                "输出截断到 1 万字符。注意:命令里访问的工作区之外的路径,是容器自己的文件系统,"
+                "不是你宿主的 —— 它动不了宿主。容器里的工作区在 /workspace,用相对名或 /workspace/... 路径,"
+                "别用宿主路径(如 D:\\...)。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "要执行的 shell 命令,例如 'ls -la' 或 'pip install --user pandas'",
+                    }
+                },
+                "required": ["command"],
+            },
+)
 def run_command(command: str) -> str:
     """在隔离容器里执行一条 shell 命令,同样只访问工作区.给 agent 装包、跑工具。"""
     if not command.strip():

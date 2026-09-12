@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .registry import tool
+
 from ..core import (
     MAX_WRITE_BYTES,
     MEMORY_FILE,
@@ -17,6 +19,21 @@ def _read_memory() -> str:
     return MEMORY_FILE.read_text(encoding="utf-8")
 
 
+@tool(
+    description="把一条需要跨会话记住的关键事实写进长期记忆,每次追加,不覆盖已有记录。"
+                "当遇到用户偏好、重要约定、项目背景这类以后还用得到的信息时使用;"
+                "一次性、随风而去的临时信息不要记。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "要记住的内容,支持多行;每行会存成一条记忆",
+                    }
+                },
+                "required": ["content"],
+            },
+)
 def remember(content: str) -> str:
     """把一条关键事实写进长期记忆。每条追加一行,不覆盖已有记录。"""
     content = content.strip()
@@ -42,6 +59,10 @@ def remember(content: str) -> str:
     return f"已记住 {len(lines)} 行。"
 
 
+@tool(
+    description="读取当前的全部长期记忆。需要回忆以前记下的关键信息、或确认自己记住了什么时使用。",
+    parameters={"type": "object", "properties": {}},
+)
 def read_memory() -> str:
     """读取当前的全部长期记忆。"""
     content = _read_memory().strip()

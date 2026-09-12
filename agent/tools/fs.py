@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .registry import tool
+
 import os
 import re
 from datetime import datetime
@@ -21,6 +23,10 @@ from ..core import (
     _rel,
 )
 
+@tool(
+    description="获取当前的日期和时间。当用户询问「现在几点」「今天几号」时使用。",
+    parameters={"type": "object", "properties": {}},
+)
 def get_current_time() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -44,6 +50,35 @@ def _read_text_with_encoding(target: Path) -> tuple[str, str]:
     return target.read_text(encoding=enc, errors="replace"), enc
 
 
+@tool(
+    description="读取一个文本文件的内容(单次最多返回 3145728 个字符,超出会明确提示截断)。"
+                "会自动识别编码,GBK 等中文编码的文件也能读。只能读取工作区内的文件。"
+                "用 start_line/end_line 可只读某个行区间 —— grep_files 命中某行后想看附近上下文,就用它读那几行,"
+                "不必把整个大文件读进来。准备用 edit_lines 或 insert_lines 按行修改文件前,"
+                "先带 with_line_numbers=true 读一遍(或读目标区间)确认行号。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "文件路径,可以是相对路径或绝对路径",
+                    },
+                    "with_line_numbers": {
+                        "type": "boolean",
+                        "description": "是否在每行前面加上行号,默认 false。按行编辑前应设为 true",
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "起始行号(1 起始,含该行)。配合 end_line 只看某段;不填则从头",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "结束行号(含该行)。不填则读到末尾。带行号读区间时,行号仍是文件真实行号",
+                    },
+                },
+                "required": ["path"],
+            },
+)
 def read_file(path: str, with_line_numbers: bool = False,
               start_line: int | None = None, end_line: int | None = None) -> str:
     """读取工作区里的文本文件。可只读某个行区间(1 起始,含两端)。
@@ -84,10 +119,31 @@ def read_file(path: str, with_line_numbers: bool = False,
     return body
 
 
+@tool(
+    description="获取你的工作区目录(绝对路径)。所有相对路径都以它为基准,文件操作也不能超出它。当用户问「我在哪」「当前目录是什么」时使用。",
+    parameters={"type": "object", "properties": {}},
+)
 def get_current_directory() -> str:
     return f"{ROOT}(你的工作区,所有文件操作都被限制在这个目录内)"
 
 
+@tool(
+    description="列出某个目录下的文件和子目录。目录名以 / 结尾,文件会附带字节大小。"
+                "当用户问「这里有什么文件」「列一下目录」,或者你需要先找到文件名再去读取它时使用。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "要列出的目录路径(相对工作区),省略则为工作区根目录",
+                    },
+                    "show_hidden": {
+                        "type": "boolean",
+                        "description": "是否包含以点开头的隐藏文件,默认 false",
+                    },
+                },
+            },
+)
 def list_files(path: str = ".", show_hidden: bool = False) -> str:
     target = safe_path(path)
     if not target.is_dir():
@@ -125,6 +181,30 @@ def _iter_search_paths(root: Path):
             yield base / f
 
 
+@tool(
+    description="按文件名在工作区里递归查找(支持目录)。"
+                "name 支持 * ? [ ] 通配符,不区分大小写;不含通配符时按「文件名包含该子串」匹配。"
+                "不知道文件叫什么名字、或在某个目录树里找某类文件时用它。"
+                "只返回路径(相对工作区),要看内容还要再用 read_file。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "文件名模式,如 *.py、test*、config.json;不含通配符时按子串匹配",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "在哪个目录下搜(相对工作区),省略则为工作区根目录",
+                    },
+                    "include_dirs": {
+                        "type": "boolean",
+                        "description": "是否把目录名也纳入匹配,默认 false(只找文件)",
+                    },
+                },
+                "required": ["name"],
+            },
+)
 def find_files(name: str, path: str = ".", include_dirs: bool = False) -> str:
     """按文件名查找工作区里的文件(递归)。
 
@@ -165,6 +245,31 @@ def _detect_text_encoding(sample: bytes) -> str:
     return "utf-8"
 
 
+@tool(
+    description="按文件内容在工作区里搜索,返回命中的文件路径、行号和行内容。"
+                "pattern 是正则(不是通配符);ignore_case=true 可忽略大小写。"
+                "只搜文本文件(二进制自动跳过),结果是「文件:行号: 内容」的形式。"
+                "想知道某个函数/变量/字符串在哪些文件里出现过时用它,比一个个 read_file 高效得多。"
+                "命中数有上限,超出会提示截断。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "要匹配的正则表达式,如 def main、TODO|FIXME、requests\\.get",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "搜索范围(相对工作区的文件或目录),省略则为整个工作区",
+                    },
+                    "ignore_case": {
+                        "type": "boolean",
+                        "description": "是否忽略大小写,默认 false",
+                    },
+                },
+                "required": ["pattern"],
+            },
+)
 def grep_files(pattern: str, path: str = ".", ignore_case: bool = False) -> str:
     """按内容搜索工作区里的文本文件(正则),返回命中的文件、行号与行内容。
 
@@ -246,6 +351,30 @@ def _check_writable(target: Path, content: str) -> int:
     return size
 
 
+@tool(
+    description="把文本内容写入工作区内的文件,父目录不存在会自动创建。"
+                "默认不允许覆盖已存在的文件:如果文件已存在,调用会失败并提示你,"
+                "此时应当先征求用户同意,确认后再带 overwrite=true 重新调用。"
+                "只想在文件末尾补充内容时,用 append_file 而不是本工具。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "目标文件路径(相对工作区),例如 notes/todo.md",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "要写入的完整文本内容",
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "是否允许覆盖已存在的文件,默认 false。覆盖不可撤销,务必先得到用户确认",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+)
 def write_file(path: str, content: str, overwrite: bool = False) -> str:
     target = safe_path(path)
     size = _check_writable(target, content)
@@ -263,6 +392,25 @@ def write_file(path: str, content: str, overwrite: bool = False) -> str:
     return f"已{'覆盖' if existed else '创建'} {target}({size} 字节)"
 
 
+@tool(
+    description="在工作区内某个文件的末尾追加文本,文件不存在则自动创建。"
+                "适合记日志、往清单里加条目这类场景,不会破坏已有内容。"
+                "注意:本工具不会自动加换行,需要换行请在 content 里自己写 \\n。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "目标文件路径(相对工作区)",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "要追加到文件末尾的文本",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+)
 def append_file(path: str, content: str) -> str:
     target = safe_path(path)
     size = _check_writable(target, content)
@@ -307,6 +455,32 @@ def _terminate(line: str) -> str:
     return line if line.endswith("\n") else line + "\n"
 
 
+@tool(
+    description="替换文件中指定行号区间的内容,只改这几行,文件其余部分原样保留。"
+                "行号从 1 开始,start_line 和 end_line 都包含在内。"
+                "把 content 留空('')就是删除这几行。"
+                "改一两处内容时优先用本工具,不要用 write_file 整篇重写。"
+                "调用前务必先用 read_file(with_line_numbers=true) 确认行号,不要凭记忆猜。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件路径(相对工作区)"},
+                    "start_line": {
+                        "type": "integer",
+                        "description": "起始行号(从 1 开始,包含该行)",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "结束行号(包含该行);只改一行时填成和 start_line 相同",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "替换进去的新内容,可以是多行;留空则删除这些行",
+                    },
+                },
+                "required": ["path", "start_line", "end_line"],
+            },
+)
 def edit_lines(path: str, start_line: int, end_line: int, content: str = "") -> str:
     target, lines, enc = _load_lines(path)
     total = len(lines)
@@ -327,6 +501,26 @@ def edit_lines(path: str, start_line: int, end_line: int, content: str = "") -> 
     return _save_lines(target, updated, summary, start_line, enc)
 
 
+@tool(
+    description="在指定行之后插入新内容,不覆盖任何已有行。"
+                "after_line=0 表示插入到文件最开头,after_line=5 表示插到第 5 行和第 6 行之间。"
+                "只是往文件末尾补内容的话,用 append_file 更简单。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件路径(相对工作区)"},
+                    "after_line": {
+                        "type": "integer",
+                        "description": "在这一行之后插入;0 表示插到文件最开头",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "要插入的内容,可以是多行",
+                    },
+                },
+                "required": ["path", "after_line", "content"],
+            },
+)
 def insert_lines(path: str, after_line: int, content: str) -> str:
     target, lines, enc = _load_lines(path)
     total = len(lines)
@@ -346,6 +540,29 @@ def insert_lines(path: str, after_line: int, content: str) -> str:
     return _save_lines(target, updated, summary, after_line + 1, enc)
 
 
+@tool(
+    description="移动或重命名工作区内的文件、目录。同一目录内换个名字就是重命名,换到别的目录就是移动。"
+                "目标的父目录不存在会自动创建;目标是一个已存在的目录时,会把源移动进去并沿用原名。"
+                "默认不允许覆盖已存在的目标文件,需要覆盖时先征求用户同意再带 overwrite=true 重试。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "源文件或目录的路径(相对工作区)",
+                    },
+                    "destination": {
+                        "type": "string",
+                        "description": "目标路径(相对工作区);可以是新的文件名,也可以是已存在的目录",
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "是否允许覆盖已存在的目标文件,默认 false。覆盖不可撤销,务必先得到用户确认",
+                    },
+                },
+                "required": ["source", "destination"],
+            },
+)
 def move_file(source: str, destination: str, overwrite: bool = False) -> str:
     src = safe_path(source)
     if not src.exists():
