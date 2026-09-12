@@ -18,6 +18,7 @@ from .core import (
 from .commands import Context as CommandContext
 from .commands import all_commands, dispatch as dispatch_command
 from .commands import system_message as commands_system_message
+from . import skills
 from .llm import usage_line
 from .loop import load_system_prompt, run
 from .session import (
@@ -203,6 +204,8 @@ def main() -> None:
     # 终端指令清单单独成一条 system 消息,而不是并进主提示词 —— 它是程序自动生成的
     # "数据",里面写明信任边界,免得描述文字被当成系统指令(详见 commands.system_message)
     messages.append({"role": "system", "content": commands_system_message()})
+    # 技能清单同理:只放"名字 + 什么时候用",正文留在磁盘上按需读(见 agent/skills.py)
+    messages.append({"role": "system", "content": skills.prompt_section()})
     # 定下本次的活跃会话。规则(见 session._resolve_session):接回本工作区最后跑过的
     # 那一个,但**如果它正被另一个活着的 agent 用着,就另开一个新的**,不去抢 ——
     # 抢的话两边会共用一个对话历史和一块虚拟机磁盘,互相覆盖。
