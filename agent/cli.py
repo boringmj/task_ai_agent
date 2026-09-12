@@ -97,7 +97,7 @@ def _replay_history(history: list[dict]) -> None:
             shown, hidden = _clip(fn.get("arguments") or "", SESSION_RESUME_CHARS)
             # 提示放在右括号**外面**,否则读起来像 `…未显示))`
             tail = f"    (参数还有 {hidden} 字未显示)" if hidden else ""
-            console.print(f"· {fn.get('name', '?')}({shown}){tail}",
+            console.print(f"• {fn.get('name', '?')}({shown}){tail}",
                           style="dim", markup=False, highlight=False)
         if text:
             console.print("AI >", style="bold green")
