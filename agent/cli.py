@@ -119,6 +119,14 @@ def main() -> None:
                 del messages[start:]
                 console.print("\n[已取消]", style="bold red")
                 continue
+            except Exception as exc:  # noqa: BLE001
+                # 未预期的错误(渲染、网络、工具内部崩了……)绝不能掀翻整个会话 ——
+                # 丢掉这一轮的对话会让人白等,还要从头把上下文喂一遍。
+                # 这里 **同样要回滚**:半截历史里很可能留着一个没有 tool 结果配对的
+                # tool_calls,那个发给 API 会直接 400,回滚才能保证历史始终合法。
+                del messages[start:]
+                console.print(f"\n[出错,本轮已回滚]{type(exc).__name__}: {exc}", style="bold red")
+                continue
 
             console.print("AI >", style="bold green")
             # Markdown 要拿到完整文本才能正确解析,所以是等模型说完再一次性渲染

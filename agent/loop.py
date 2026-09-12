@@ -90,12 +90,17 @@ def run(user_input: str, messages: list[dict]) -> str:
             fname = call["function"]["name"]
             fargs = call["function"]["arguments"]
             # markup=False:工具参数里的 [ ] 不该被 rich 当成样式标记解析
-            console.print(
-                f"• {fname}({fargs})",
-                style="dim",
-                markup=False,
-                highlight=False,
-            )
+            # 打印只是一行提示,渲染失败(如老终端编码不支持某个字符)不该中断整个回合,
+            # 更不能让这一步之后的历史缺 tool 结果 —— 那会直接让下一次请求 400。
+            try:
+                console.print(
+                    f"• {fname}({fargs})",
+                    style="dim",
+                    markup=False,
+                    highlight=False,
+                )
+            except Exception:  # noqa: BLE001
+                pass
             messages.append(
                 {
                     "role": "tool",

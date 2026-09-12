@@ -18,6 +18,7 @@ from ..core import (
 
 # ---- git 工具专属配置(环境变量名不变,仍可在 .env 覆盖)----
 GIT_MAX_OUTPUT = int(os.environ.get("GIT_MAX_OUTPUT", "20000"))  # 单次命令输出进上下文的字符上限
+GIT_TIMEOUT = int(os.environ.get("GIT_TIMEOUT", "120"))  # 单条 git 命令的硬超时(秒);clone/pull 走网络,给宽一点
 # 正常管理版本所需的安全指令;不在白名单里的指令一律拒绝(不管 confirm)
 GIT_SAFE = {
     "status", "add", "commit", "log", "diff", "show", "rm", "mv",
@@ -37,18 +38,34 @@ GIT_EXCLUDE = (".agent/", ".trash/", "clones/", "__pycache__/", ".pylibs/")
 # 所以整个 git 工具一条命令都不会碰到沙箱外。
 
 
-def _git_run(*args: str) -> subprocess.CompletedProcess:
-    """在 workspace 根仓库里跑 git:固定工作区,并强制英文输出。
+def _git_exec(cmd: list[str]) -> subprocess.CompletedProcess:
+    """跑一条 git 命令,带硬超时 —— clone/pull 走网络,挂住时不能把会话无限堵死。
 
     强制 LC_ALL=C 很重要 —— Windows 中文系统下 git 默认按 GBK 输出,和 Python
     的 UTF-8 对不上,内容会被 errors=replace 替换成乱码。英文输出是稳定的。
+    超时按"失败"返回(returncode=-1),调用方已有的错误分支会把它如实报出去。
     """
     env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
-    return subprocess.run(
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", env=env, timeout=GIT_TIMEOUT)
+    except subprocess.TimeoutExpired as exc:
+        def _text(v) -> str:
+            return v.decode("utf-8", "replace") if isinstance(v, bytes) else (v or "")
+        return subprocess.CompletedProcess(
+            exc.cmd, -1, _text(exc.stdout),
+            _text(exc.stderr) + (
+                f"\n(git 超过 {GIT_TIMEOUT}s 未返回,已中止。克隆大仓库或网络慢时,"
+                f"可用环境变量 GIT_TIMEOUT 调大)"
+            ),
+        )
+
+
+def _git_run(*args: str) -> subprocess.CompletedProcess:
+    """在 workspace 根仓库里跑 git:固定工作区。"""
+    return _git_exec(
         ["git", "-c", "core.quotepath=false",
-         "--git-dir", str(GIT_DIR), "--work-tree", str(ROOT), *args],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        env=env,
+         "--git-dir", str(GIT_DIR), "--work-tree", str(ROOT), *args]
     )
 
 
@@ -57,12 +74,7 @@ def _git_run_in(repo: Path, *args: str) -> subprocess.CompletedProcess:
 
     用 -C 让 git 自行发现该目录下的 .git,不预先假定仓库结构。
     """
-    env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
-    return subprocess.run(
-        ["git", "-c", "core.quotepath=false", "-C", str(repo), *args],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        env=env,
-    )
+    return _git_exec(["git", "-c", "core.quotepath=false", "-C", str(repo), *args])
 
 
 def _git_is_repo() -> bool:
