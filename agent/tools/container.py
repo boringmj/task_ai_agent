@@ -13,6 +13,7 @@ from ..core import (
     ROOT,
     clip_text,
 )
+from ..skills import CONTAINER_SKILLS_DIR, SKILLS_DIR
 
 
 # ---- container 工具专属配置(环境变量名不变,仍可在 .env 覆盖)----
@@ -124,7 +125,12 @@ def _docker_run(inner: list[str]) -> str:
         # PYTHONPATH 指向 workspace/.pylibs:agent 用 `pip install --target /workspace/.pylibs`
         # 装一次就永久保留(workspace 是宿主盘,不随容器销毁),之后每次 run_python 都能 import。
         "-e", "PYTHONPATH=/workspace/.pylibs",
-        "-v", f"{ROOT}:/workspace", "-w", "/workspace",  # 唯一挂载:只给 workspace
+        "-v", f"{ROOT}:/workspace", "-w", "/workspace",  # 唯一可写的:只有 workspace
+        # 技能目录**只读**挂进来:`:ro` 保证容器改不了它 —— 技能是项目里的事实来源,
+        # 不该被跑在里面的代码篡改。技能自带的脚本因此能在容器里跑:
+        #   skills/<名>/scripts/x.py  ->  /skills/<名>/scripts/x.py
+        # (技能放在工作区之外,不挂的话容器根本看不到它。)
+        "-v", f"{SKILLS_DIR}:{CONTAINER_SKILLS_DIR}:ro",
         CONTAINER_IMAGE,
         # 容器内自毁:到 CONTAINER_CMD_TIMEOUT 由 GNU timeout 终止,不依赖 agent 进程活着。
         # 这样 agent 崩溃也不会留下收不掉的容器(否则 --rm 只会等容器自己退出)。

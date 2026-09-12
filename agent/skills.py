@@ -28,6 +28,9 @@ from pathlib import Path
 from .core import PROJECT_DIR
 
 SKILLS_DIR = PROJECT_DIR / "skills"
+# 技能目录在容器里的挂载点(只读;见 agent/tools/container.py)。技能脚本要从容器跑,
+# 这里集中定义一次,免得两处各写一个路径字符串、改一处漏一处。
+CONTAINER_SKILLS_DIR = "/skills"
 _SKILL_FILE = "SKILL.md"
 # 正文里附带的资源目录,加载时一并告诉模型"还有这些可看"
 _RESOURCE_DIRS = ("scripts", "references", "assets")
@@ -115,14 +118,21 @@ def load(name: str) -> str:
 
     text = skill_file.read_text(encoding="utf-8")
     _meta, body = _parse_frontmatter(text)
-    extra = [d for d in _RESOURCE_DIRS if (path / d).is_dir()]
-    if extra:
-        listing = []
-        for d in extra:
-            files = sorted(f.name for f in (path / d).rglob("*") if f.is_file())[:20]
-            listing.append(f"- {d}/:{'、'.join(files) or '(空)'}")
-        body += ("\n\n---\n这个技能还带了这些资源(需要时自己去读,不会自动进上下文):\n"
-                 + "\n".join(listing))
+
+    # 附带资源不进上下文,但要说清"在哪、怎么用" —— 尤其脚本:技能目录在工作区**之外**,
+    # 你的文件工具够不到;它是**只读**挂载在容器里的 /skills 下(见 container.py 的挂载),
+    # 所以跑脚本要用 run_command / run_python 走容器那条路。
+    files = [f for d in _RESOURCE_DIRS if (path / d).is_dir()
+             for f in sorted((path / d).rglob("*")) if f.is_file()]
+    if files:
+        rel = [f.relative_to(path).as_posix() for f in files][:40]
+        listing = "\n".join(f"- {r}  →  容器里:{CONTAINER_SKILLS_DIR}/{name}/{r}" for r in rel)
+        body += (
+            f"\n\n---\n这个技能还带了 {len(rel)} 个附带资源(不会自动进上下文,需要时自己去取)。"
+            f"技能目录**不在工作区里**、你的文件工具够不到它,但它在容器里**只读**挂载着 —— "
+            f"所以要用 `run_command` / `run_python` 走容器那条路:\n{listing}\n"
+            f"(只读:能跑能读,改不了。VM 里看不到这些文件。)"
+        )
     return body
 
 

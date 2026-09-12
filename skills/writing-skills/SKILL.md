@@ -60,6 +60,24 @@ description: <什么时候该用这个技能>
   而不是把内容整个抄进正文。
 - `assets/` —— 产出里要被复制/引用的文件(模板、字体、图片)。
 
+**这些文件是怎么被用到的**:技能目录在工作区**之外**,文件工具够不到它;但它被**只读**
+挂载进容器,所以要用 `run_command` / `run_python` 走容器那条路:
+
+```
+skills/<技能名>/scripts/foo.py   →   容器里:/skills/<技能名>/scripts/foo.py
+```
+
+正文里写"跑 `scripts/foo.py`"时,模型会自动换算成上面那个容器路径(`load_skill` 也会
+把每个资源的实际路径列出来)。只读:能跑能读、改不了;VM 里看不到。
+
+举例 —— 写个校验脚本让人能自查(这个技能自己就带了一个 `scripts/check_skill.py`):
+
+```markdown
+写完用容器里的校验脚本过一遍:
+
+    python /skills/<技能名>/scripts/check_skill.py /skills/<技能名>
+```
+
 ## 加完之后
 
 技能是**自动发现**的:目录建好、`SKILL.md` 写好,下次启动就会出现在技能清单里,
