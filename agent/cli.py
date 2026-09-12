@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+import sys
+
+from rich.markdown import Markdown
+
+from .core import (
+    AUTO_COMPACT_RATIO,
+    ROOT,
+    TRASH_MAX_AGE_DAYS,
+    console,
+)
+from .llm import usage_detail, usage_line
+from .loop import compact, load_system_prompt, run
+from .tools.container import _docker_cleanup_stale, _docker_health
+from .tools.memory import _read_memory
+from .tools.trash import purge_trash
+from .tools.vm import _vm_kickoff, _vm_state_get, vm_status
+
+
+def _cleanup_trash_on_start() -> None:
+    """启动时删除超过保留期(默认 7 天)的回收站文件。
+
+    必须传 TRASH_MAX_AGE_DAYS —— 若调 purge_trash()(无参),会变成"清空全部",
+    把还没过保留期的文件也一起删了,那就违背"只删 7 天以上"的本意了。
+    """
+    try:
+        result = purge_trash(TRASH_MAX_AGE_DAYS)
+        if "删除 0 个" not in result:  # 只在确有清理时提示,免得每次启动都罗嗦
+            console.print(f"回收站:{result}", style="dim")
+    except Exception as exc:  # noqa: BLE001 - 回收站清理失败不应阻止 agent 启动
+        console.print(f"回收站清理失败(不影响使用):{exc}", style="dim")
+
+
+def _read_multiline(prompt: str = "你 > ") -> str:
+    """读取一段多行输入,空行提交 —— 支持粘贴多行并保留换行。
+
+    console.input() 只读单行,没法粘贴多行代码/文本。改为逐行读取,
+    用户输入完(或粘贴完)按一个空行结束。空行只作提交信号,不会进消息。
+    """
+    lines: list[str] = []
+    try:
+        console.print(prompt, style="bold cyan", end="")
+        while True:
+            line = sys.stdin.readline()
+            if line == "":  # EOF(Ctrl+D / Ctrl+Z),停止
+                break
+            if line in {"\n", "\r\n"}:  # 空行 = 提交
+                break
+            lines.append(line.rstrip("\r\n"))
+            console.print("… ", style="dim", end="")
+    except KeyboardInterrupt:
+        # 空闲时 Ctrl+C = 退出信号(返回 None)。
+        # 必须包住整个函数(含提示打印),否则中断落在 console.print 里的
+        # os.get_terminal_size() 时(像这次的栈)会从这个函数逃逸,直接崩掉进程。
+        # 恢复打印用裸 write(不走 Rich),避免 get_terminal_size 又被中断引发二次异常。
+        sys.stdout.write("\n")
+        return None
+    except EOFError:
+        pass
+    return "\n".join(lines)
+
+
+def main() -> None:
+    messages: list[dict] = [{"role": "system", "content": load_system_prompt()}]
+    memory = _read_memory().strip()  # 跨会话记住的关键事实最先注入,始终在场
+    if memory:
+        messages.append(
+            {
+                "role": "system",
+                "content": f"以下是跨会话保留的长期记忆,和你的对话无关,仅供参考:\n{memory}",
+            }
+        )
+    _cleanup_trash_on_start()
+    # 预处理 Docker 健康状态(非阻断):可用则做残留清理,不可用仅警告,agent 照常启动
+    ok, msg = _docker_health()
+    if ok:
+        n = _docker_cleanup_stale()
+        if n:
+            console.print(f"已清理 {n} 个上次残留的容器", style="dim")
+    console.print(f"Docker:{'✅ ' if ok else '⚠ 不可用 —— '}{msg}", style="dim" if ok else "yellow")
+    # 后台拉起虚拟机(非阻断,失败仅提示,agent 照常启动)
+    try:
+        _vm_kickoff()  # 后台线程启动/配置虚拟机,不阻塞
+        ready = _vm_state_get()["status"] == "ready"
+        console.print(f"VM:{vm_status()}", style="dim" if ready else "yellow")
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"VM:启动失败(不影响 agent)—— {exc}", style="yellow")
+    console.print("Agent 已启动。", style="bold")
+    console.print("输入多行:连续输入,最后一个空行提交(支持粘贴)。", style="dim")
+    console.print("执行中 Ctrl+C=取消本轮;空闲时 Ctrl+C=退出;exit 退出。", style="dim")
+    console.print(f"/compact 压缩上下文(省 token);/tokens 看用量;占用达 "
+                  f"{AUTO_COMPACT_RATIO:.0%} 会自动压缩。", style="dim")
+    console.print(f"工作区:{ROOT}\n", style="dim")
+
+    while True:
+        try:
+            user_input = _read_multiline()  # 多行读取,空行提交
+            if user_input is None:  # 空闲时 Ctrl+C = 退出
+                console.print("再见。", style="dim")
+                break
+            text = user_input.rstrip()  # 去掉粘贴时多带的结尾空行,保留行内缩进
+            if not text.strip():
+                continue
+            if text in {"exit", "quit"}:
+                break
+            if text == "/compact":
+                console.print(compact(messages), style="dim")
+                continue
+            if text == "/tokens":
+                console.print(usage_detail(), style="dim")
+                continue
+
+            start = len(messages)  # 快照:用于取消时回滚本轮半截改动
+            try:
+                reply = run(text, messages)
+            except KeyboardInterrupt:
+                # 执行中 Ctrl+C:回滚半截对话,回到提示,会话不退出
+                del messages[start:]
+                console.print("\n[已取消]", style="bold red")
+                continue
+
+            console.print("AI >", style="bold green")
+            # Markdown 要拿到完整文本才能正确解析,所以是等模型说完再一次性渲染
+            console.print(Markdown(reply) if reply.strip() else "(模型没有返回内容)")
+            line = usage_line()
+            if line:
+                console.print(line, style="dim")
+            console.print()
+        except KeyboardInterrupt:
+            # 兜底:任何没被上面捕获的 Ctrl+C(例如渲染 Markdown 那一下),
+            # 一律干净退出,而不是抛栈崩掉。
+            console.print("\n再见。", style="dim")
+            break
+
+
+if __name__ == "__main__":
+    main()

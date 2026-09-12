@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+import base64
+
+from ..core import (
+    IMG_MAX_BYTES,
+    IMG_MIME,
+    SCREEN_MAX_DIM,
+    safe_path,
+    _pending_images,
+)
+
+
+def _img_magic_ok(ext: str, data: bytes) -> bool:
+    """按扩展名校验文件头(魔数),确认真的是那种格式的图片。
+
+    只信扩展名不够 —— 一个 .jpg 的文本文件也能通过,交给视觉模型会在 API 层
+    报错,不如在这里就拦掉。零依赖,自己读文件头。
+    """
+    if ext == ".png":
+        return data.startswith(b"\x89PNG\r\n\x1a\n")
+    if ext in (".jpg", ".jpeg"):
+        return data.startswith(b"\xff\xd8\xff")
+    if ext == ".gif":
+        return data.startswith(b"GIF8")
+    if ext == ".webp":
+        return data.startswith(b"RIFF") and data[8:12] == b"WEBP"
+    return False
+
+
+def img(path: str) -> str:
+    """把工作区里的图片转成 data URL,登记到待注入队列,供下一轮模型以 image_url 查看。
+
+    工具返回值只能存文本,塞不进 image_url;所以这里不返回 base64 字符串,
+    只登记数据,由 run() 在下次调用模型前把它作为 content 里的 image_url 段注入。
+    """
+    target = safe_path(path)
+    if not target.is_file():
+        raise FileNotFoundError(f"{target} 不存在或不是文件")
+    ext = target.suffix.lower()
+    if ext not in IMG_MIME:
+        raise ValueError(f"不支持的图片格式 {ext},支持:{'、'.join(sorted(IMG_MIME))}")
+    size = target.stat().st_size
+    if size > IMG_MAX_BYTES:
+        raise ValueError(f"图片过大({size} 字节),上限 {IMG_MAX_BYTES} 字节")
+
+    data = target.read_bytes()
+    if not _img_magic_ok(ext, data):
+        raise ValueError(f"{target.name} 的文件头与 {ext} 格式不符,可能不是有效的 {ext} 图片。")
+
+    b64 = base64.b64encode(data).decode("ascii")
+    _pending_images.append(f"data:{IMG_MIME[ext]};base64,{b64}")
+    return f"图片 {target.name} 已加载({size} 字节),将在下一轮作为图像信息交给模型。"
+
+
+def _image_to_data_url(image) -> str:
+    """把 PIL Image 压缩到最长边不超过 SCREEN_MAX_DIM,再转成 PNG data URL。
+
+    这是回答"大图"问题的核心:屏幕截图通常远超视力模型能接受的分辨率,
+    先在本地压小再发,而不是原样送一个 4K 图给模型内部缩小。
+    """
+    from PIL import Image  # 延迟导入,只在真用到时加载
+
+    if image.mode not in ("RGB", "RGBA"):
+        image = image.convert("RGB")
+    if max(image.size) > SCREEN_MAX_DIM:
+        scale = SCREEN_MAX_DIM / max(image.size)
+        image = image.resize(
+            (max(1, int(image.size[0] * scale)), max(1, int(image.size[1] * scale))),
+            Image.LANCZOS,
+        )
+    from io import BytesIO
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def screen() -> str:
+    """截取整个屏幕,压缩后作为图像交给视觉模型。
+
+    截取的是用户自己的屏幕,属于敏感操作 —— 务必只在用户明确要求查看屏幕、
+    或任务确实依赖当前屏幕内容时才调用。
+    """
+    try:
+        from PIL import ImageGrab  # Windows 原生截屏;延迟导入,非截屏场景不背依赖
+    except ImportError as exc:
+        raise RuntimeError("截屏需要 Pillow,请先执行:pip install Pillow") from exc
+
+    image = ImageGrab.grab()
+    orig_w, orig_h = image.size
+    url = _image_to_data_url(image)
+    _pending_images.append(url)
+    cw = max(1, int(orig_w * SCREEN_MAX_DIM / max(orig_w, orig_h)))
+    ch = max(1, int(orig_h * SCREEN_MAX_DIM / max(orig_w, orig_h)))
+    # 给出原分辨率与压缩后的换算,方便模型算真实点击坐标:
+    # click/move 用原始分辨率坐标;真实坐标 = 图坐标 × (orig/cw)。
+    return (
+        f"已截取全屏:原始 {orig_w}×{orig_h},交给模型的压缩图为 {cw}×{ch}。"
+        f"click/move 请用原始分辨率坐标,换算:真实坐标 = 图坐标 × ({orig_w}/{cw})。"
+    )
+
+
+def _inject_pending_images(messages: list[dict]) -> None:
+    """把本轮登记的图片作为 image_url 内容段注入对话,让视觉模型能真正看到。
+
+    图像只能出现在消息的 content 列表里(tool 结果只能是字符串),所以单独
+    追加一条带图像内容的消息,而不是塞进工具返回值。
+    """
+    if not _pending_images:
+        return
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                [{"type": "text", "text": "(以下为 img 工具加载的图片,请据此处理当前任务。)"}]
+                + [{"type": "image_url", "image_url": {"url": u}} for u in _pending_images]
+            ),
+        }
+    )
+    _pending_images.clear()

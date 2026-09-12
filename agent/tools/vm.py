@@ -1,0 +1,582 @@
+from __future__ import annotations
+
+import atexit
+import json
+import socket
+import shutil
+import subprocess
+import threading
+import time
+import uuid
+
+from ..core import (
+    QEMU_IMG,
+    QEMU_SYSTEM,
+    VM_ACCEL,
+    VM_BASE,
+    VM_DIR,
+    VM_DISK,
+    VM_INSTANCE,
+    VM_VMSERVER_PORT,
+    safe_path,
+)
+
+_vm_port: int | None = None                        # 启动时动态分配,避免多开抢 2222
+_vm_token = ""                                     # 每启动随机生成、经串口注入 guest,服务端每次请求读它
+_vm_vmserver_host_port: int | None = None           # 宿主侧转发到 guest:40000 的端口
+_vm_tunnels: dict = {}                              # host_port -> 常驻转发入口(宿主监听 + relay)
+
+
+# ---------------- 虚拟机(QEMU)沙箱 ----------------
+# 后台启动一个 Alpine 虚拟机作为更强隔离的沙箱。guest 内置 vmserver(socket),
+# 每启动随机 token 经串口注入。状态机:BOOTING → LOGIN → READY。
+# 执行命令走 vmserver(JSON);agent 只写本实例 overlay,基础盘只读共享。
+
+_vm_proc = None
+_vm_thread: "threading.Thread | None" = None
+_vm_serial_port: int | None = None
+# 线程安全的状态:{status, step, port, error}
+_vm_state: dict = {"status": "idle", "step": "", "port": None, "error": ""}
+_vm_lock = threading.Lock()
+
+
+def _vm_state_set(status: str, step: str = "", port: int | None = None, error: str = "") -> None:
+    with _vm_lock:
+        _vm_state.update({"status": status, "step": step, "port": port, "error": error})
+
+
+def _vm_state_get() -> dict:
+    with _vm_lock:
+        return dict(_vm_state)
+
+
+def _vm_free_port(base: int) -> int:
+    import socket
+    for port in range(base, base + 60):
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                continue
+        except OSError:
+            return port
+    raise RuntimeError(f"端口分配失败({base} 起 60 个都被占用)")
+
+
+def _vm_ensure() -> None:
+    VM_DIR.mkdir(parents=True, exist_ok=True)
+    if not VM_DISK.exists():
+        if not (QEMU_IMG.exists() and VM_BASE.exists()):
+            raise FileNotFoundError(f"缺少 QEMU 工具({QEMU_IMG})或基础盘({VM_BASE})")
+        subprocess.run(
+            [str(QEMU_IMG), "create", "-f", "qcow2", "-F", "qcow2",
+             "-b", str(VM_BASE), str(VM_DISK)],
+            check=True, capture_output=True,
+        )
+
+
+class _VmSerial:
+    """QEMU 串口控制台通道(参考 sandbox_demo):连接 sentinel 读取、发送、排空。"""
+    def __init__(self, port: int):
+        import socket
+        self.s = socket.create_connection(("127.0.0.1", port), timeout=15)
+        self.s.settimeout(0.5)
+        self.buf = b""
+
+    def read_until(self, marker: str, timeout: float = 30.0) -> str:
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                d = self.s.recv(4096)
+            except socket.timeout:
+                continue
+            if not d:
+                break
+            self.buf += d
+            if marker in self.buf.decode("utf-8", "replace"):
+                return self.buf.decode("utf-8", "replace")
+        return self.buf.decode("utf-8", "replace")
+
+    def send(self, text: str) -> None:
+        self.s.sendall(text.encode())
+
+    def drain(self) -> None:
+        self.s.settimeout(0.2)
+        try:
+            while True:
+                d = self.s.recv(4096)
+                if not d:
+                    break
+                self.buf += d
+        except socket.timeout:
+            pass
+
+    def reset_buf(self) -> None:
+        self.buf = b""
+
+
+def _vm_serial_login(port: int) -> _VmSerial:
+    """连串口,root/123456 登录,关回显。返回保持登录态的会话(不配置 sshd)。
+
+    参考 sandbox_demo:全程串口控制台执行,不用 sshd — 这是正确的通道。
+    """
+    _vm_state_set("login", "登录 root/123456…")
+    ser = None
+    for _ in range(40):
+        try:
+            ser = _VmSerial(port)
+            break
+        except OSError:
+            time.sleep(0.5)
+    if ser is None:
+        raise ConnectionError("连不上虚拟机串口")
+    ser.read_until("login:", 30)
+    ser.send("root\n")
+    ser.read_until("Password:", 15)
+    ser.send("123456\n")
+    if "#" not in ser.read_until("#", 25):  # 等 shell 提示符,确认真进入 shell
+        raise RuntimeError("串口登录未进入 shell")
+    ser.send("stty -echo\n")  # 关回显:命令输出与输入回声分离,避免误判
+    ser.drain()
+    return ser
+
+
+_vm_ser: "_VmSerial | None" = None        # 保持登录态的串口会话
+_vm_serial_lock = threading.Lock()          # 串口只用于启动时注入 token,加锁避免冲突
+
+
+def _vm_spawn_and_login(serial_port: int, vmserver_host_port: int) -> None:
+    """boot QEMU(映射 guest:40000 的 vmserver)+ 串口登录,设置 _vm_proc/_vm_ser。"""
+    global _vm_proc, _vm_ser
+    cmd = [
+        str(QEMU_SYSTEM),
+        "-drive", f"file={VM_DISK},if=virtio",
+        # 只把 vmserver 的 40000 口转发到宿主;其余 guest 口不暴露(vmserver 可代理)
+        "-netdev", f"user,id=n0,hostfwd=tcp::{vmserver_host_port}-:{VM_VMSERVER_PORT}",
+        "-device", "virtio-net-pci,netdev=n0",
+        "-m", "1024", "-smp", "2", "-display", "none",
+        "-serial", f"tcp:127.0.0.1:{serial_port},server=on,wait=off",
+        "-accel", VM_ACCEL,
+    ]
+    import subprocess as sp
+    _vm_proc = sp.Popen(cmd, creationflags=sp.CREATE_NO_WINDOW,
+                        stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+    time.sleep(1)
+    if _vm_proc.poll() is not None and _vm_proc.returncode != 0:
+        raise RuntimeError("QEMU 启动即退出,请检查 VM_ACCEL(whpx/tcg)或镜像")
+    _vm_ser = _vm_serial_login(serial_port)
+
+
+def _vm_worker() -> None:
+    """后台线程:boot → 串口登录 → 注入每启动随机 token → READY。
+
+    之后 vm_run 走 socket 到 vmserver,不再用裸串口;串口只在启动时注入 token。
+    """
+    global _vm_token, _vm_vmserver_host_port
+    try:
+        if not VM_BASE.exists():
+            raise FileNotFoundError(
+                f"缺少 vmserver 基础盘 {VM_BASE}。请先用 qemu-img convert 生成 vm/alpine-vmserver.qcow2。")
+        _vm_ensure()
+        serial_port = _vm_free_port(3000)
+        vmserver_host_port = _vm_free_port(5000)
+        global _vm_serial_port
+        _vm_serial_port = serial_port
+        _vm_vmserver_host_port = vmserver_host_port
+        _vm_state_set("booting", "启动 QEMU…", port=vmserver_host_port)
+        _vm_spawn_and_login(serial_port, vmserver_host_port)
+
+        # 生成并注入每启动随机 token(vmserver 每次请求读 /root/.vm_token,无需重启服务)
+        _vm_token = uuid.uuid4().hex + uuid.uuid4().hex
+        with _vm_serial_lock:
+            _vm_ser.send(f"echo '{_vm_token}' > /root/.vm_token\n")
+            time.sleep(0.5)
+        try:
+            _vm_ser.s.close()   # 串口只在注入 token 用,之后 vm_run 走 socket
+        except Exception:
+            pass
+        _vm_state_set("ready", "就绪,可连接 vmserver", port=vmserver_host_port)
+    except Exception as exc:  # noqa: BLE001
+        _vm_state_set("error", "", error=str(exc))
+
+
+def _vm_kickoff() -> None:
+    """启动后台线程(幂等)。"""
+    global _vm_thread
+    if _vm_thread is not None and _vm_thread.is_alive():
+        return
+    _vm_thread = threading.Thread(target=_vm_worker, daemon=True)
+    _vm_thread.start()
+
+
+def vm_status() -> str:
+    """查看沙箱虚拟机的当前状态(进行到哪一步、是否就绪)。"""
+    st = _vm_state_get()
+    if st["status"] == "ready":
+        return f"虚拟机就绪(实例 {VM_INSTANCE[:8]},串口 {st['port']})。"
+    if st["status"] == "error":
+        return f"虚拟机出错:{st['error']}"
+    return "虚拟机会在后台启动,agent 退出后会自动销毁。"
+
+
+def vm_run(command: str) -> str:
+    """在沙箱虚拟机里执行一条命令 —— 连接 guest 里的 vmserver(socket, JSON 协议)。
+
+    vmserver 用无 TTY 的 subprocess 跑命令、自带超时(超时就 kill,返回 timed_out),
+    所以交互程序(vim/top)会直接秒失败、不会卡死会话;命令输出是结构化 JSON,无壳提示符。
+    """
+    st = _vm_state_get()
+    if st["status"] != "ready":
+        return f"虚拟机还没就绪,当前:{st['step'] or st['status']}。请用 vm_status 或稍后再试。"
+    if not _vm_vmserver_host_port or not _vm_token:
+        return "虚拟机 vmserver 未就绪,请稍后再试。"
+
+    import socket as sk, json
+    req = {"token": _vm_token, "cmd": "exec", "command": command, "timeout": 60}
+    try:
+        s = sk.create_connection(("127.0.0.1", _vm_vmserver_host_port), timeout=10)
+        s.settimeout(90)
+        s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+        line = s.makefile("rb").readline()
+        s.close()
+        resp = json.loads(line.decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001 - 服务端可能挂了,给提示并可尝试重启
+        return f"连接 vmserver 失败:{exc}(vmserver 可能未就绪或已退出,可稍后重试或看 vm_status)。"
+
+    if not resp.get("ok"):
+        return f"vmserver 错误:{resp.get('error', 'unknown')}"
+    out = resp.get("output", "")
+    timed = resp.get("timed_out", False)
+    return (out[:10000] if out else "(无输出)") + ("\n[命令超时,已中断]" if timed else "")
+
+
+def _shq(s: str) -> str:
+    """POSIX 单引号转义:把 guest 侧字符串安全地放进单引号里。"""
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _vm_exec_raw(command: str, timeout: int = 60) -> dict:
+    """发一条 exec 到 guest 里的 vmserver,返回**原始响应 dict**(不截断、不拼摘要)。
+
+    与 vm_run 的区别:这里拿的是完整响应(含任意大 output),由调用方决定怎么用;
+    vm_run 面向模型、输出会截断后回显;文件传输(读回 base64)要的是完整字节,故走这里,
+    这样文件内容只存在于工具函数内部,不会填进对话上下文。
+    """
+    st = _vm_state_get()
+    if st["status"] != "ready":
+        return {"ok": False, "error": f"虚拟机还没就绪({st['step'] or st['status']})"}
+    if not _vm_vmserver_host_port or not _vm_token:
+        return {"ok": False, "error": "vmserver 未就绪"}
+    import socket as sk, json
+    req = {"token": _vm_token, "cmd": "exec", "command": command, "timeout": timeout}
+    try:
+        s = sk.create_connection(("127.0.0.1", _vm_vmserver_host_port), timeout=10)
+        s.settimeout(timeout + 30)
+        s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+        line = s.makefile("rb").readline()
+        s.close()
+        return json.loads(line.decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"连接 vmserver 失败:{exc}"}
+
+
+def vm_push(local_path: str, guest_path: str) -> str:
+    """把工作区里的一个文件上传到虚拟机(宿主 → guest)。
+
+    文件字节经 base64 分块走 vmserver 写入 guest,**全程在工具内部完成**,
+    只回「已上传 (n 字节)」这类摘要,不会把文件内容塞进对话上下文。
+    local_path 必须是工作区内路径(相对或绝对);guest_path 是 guest 里的绝对路径(如 /root/a.txt)。
+    """
+    import base64
+    local = safe_path(local_path)
+    if not local.is_file():
+        return f"错误:工作区里没有 {local_path}(解析为 {local})"
+    gp = _shq(guest_path)
+    data = local.read_bytes()
+    base = base64.b64encode(data).decode("ascii")  # base64 字符不含单引号,可安全放进单引号
+    if not base:
+        _vm_exec_raw(f"rm -f {gp}; mkdir -p \"$(dirname {gp})\"; : > {gp}", 30)
+        return f"已把工作区文件上传到 guest:{guest_path}(空文件,0 字节)。"
+    _vm_exec_raw(f"rm -f {gp}; mkdir -p \"$(dirname {gp})\"", 30)
+    CHUNK = 64 * 1024  # 每块 64KB 源,base64 后 ~87KB,低于 guest 参数限制
+    for i in range(0, len(base), CHUNK):
+        piece = base[i:i + CHUNK]
+        redir = ">" if i == 0 else ">>"  # 首块覆盖、其余追加
+        resp = _vm_exec_raw(f"printf '%s' '{piece}' | base64 -d {redir} {gp}", 60)
+        if not resp.get("ok"):
+            return f"错误:第 {i // CHUNK + 1} 块写入失败:{resp.get('error', '')} — {resp.get('output', '')[:200]}"
+    return f"已把工作区文件 {local_path} 上传到 guest:{guest_path}({len(data)} 字节)。"
+
+
+def vm_pull(guest_path: str, local_path: str) -> str:
+    """把虚拟机里的一个文件下载到工作区(guest → 宿主)。
+
+    文件经 vmserver 分块 base64 读回,**在工具内部解码后写入工作区 local_path**,
+    只回「已下载 (n 字节)」摘要,文件内容不进对话上下文。
+    local_path 是工作区路径;guest_path 是 guest 里的绝对路径(如 /root/out.txt)。
+    """
+    import base64
+    local = safe_path(local_path)
+    gp = _shq(guest_path)
+    size_resp = _vm_exec_raw(f"if [ -f {gp} ]; then stat -c %s {gp}; else echo MISSING; fi", 30)
+    size_raw = (size_resp.get("output") or "").strip()
+    if size_raw == "MISSING":
+        return f"错误:虚拟机里没有 {guest_path}"
+    try:
+        total = int(size_raw.splitlines()[-1])
+    except ValueError:
+        return f"错误:无法读取 guest 文件大小({size_raw!r})"
+    BS = 64 * 1024          # 与 vmserver 200KB 输出上限对齐:base64 后 ~87KB < 200KB
+    out = bytearray()
+    blocks = (total + BS - 1) // BS
+    for b in range(blocks):
+        cmd = f"dd if={gp} bs={BS} skip={b} count=1 2>/dev/null | base64 | tr -d '\n'"
+        resp = _vm_exec_raw(cmd, 60)
+        if not resp.get("ok"):
+            return f"错误:读 guest {guest_path} 第 {b + 1}/{blocks} 块失败:{resp.get('error', '')}"
+        try:
+            out += base64.b64decode((resp.get("output") or "").strip())
+        except Exception as exc:  # noqa: BLE001
+            return f"错误:guest 第 {b + 1} 块 base64 解码失败:{exc}"
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_bytes(bytes(out))
+    return f"已把 guest {guest_path} 下载到工作区:{local_path}({len(out)} 字节)。"
+
+
+def vm_fetch(guest_url: str) -> str:
+    """转发访问 guest 内的 HTTP 服务:通过 vmserver 的 proxy,把 guest 端口代理到本地。
+
+    只支持 http(geth;HTTPS 透传要 TLS,不支持)。适合访问 agent 在 guest 里起的服务。
+    """
+    st = _vm_state_get()
+    if st["status"] != "ready":
+        return f"虚拟机还没就绪,当前:{st['step'] or st['status']}。请用 vm_status 或稍后再试。"
+    if not _vm_vmserver_host_port or not _vm_token:
+        return "虚拟机 vmserver 未就绪,请稍后再试。"
+
+    from urllib.parse import urlparse
+    u = urlparse(guest_url)
+    if u.scheme != "http" or not u.netloc:
+        return "只支持 http://host:port/... 形式(HTTPS 透传暂不支持,请用 guest 内的 http 服务)。"
+    host = u.hostname or "127.0.0.1"
+    port = u.port or 80
+    path = u.path or "/"
+    if u.query:
+        path += "?" + u.query
+
+    import socket as sk
+    try:
+        s = sk.create_connection(("127.0.0.1", _vm_vmserver_host_port), timeout=10)
+        s.settimeout(30)
+        req = {"token": _vm_token, "cmd": "proxy", "host": host, "port": port}
+        s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+        ack = json.loads(s.makefile("rb").readline().decode("utf-8", "replace"))
+        if not (ack.get("ok") and ack.get("proxy")):
+            s.close()
+            return f"vmserver proxy 失败:{ack.get('error', 'unknown')}"
+        # 通过已建立的透传连接发 HTTP GET,读响应
+        s.sendall(f"GET {path} HTTP/1.1\r\nHost: {u.netloc}\r\nConnection: close\r\n\r\n".encode())
+        data = b""
+        while True:
+            c = s.recv(8192)
+            if not c:
+                break
+            data += c
+            if len(data) > 2_000_000:
+                break
+        s.close()
+    except Exception as exc:  # noqa: BLE001
+        return f"vm_fetch 失败:{exc}"
+
+    if not data:
+        return "(guest 服务无响应)"
+    status = data.split(b"\r\n", 1)[0].decode("utf-8", "replace")
+    sep = data.find(b"\r\n\r\n")
+    body = data[sep + 4:].decode("utf-8", "replace") if sep >= 0 else ""
+    return f"{status}\n--- body ---\n{body[:8000]}"
+
+
+def vm_tcp(host: str, port: int, data: str) -> str:
+    """向 guest 内任意 TCP 服务发一段字节并读回复(经 vmserver proxy)。
+
+    通用 TCP(不仅 HTTP):适合请求/答一类协议(Redis、MySQL 查询、自定协议等)。
+    注意是"发一次、收一次"的一问一答;持续会话类(SSH)不适合。
+    """
+    st = _vm_state_get()
+    if st["status"] != "ready":
+        return f"虚拟机还没就绪,当前:{st['step'] or st['status']}。请用 vm_status 或稍后再试。"
+    if not _vm_vmserver_host_port or not _vm_token:
+        return "虚拟机 vmserver 未就绪,请稍后再试。"
+
+    import socket as sk
+    try:
+        s = sk.create_connection(("127.0.0.1", _vm_vmserver_host_port), timeout=10)
+        s.settimeout(30)
+        req = {"token": _vm_token, "cmd": "proxy", "host": host, "port": int(port)}
+        s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+        ack = json.loads(s.makefile("rb").readline().decode("utf-8", "replace"))
+        if not (ack.get("ok") and ack.get("proxy")):
+            s.close()
+            return f"vmserver proxy 失败:{ack.get('error', 'unknown')}"
+        s.sendall(data.encode("utf-8"))
+        reply = b""
+        while True:
+            c = s.recv(8192)
+            if not c:
+                break
+            reply += c
+            if len(reply) > 2_000_000:
+                break
+        s.close()
+    except Exception as exc:  # noqa: BLE001
+        return f"vm_tcp 失败:{exc}"
+
+    if not reply:
+        return "(guest 服务无响应)"
+    try:
+        text = reply.decode("utf-8")
+        if all(ord(ch) >= 32 or ch in "\r\n\t" for ch in text):
+            return text[:10000]
+        raise ValueError
+    except Exception:
+        return f"(二进制 {len(reply)} 字节,前 200 字节 hex: {reply[:200].hex()})"
+
+
+def _vm_proxy_relay(guest_port: int, client) -> None:
+    """把一条宿主连接经 vmserver proxy 转发到 guest:guest_port,双向泵字节。"""
+    import socket as sk, json
+    try:
+        up = sk.create_connection(("127.0.0.1", _vm_vmserver_host_port), timeout=10)
+        up.settimeout(60)
+        req = {"token": _vm_token, "cmd": "proxy", "host": "127.0.0.1", "port": guest_port}
+        up.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+        ack = json.loads(up.makefile("rb").readline().decode("utf-8", "replace"))
+        if not (ack.get("ok") and ack.get("proxy")):
+            up.close()
+            client.close()
+            return
+    except Exception:
+        try:
+            client.close()
+        except Exception:
+            pass
+        return
+
+    def pump(a, b):
+        try:
+            while True:
+                d = a.recv(8192)
+                if not d:
+                    break
+                b.sendall(d)
+        except Exception:
+            pass
+        try:
+            b.shutdown(sk.SHUT_WR)
+        except Exception:
+            pass
+
+    threading.Thread(target=pump, args=(client, up), daemon=True).start()
+    threading.Thread(target=pump, args=(up, client), daemon=True).start()
+
+
+def vm_tunnel(host_port: int, guest_port: int) -> str:
+    """把 guest 内某个端口常驻转发到宿主导 —— 浏览器等直接访问宿主口即可。
+
+    每条进来的宿主连接,都会经 vmserver proxy(带本进程 token)转到 guest:guest_port。
+    真正实现"把 VM 端口映射到宿主导、可浏览器访问"。
+    """
+    st = _vm_state_get()
+    if st["status"] != "ready":
+        return f"虚拟机还没就绪,当前:{st['step'] or st['status']}。请用 vm_status 或稍后再试。"
+    if not _vm_vmserver_host_port or not _vm_token:
+        return "虚拟机 vmserver 未就绪,请稍后再试。"
+    import socket as sk
+    sk.setdefaulttimeout(1.0)
+    if int(host_port) in _vm_tunnels:
+        vm_tunnel_stop(int(host_port))
+    srv = sk.socket(sk.AF_INET, sk.SOCK_STREAM)
+    srv.setsockopt(sk.SOL_SOCKET, sk.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", int(host_port)))
+    srv.listen(16)
+    srv.settimeout(1.0)
+
+    def accept_loop():
+        while int(host_port) in _vm_tunnels:
+            try:
+                client, _ = srv.accept()
+            except sk.timeout:
+                continue
+            except OSError:
+                break
+            if int(host_port) in _vm_tunnels:
+                threading.Thread(target=_vm_proxy_relay, args=(int(guest_port), client), daemon=True).start()
+            else:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    _vm_tunnels[int(host_port)] = {"server": srv, "thread": threading.Thread(target=accept_loop, daemon=True)}
+    _vm_tunnels[int(host_port)]["thread"].start()
+    return f"已开通宿主 127.0.0.1:{host_port} → guest:{guest_port}。浏览器访问 http://127.0.0.1:{host_port}"
+
+
+def vm_tunnel_stop(host_port: int | None = None) -> str:
+    """停止一个(或全部)常驻转发。"""
+    if host_port is not None and int(host_port) not in _vm_tunnels:
+        return f"宿主 {host_port} 没有在转发。"
+    targets = [int(host_port)] if host_port is not None else list(_vm_tunnels)
+    for hp in targets:
+        entry = _vm_tunnels.pop(hp, None)
+        if not entry:
+            continue
+        try:
+            entry["server"].close()  # 关闭监听,accept 循环退出
+        except Exception:
+            pass
+    return "已停止指定转发。" if host_port is not None else "已停止所有转发。"
+
+
+def _vm_cleanup() -> None:
+    """agent 退出时:杀掉本实例的 QEMU,删掉本实例 overlay 和密钥,不留残 VM/盘。
+
+    只动本进程的 VM_DISK(_vm_proc),不 taskkill /IM 以免误杀其它 agent/用户自己的 VM。
+    """
+    try:
+        if _vm_proc is not None and _vm_proc.poll() is None:
+            _vm_proc.kill()          # 仅本进程起的 QEMU
+            try:
+                _vm_proc.wait(timeout=5)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    time.sleep(0.3)  # 等 QEMU 释放对 overlay 的句柄
+    try:
+        for _ in range(4):  # 句柄释放有延迟,重试删
+            try:
+                if VM_DISK.exists():
+                    VM_DISK.unlink()
+                break
+            except OSError:
+                time.sleep(0.3)
+    except OSError:
+        pass
+    keydir = VM_DIR / f"key-{VM_INSTANCE}"
+    try:
+        if keydir.exists():
+            shutil.rmtree(keydir, ignore_errors=True)
+    except Exception:
+        pass
+    try:
+        vm_tunnel_stop()  # 关闭所有常驻转发
+    except Exception:
+        pass
+
+
+atexit.register(_vm_cleanup)
+
+
+def vm_start() -> str:
+    """确保沙箱虚拟机在后台启动(已在配就返回当前状态)。"""
+    _vm_kickoff()
+    return f"虚拟机正在后台启动({VM_INSTANCE[:8]}),可查 vm_status。"

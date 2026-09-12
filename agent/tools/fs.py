@@ -1,0 +1,389 @@
+from __future__ import annotations
+
+import os
+import re
+from datetime import datetime
+from pathlib import Path
+
+from .trash import _is_system_dir
+from ..core import (
+    DENY_READ,
+    MAX_ENTRIES,
+    MAX_FIND_RESULTS,
+    MAX_GREP_FILE_BYTES,
+    MAX_GREP_LINE_CHARS,
+    MAX_GREP_MATCHES,
+    MAX_READ_CHARS,
+    MAX_WRITE_BYTES,
+    ROOT,
+    SEARCH_SKIP_DIRS,
+    safe_path,
+    _rel,
+)
+
+def get_current_time() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _sniff_encoding(target: Path) -> str:
+    """探测一个已存在文件的编码(读头部样本;UTF-16 看 BOM)。"""
+    with target.open("rb") as fh:
+        head = fh.read(65536)
+    if head[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return "utf-16"
+    return _detect_text_encoding(head) if head else "utf-8"
+
+
+def _read_text_with_encoding(target: Path) -> tuple[str, str]:
+    """按探测到的编码读出文本,返回 (文本, 编码名)。
+
+    GBK/GB18030 等中文编码的文件也能读。读时用 errors='replace':万一探测不准,
+    也只是个别字符变乱码,不会整个读失败。(写回要用同一个编码,见 _save_lines / append_file。)
+    """
+    enc = _sniff_encoding(target)
+    return target.read_text(encoding=enc, errors="replace"), enc
+
+
+def read_file(path: str, with_line_numbers: bool = False,
+              start_line: int | None = None, end_line: int | None = None) -> str:
+    """读取工作区里的文本文件。可只读某个行区间(1 起始,含两端)。
+
+    给 start_line/end_line 就只返回那几行 —— grep_files 命中某行后想看附近上下文时用它,
+    不必整份读进来。带行号时,行号始终是**文件里的真实行号**,可直接喂给 edit_lines。
+    """
+    target = safe_path(path)
+    if target.name in DENY_READ:
+        raise PermissionError(f"{target.name} 属于敏感文件(如 .env),禁止读取")
+    text, _enc = _read_text_with_encoding(target)
+    lines = text.splitlines()
+    total = len(lines)
+
+    if start_line is None and end_line is None:
+        lo, hi = 1, total
+    else:
+        if total == 0:
+            return "(文件是空的)"
+        lo = max(1, int(start_line or 1))
+        hi = min(total, int(end_line or total))
+        if lo > hi:
+            return (f"错误:行区间无效(start_line={start_line}, end_line={end_line},"
+                    f"文件共 {total} 行)")
+
+    selected = lines[lo - 1:hi]
+    if with_line_numbers:
+        body = "\n".join(f"{i:>4} | {line}" for i, line in enumerate(selected, lo))
+    else:
+        body = "\n".join(selected)
+    if len(body) > MAX_READ_CHARS:
+        body = body[:MAX_READ_CHARS] + (
+            f"\n\n…(内容过长,只返回前 {MAX_READ_CHARS} 个字符;"
+            f"请用 start_line/end_line 分段读)"
+        )
+    if (lo, hi) != (1, total):
+        body += f"\n\n…(本次为第 {lo}-{hi} 行,文件共 {total} 行)"
+    return body
+
+
+def get_current_directory() -> str:
+    return f"{ROOT}(你的工作区,所有文件操作都被限制在这个目录内)"
+
+
+def list_files(path: str = ".", show_hidden: bool = False) -> str:
+    target = safe_path(path)
+    if not target.is_dir():
+        return f"错误:{target} 不是一个目录"
+
+    entries = [e for e in target.iterdir() if show_hidden or not e.name.startswith(".")]
+    entries.sort(key=lambda e: (e.is_file(), e.name.lower()))  # 目录在前,再按名字排
+
+    if not entries:
+        return f"{target} 是空目录"
+
+    lines = [
+        f"{e.name}/" if e.is_dir() else f"{e.name}  ({e.stat().st_size} B)"
+        for e in entries[:MAX_ENTRIES]
+    ]
+    if len(entries) > MAX_ENTRIES:
+        lines.append(f"…(共 {len(entries)} 项,只显示前 {MAX_ENTRIES} 项)")
+    return "\n".join([f"{target}(共 {len(entries)} 项):", *lines])
+
+
+def _iter_search_paths(root: Path):
+    """递归产出 root 下的文件和子目录,剪掉隐藏目录与依赖/缓存目录。
+
+    搜索不该翻进 .git/.trash/.agent/.venv 这些地方 —— 要么是本地状态、要么是海量噪音。
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            d for d in dirnames
+            if not d.startswith(".") and d not in SEARCH_SKIP_DIRS
+        ]
+        base = Path(dirpath)
+        for d in dirnames:
+            yield base / d
+        for f in filenames:
+            yield base / f
+
+
+def find_files(name: str, path: str = ".", include_dirs: bool = False) -> str:
+    """按文件名查找工作区里的文件(递归)。
+
+    支持 * ? [ ] 通配符(不区分大小写);不含通配符时按子串匹配文件名。
+    include_dirs=true 时把目录名也纳入匹配。只搜工作区,自动跳过隐藏目录与依赖目录。
+    """
+    import fnmatch
+    root = safe_path(path)
+    if not root.exists():
+        return f"错误:{root} 不存在"
+    pat = name.lower()
+    has_glob = any(ch in name for ch in "*?[")
+    hits: list[Path] = []
+    for p in _iter_search_paths(root):
+        if p.is_dir() and not include_dirs:
+            continue
+        low = p.name.lower()
+        if fnmatch.fnmatch(low, pat) if has_glob else (pat in low):
+            hits.append(p)
+    if not hits:
+        what = "文件或目录" if include_dirs else "文件"
+        return f"没有匹配「{name}」的{what}(搜索范围:{_rel(root)})"
+    hits.sort(key=lambda p: _rel(p).lower())
+    shown = hits[:MAX_FIND_RESULTS]
+    lines = [f"{_rel(p)}{'/' if p.is_dir() else ''}" for p in shown]
+    tail = f"\n…(共 {len(hits)} 条,只显示前 {MAX_FIND_RESULTS} 条)" if len(hits) > MAX_FIND_RESULTS else ""
+    return "\n".join([f"匹配「{name}」共 {len(hits)} 条:", *lines]) + tail
+
+
+def _detect_text_encoding(sample: bytes) -> str:
+    """猜文本编码:优先 utf-8,其次中文常见的 gb18030/big5;都不行就按 utf-8 尽力解。"""
+    for enc in ("utf-8", "gb18030", "big5"):
+        try:
+            sample.decode(enc)
+            return enc
+        except UnicodeDecodeError:
+            continue
+    return "utf-8"
+
+
+def grep_files(pattern: str, path: str = ".", ignore_case: bool = False) -> str:
+    """按内容搜索工作区里的文本文件(正则),返回命中的文件、行号与行内容。
+
+    逐行流式读取 —— 整本书、长日志这种大文件也照搜。按 utf-8 / gb18030 / big5 试解码,
+    所以 GBK 编码的中文文件也能搜到。自动跳过隐藏目录与依赖目录,二进制文件(含空字节)跳过。
+    结果上限 MAX_GREP_MATCHES 条,超出会提示截断。path 可以是文件或目录。
+    """
+    try:
+        rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+    except re.error as exc:
+        return f"错误:正则表达式无效:{exc}"
+    root = safe_path(path)
+    if not root.exists():
+        return f"错误:{root} 不存在"
+    targets = [root] if root.is_file() else [p for p in _iter_search_paths(root) if p.is_file()]
+
+    results: list[tuple[Path, int, str]] = []
+    files_hit: set[Path] = set()
+    truncated = False
+    too_big = 0  # 超过大小的文件数 —— 如实报出来,绝不静默跳过
+    for fp in targets:
+        if fp.name in DENY_READ:
+            continue
+        try:
+            if fp.stat().st_size > MAX_GREP_FILE_BYTES:
+                too_big += 1
+                continue
+            with fp.open("rb") as fh:
+                head = fh.read(65536)
+        except OSError:
+            continue
+        if not head:
+            continue
+        if head[:2] in (b"\xff\xfe", b"\xfe\xff"):   # UTF-16 BOM
+            enc = "utf-16"
+        elif b"\x00" in head[:8192]:                 # 含空字节 → 视为二进制,跳过
+            continue
+        else:
+            enc = _detect_text_encoding(head)
+        try:
+            with fp.open("r", encoding=enc, errors="replace") as fh:
+                for i, line in enumerate(fh, 1):
+                    if rx.search(line):
+                        results.append((fp, i, line.strip()[:MAX_GREP_LINE_CHARS]))
+                        files_hit.add(fp)
+                        if len(results) >= MAX_GREP_MATCHES:
+                            truncated = True
+                            break
+        except OSError:
+            continue
+        if truncated:
+            break
+
+    skip_note = ""
+    if too_big:
+        skip_note = f";另有 {too_big} 个文件超过 {MAX_GREP_FILE_BYTES // (1024 * 1024)}MB 未搜"
+    if not results:
+        return f"没有匹配「{pattern}」的内容(搜索范围:{_rel(root)})" + skip_note
+    out: list[str] = []
+    last: Path | None = None
+    for fp, ln, txt in results:
+        if fp != last:
+            out.append(f"{_rel(fp)}:")
+            last = fp
+        out.append(f"  {ln}: {txt}")
+    summary = f"共 {len(results)} 处命中,{len(files_hit)} 个文件"
+    if truncated:
+        summary += f"(已达上限 {MAX_GREP_MATCHES},后续未继续)"
+    return summary + skip_note + "\n" + "\n".join(out)
+
+
+def _check_writable(target: Path, content: str) -> int:
+    """写入前的公共校验,返回内容的字节数。"""
+    size = len(content.encode("utf-8"))
+    if size > MAX_WRITE_BYTES:
+        raise ValueError(f"内容过大({size} 字节),单次写入上限为 {MAX_WRITE_BYTES} 字节")
+    if target.is_dir():
+        raise IsADirectoryError(f"{target} 是一个目录,不能当作文件写入")
+    return size
+
+
+def write_file(path: str, content: str, overwrite: bool = False) -> str:
+    target = safe_path(path)
+    size = _check_writable(target, content)
+
+    # 覆盖是不可逆的,必须由模型显式声明意图,不能靠默认行为悄悄发生
+    existed = target.is_file()
+    if existed and not overwrite:
+        return (
+            f"错误:{target.name} 已存在({target.stat().st_size} 字节)。"
+            f"确认要覆盖就带 overwrite=true 重新调用,否则换个文件名。"
+        )
+
+    target.parent.mkdir(parents=True, exist_ok=True)  # 子目录不存在就顺手建出来
+    target.write_text(content, encoding="utf-8")
+    return f"已{'覆盖' if existed else '创建'} {target}({size} 字节)"
+
+
+def append_file(path: str, content: str) -> str:
+    target = safe_path(path)
+    size = _check_writable(target, content)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # 追加要沿用原文件编码:否则会给 GBK 文件塞进 UTF-8 字节,把文件编码搞坏
+    enc = _sniff_encoding(target) if target.is_file() else "utf-8"
+    with target.open("a", encoding=enc) as fp:
+        fp.write(content)
+    return f"已向 {target} 追加 {size} 字节(当前共 {target.stat().st_size} 字节)"
+
+
+def _load_lines(path: str) -> tuple[Path, list[str], str]:
+    """按行读出文件,保留行尾换行符,供按行编辑的工具复用。返回 (路径, 行, 原编码)。"""
+    target = safe_path(path)
+    if target.name in DENY_READ:
+        raise PermissionError(f"{target.name} 属于敏感文件,禁止编辑")
+    if not target.is_file():
+        raise FileNotFoundError(f"{target} 不存在;要新建文件请用 write_file")
+    text, enc = _read_text_with_encoding(target)
+    return target, text.splitlines(keepends=True), enc
+
+
+def _save_lines(target: Path, lines: list[str], summary: str, center: int,
+                encoding: str = "utf-8") -> str:
+    """写回并返回改动摘要 + 附近几行,让模型能自己确认改对没有。
+
+    用文件**原来的编码**写回(不是一律 UTF-8),否则编辑一个 GBK 文件会把它悄悄转码。
+    """
+    text = "".join(lines)
+    _check_writable(target, text)
+    target.write_text(text, encoding=encoding)
+
+    lo, hi = max(1, center - 3), min(len(lines), center + 3)
+    preview = "\n".join(f"{i:>4} | {lines[i - 1].rstrip(chr(10))}" for i in range(lo, hi + 1))
+    tail = f"\n改动附近的内容:\n{preview}" if preview else "\n(文件现在是空的)"
+    return f"{summary},文件现共 {len(lines)} 行{tail}"
+
+
+def _terminate(line: str) -> str:
+    """补上缺失的行尾换行,否则插入的内容会和下一行粘成一行。"""
+    return line if line.endswith("\n") else line + "\n"
+
+
+def edit_lines(path: str, start_line: int, end_line: int, content: str = "") -> str:
+    target, lines, enc = _load_lines(path)
+    total = len(lines)
+    if not 1 <= start_line <= total or not start_line <= end_line <= total:
+        raise ValueError(
+            f"行号超出范围:文件共 {total} 行,收到 start_line={start_line}、end_line={end_line}。"
+            f"请先用 read_file(with_line_numbers=true) 确认行号。"
+        )
+
+    new = content.splitlines(keepends=True) if content else []
+    if new and end_line < total:  # 末行之外的替换必须以换行结尾,否则会粘住后一行
+        new[-1] = _terminate(new[-1])
+
+    replaced = end_line - start_line + 1
+    updated = lines[:start_line - 1] + new + lines[end_line:]
+    verb = "删除" if not new else "替换"
+    summary = f"已{verb}第 {start_line}-{end_line} 行({replaced} 行 → {len(new)} 行)"
+    return _save_lines(target, updated, summary, start_line, enc)
+
+
+def insert_lines(path: str, after_line: int, content: str) -> str:
+    target, lines, enc = _load_lines(path)
+    total = len(lines)
+    if not 0 <= after_line <= total:
+        raise ValueError(
+            f"after_line 必须在 0 到 {total} 之间(0 表示插入到文件最开头),收到 {after_line}。"
+        )
+
+    if after_line > 0:  # 插入点的前一行若缺换行,先补上
+        lines[after_line - 1] = _terminate(lines[after_line - 1])
+    new = content.splitlines(keepends=True)
+    if new and after_line < total:
+        new[-1] = _terminate(new[-1])
+
+    updated = lines[:after_line] + new + lines[after_line:]
+    summary = f"已在第 {after_line} 行之后插入 {len(new)} 行"
+    return _save_lines(target, updated, summary, after_line + 1, enc)
+
+
+def move_file(source: str, destination: str, overwrite: bool = False) -> str:
+    src = safe_path(source)
+    if not src.exists():
+        raise FileNotFoundError(f"{src} 不存在")
+
+    dest = safe_path(destination)
+    # 目标是已存在的目录 -> 移动进去并沿用原名,与 shell 里 mv a.txt dir/ 的习惯一致
+    if dest.is_dir() and dest != src:
+        dest = dest / src.name
+
+    # 源或目标都不能是 agent 的系统目录(.trash/.git/.agent/clones),否则能挪走
+    # 回收站、版本库、记忆,把整个 agent 搞致残 —— move_file 之前漏了这个检查。
+    if _is_system_dir(src) or _is_system_dir(dest):
+        raise PermissionError("不允许移动或重命名 agent 的系统目录(.trash/.git/.agent/clones)。")
+
+    if src == dest:
+        return f"错误:源路径和目标路径相同({src}),无需移动"
+    if src.is_dir() and dest.is_relative_to(src):
+        raise ValueError(f"不能把目录 {src.name} 移动到它自己内部:{dest}")
+
+    existed = dest.exists()
+    if existed:
+        if dest.is_dir():
+            raise IsADirectoryError(f"目标 {dest} 是已存在的目录,不能覆盖")
+        if not overwrite:
+            return (
+                f"错误:目标 {dest.name} 已存在({dest.stat().st_size} 字节)。"
+                f"确认要覆盖就带 overwrite=true 重新调用,否则换个目标名。"
+            )
+
+    kind = "目录" if src.is_dir() else "文件"  # 移动之后 src 就不在了,先取
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    src.replace(dest)  # 用 replace 不用 rename:Windows 上 rename 遇到已存在的目标会失败
+
+    if existed:
+        action = "覆盖并移动"
+    elif src.parent == dest.parent:
+        action = "重命名"
+    else:
+        action = "移动"
+    return f"已{action}{kind}:{src} -> {dest}"
