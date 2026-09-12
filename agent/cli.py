@@ -24,6 +24,7 @@ from .session import (
     current_session_id,
     load_session,
     release_owner,
+    session_note as session_note_text,
     rewrite_session,
 )
 from .tools.container import _docker_cleanup_stale, _docker_health
@@ -210,11 +211,12 @@ def main() -> None:
     # 终端指令清单单独成一条 system 消息,而不是并进主提示词 —— 它是程序自动生成的
     # "数据",里面写明信任边界,免得描述文字被当成系统指令(详见 commands.system_message)
     messages.append({"role": "system", "content": commands_system_message()})
-    # 定下本次的活跃会话:接回本工作区**最后跑过**的那一个,没有就新开一个
-    # (id 随机、全局唯一 —— 它才是会话的隔离单元)。解析一次后缓存,
-    # 虚拟机磁盘等路径都由它推导,所以必须在这之前定下来。
+    # 定下本次的活跃会话。规则(见 session._resolve_session):接回本工作区最后跑过的
+    # 那一个,但**如果它正被另一个活着的 agent 用着,就另开一个新的**,不去抢 ——
+    # 抢的话两边会共用一个对话历史和一块虚拟机磁盘,互相覆盖。
     session_id = current_session_id()
-    conflict = claim_owner(session_id)
+    claim_owner(session_id)          # 立刻登记占用,让别人知道这个会话正在被用
+    session_note = session_note_text()
     history, resume_note = load_session(session_id)
     messages.extend(history)
     if history:
@@ -243,9 +245,7 @@ def main() -> None:
                   + f"(敲 /help 看说明);上下文占用达 {AUTO_COMPACT_RATIO:.0%} 会自动压缩。",
                   style="dim")
     console.print(f"工作区:{ROOT}", style="dim")
-    console.print(f"会话:{session_id} — {resume_note}", style="dim")
-    if conflict:
-        console.print(conflict, style="yellow")
+    console.print(f"会话:{session_id} — {session_note};{resume_note}", style="dim")
     _replay_history(history)   # 把上次对话按原样重放一遍，接着聊
     console.print()
 

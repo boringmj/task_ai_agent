@@ -46,6 +46,7 @@ _FORMAT_VERSION = 1
 _ENCODING = "utf-8"
 
 _current_session: str | None = None      # 本进程的活跃会话,首次解析后缓存
+_resolve_note = ""                       # 它是怎么定下来的(见 _resolve_session)
 
 
 def _persistable(messages: list[dict]) -> list[dict]:
@@ -139,25 +140,59 @@ def set_current_session(sid: str) -> None:
     register_session(_current_session)
 
 
+def _owner_alive(sid: str) -> bool:
+    """这个会话是不是正被**另一个活着的进程**占着。"""
+    try:
+        info = json.loads(owner_file(sid).read_text(encoding=_ENCODING) or "{}")
+        pid = int(info.get("pid") or 0)
+        return bool(pid) and pid != os.getpid() and _pid_alive(pid)
+    except Exception:  # noqa: BLE001 - 读不出占用者信息就当没人占
+        return False
+
+
+def _resolve_session() -> None:
+    """定下本次的活跃会话,并记下"为什么是这个"供启动时告知用户。
+
+    关键规则:**不去抢别人正在用的会话**。接回"最后一次运行的会话"之前先看它有没有
+    被活着的进程占着 —— 占着就另开一个新的,而不是两边共用一个历史和一块虚拟机磁盘
+    (那会互相覆盖、VM 也会互踩)。这是实测踩到的:同工作区开第二个 agent 时,它会
+    直接接管第一个正在用的会话。
+    """
+    global _current_session, _resolve_note
+    entry = _index_load()["workspaces"].get(_workspace_key()) or {}
+    last = entry.get("last")
+
+    if last and session_dir(last).exists() and not _owner_alive(last):
+        _current_session = _safe_name(last)
+        register_session(_current_session)          # 顺手更新 last_used
+        _resolve_note = "接回上次的会话"
+        return
+
+    _current_session = new_session_id()
+    register_session(_current_session)
+    if last and session_dir(last).exists():
+        _resolve_note = (f"上一个会话 {last} 正被另一个 agent 占用,"
+                         f"为免互相覆盖已另开新会话(用 /sessions 可看全部)")
+    else:
+        _resolve_note = "新会话"
+
+
 def current_session_id() -> str:
-    """本进程的活跃会话 id:接回本工作区**最后跑过的那一个**;没有就新建一个。
+    """本进程的活跃会话 id。
 
     首次调用时解析并缓存 —— 会话 id 一旦定下来,整个进程都用它(虚拟机磁盘路径等
     都由它推导),中途换意味着连 VM 都要换,那是"切换会话"指令才做的事。
     """
-    global _current_session
-    if _current_session is not None:
-        return _current_session
-
-    entry = _index_load()["workspaces"].get(_workspace_key()) or {}
-    last = entry.get("last")
-    if last and session_dir(last).exists():
-        _current_session = _safe_name(last)
-        register_session(_current_session)          # 顺手更新 last_used
-    else:
-        _current_session = new_session_id()
-        register_session(_current_session)
+    if _current_session is None:
+        _resolve_session()
     return _current_session
+
+
+def session_note() -> str:
+    """本次会话是怎么定下来的(接回旧的 / 因为被占用而新开 / 全新)。"""
+    if _current_session is None:
+        _resolve_session()
+    return _resolve_note
 
 
 def list_sessions() -> list[dict]:
