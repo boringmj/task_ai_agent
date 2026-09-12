@@ -211,6 +211,9 @@ def list_sessions() -> list[dict]:
             "last_used": (meta or {}).get("last_used", "?"),
             "active": sid == _current_session,
             "missing": not exists,      # 目录被手工删了,但索引还记着
+            # 被**别的活着的 agent** 占着 —— 列表里要标出来,不然用户会以为能切过去。
+            # 当前这个会话返回 False(自己的 pid 不算冲突)。
+            "busy": exists and _owner_alive(sid),
         })
     out.sort(key=lambda s: s["last_used"], reverse=True)
     return out

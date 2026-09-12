@@ -37,9 +37,17 @@ def cmd_sessions(ctx: Context) -> str:
     active = current_session_id()
     lines = [f"当前活跃会话:{active}", "", "这个工作区里的会话(最近用的在前):"]
     for s in rows:
-        mark = "← 当前" if s["id"] == active else ""
-        note = "(目录已丢失)" if s["missing"] else ""
-        lines.append(f"  {s['id']}  最后使用 {s['last_used']} {mark}{note}")
+        # 状态要一眼看出来:哪个是当前、哪个被别的 agent 占着(切不过去)、
+        # 哪个是空的、哪个目录已经没了
+        if s["id"] == active:
+            state = "← 当前"
+        elif s["busy"]:
+            state = "⚠ 被另一个 agent 占用,切不过去"
+        elif s["missing"]:
+            state = "(目录已丢失)"
+        else:
+            state = "空闲"
+        lines.append(f"  {s['id']}  最后使用 {s['last_used']}  {state}")
     return "\n".join(lines)
 
 
@@ -60,12 +68,18 @@ def cmd_switch(ctx: Context) -> str:
     cur = current_session_id()
 
     if not target:
-        rows = list_sessions()
+        # 不带参数就当"列个清单帮我选",不用让用户先去敲 /sessions 看一眼
         lines = [f"当前会话:{cur}", "", "用 `/switch <id>` 切换,或 `/switch new` 新开一个。", ""]
-        lines.append("可选会话(标 ⚠ 的已被别的 agent 占用,切不过去):")
-        for s in rows:
-            busy = " ⚠被占用" if not s.get("active") and not _free(s["id"]) else ""
-            lines.append(f"  {s['id']}{'  ← 当前' if s['active'] else busy}")
+        for s in list_sessions():
+            if s["active"]:
+                state = "← 当前"
+            elif s["busy"]:
+                state = "⚠ 被另一个 agent 占用,切不过去"
+            elif s["missing"]:
+                state = "(目录已丢失)"
+            else:
+                state = "空闲"
+            lines.append(f"  {s['id']}  {state}")
         return "\n".join(lines)
 
     creating = target.lower() in ("new", "新")
@@ -105,12 +119,6 @@ def cmd_switch(ctx: Context) -> str:
     vm_switch_session()          # 每会话一块盘,换会话就得换 VM
     kind = "已新建并切到" if creating else "已切到"
     return f"{kind}会话 {target}({note})。虚拟机正在按该会话的磁盘重启,可稍后用 vm_status 看。"
-
-
-def _free(sid: str) -> bool:
-    """这个会话当前有没有被别的活着的 agent 占着(供 /switch 列表标注)。"""
-    from ..session import _owner_alive
-    return not _owner_alive(sid)
 
 
 @command(
