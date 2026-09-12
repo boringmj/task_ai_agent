@@ -3719,11 +3719,15 @@ def run(user_input: str, messages: list[dict]) -> str:
 
 
 def load_system_prompt() -> str:
-    """从 system_prompt.md 读取系统提示词。改提示词只需要编辑那个文件。"""
+    """从 system_prompt.md 读取系统提示词。改提示词只需要编辑那个文件。
+
+    会把 `{max_steps}` 之类的占位符替换成代码里的实际值,免得提示词和常量对不上。
+    """
     try:
-        return PROMPT_FILE.read_text(encoding="utf-8").strip()
+        text = PROMPT_FILE.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         raise SystemExit(f"找不到系统提示词文件:{PROMPT_FILE}") from None
+    return text.replace("{max_steps}", str(MAX_STEPS))
 
 
 def _cleanup_trash_on_start() -> None:
