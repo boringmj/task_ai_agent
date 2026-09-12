@@ -144,11 +144,17 @@ def _cleanup_trash_on_start() -> None:
         console.print(f"回收站清理失败(不影响使用):{exc}", style="dim")
 
 
+_EXIT_WORDS = {"exit", "quit"}      # 裸敲也等价于 /exit,两处用法见下
+
+
 def _read_multiline(prompt: str = "你 > ") -> str:
-    """读取一段多行输入,空行提交 —— 支持粘贴多行并保留换行。
+    """读取一段输入,空行提交 —— 支持粘贴多行并保留换行。
 
     console.input() 只读单行,没法粘贴多行代码/文本。改为逐行读取,
     用户输入完(或粘贴完)按一个空行结束。空行只作提交信号,不会进消息。
+
+    例外:**第一行本身就是终端指令**(以 / 开头)或裸的 exit/quit 时,回车即执行,
+    不必再敲空行 —— 指令天生是单行的,逼人多按一次回车只会烦人。
     """
     lines: list[str] = []
     try:
@@ -160,6 +166,9 @@ def _read_multiline(prompt: str = "你 > ") -> str:
             if line in {"\n", "\r\n"}:  # 空行 = 提交
                 break
             lines.append(line.rstrip("\r\n"))
+            if len(lines) == 1 and (lines[0].lstrip().startswith("/")
+                                    or lines[0].strip().lower() in _EXIT_WORDS):
+                break               # 指令:回车即走,连续行提示符都不打
             console.print("… ", style="dim", end="")
     except KeyboardInterrupt:
         # 空闲时 Ctrl+C = 退出信号(返回 None)。
@@ -253,6 +262,10 @@ def main() -> None:
             text = user_input.rstrip()  # 去掉粘贴时多带的结尾空行,保留行内缩进
             if not text.strip():
                 continue
+            # 裸敲的 exit / quit 当成 /exit:老习惯要接住,但退出只留一个入口 ——
+            # 否则"纯字符退出"和"指令退出"两套逻辑各走各的,早晚对不上。
+            if text.strip().lower() in _EXIT_WORDS:
+                text = "/exit"
             # 终端指令(/compact、/reset、/tokens…)。注册在 agent/commands/ 里,
             # 系统提示词中那段说明也由同一份注册表生成,不用两头各维护一遍。
             cmd_ctx = CommandContext(messages)
