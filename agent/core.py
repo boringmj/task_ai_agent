@@ -44,8 +44,9 @@ _pending_images: list[str] = []  # 本轮待注入的图片 data URL,img 工具�
 PROJECT_DIR = Path(
     os.environ.get("AGENT_PROJECT_DIR") or Path(__file__).resolve().parent.parent
 ).resolve()
-# 系统提示词跟着代码走,不放进沙箱 —— 模型不能读自己的提示词,更不能改
-PROMPT_FILE = PROJECT_DIR / "system_prompt.md"
+# 提示词目录:一个用途一个文件,由 agent/prompts.py 按名字读取。
+# 跟着代码走、不放进沙箱 —— 模型不能读自己的提示词,更不能改
+PROMPTS_DIR = PROJECT_DIR / "prompts"
 
 
 def _resolve_workspace() -> Path:

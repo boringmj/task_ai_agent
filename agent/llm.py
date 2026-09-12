@@ -143,10 +143,3 @@ def _stream_model(messages: list[dict]) -> tuple[str, list[dict], str]:
     tool_calls = [tool_slots[i] for i in sorted(tool_slots)]
     return "".join(content_parts), tool_calls, "".join(reason_parts)
 
-
-_COMPACT_INSTRUCTION = (
-    "请把以上我们这次对话压缩成一份紧凑的要点摘要,供之后继续对话使用。"
-    "务必保留:我的偏好与明确要求、已做出的决定与结论、涉及的文件路径与对文件的改动、"
-    "尚未完成的任务/待办、重要的具体数据;可以省略寒暄、重复的试探和被推翻的中间步骤。"
-    "用简体中文直接输出摘要本身,不要加任何评论或前后缀,也不要调用任何工具。"
-)

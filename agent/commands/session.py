@@ -4,6 +4,9 @@ from __future__ import annotations
 from . import Context, command
 
 
+from .. import prompts
+
+
 @command(
     "/reset",
     "丢弃当前会话的对话历史,重新开始。工作区文件和长期记忆都不受影响。"
@@ -107,13 +110,8 @@ def cmd_switch(ctx: Context) -> str:
     ctx.messages.extend(hist)
     ctx.messages.append({
         "role": "system",
-        "content": (
-            f"【程序提示】刚刚切换到了会话 {target}{'(新建的)' if creating else ''}。"
-            f"上面的对话属于这个会话,和刚才那段无关,别混在一起。\n"
-            f"- 工作区文件与长期记忆是全局的,继续有效。\n"
-            f"- **虚拟机已按本会话自己的磁盘重启**(会话之间 VM 是分开的),"
-            f"里面有什么、要装什么,先用 vm_status 看状态再动手。"
-        ),
+        "content": prompts.load("switch_notice", session=target,
+                                note="(新建的)" if creating else ""),
     })
 
     vm_switch_session()          # 每会话一块盘,换会话就得换 VM

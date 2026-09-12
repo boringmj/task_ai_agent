@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+from . import prompts
 from .core import (
     AUTO_COMPACT_RATIO,
     MAX_STEPS,
     MODEL,
-    PROMPT_FILE,
     client,
     console,
     _pending_images,
 )
-from .llm import _stream_model, _context_ratio, _COMPACT_INSTRUCTION
+from .llm import _stream_model, _context_ratio
 from .tools.media import _inject_pending_images
 from .tools.net import reset_turn_searches
 from .tools.registry import TOOLS, dispatch
@@ -34,7 +34,7 @@ def compact(messages: list[dict], keep_recent: int = 0) -> str:
     if len(head) < 2:
         return "对话还很短,不需要压缩。"
 
-    req = head + [{"role": "user", "content": _COMPACT_INSTRUCTION}]
+    req = head + [{"role": "user", "content": prompts.load("compact_instruction")}]
     try:
         resp = client.chat.completions.create(model=MODEL, messages=req, tools=TOOLS)
         summary = (resp.choices[0].message.content or "").strip()
@@ -48,7 +48,7 @@ def compact(messages: list[dict], keep_recent: int = 0) -> str:
 
     messages[head_start:] = [{
         "role": "user",
-        "content": f"(以上对话已压缩以节省上下文。以下是此前对话的摘要,请据此继续:\n{summary})",
+        "content": prompts.load("compact_summary", summary=summary),
     }] + tail
     return f"已压缩上下文:{len(head)} 条消息 → 1 条摘要({len(summary)} 字)"
 
@@ -116,16 +116,12 @@ def run(user_input: str, messages: list[dict]) -> str:
 
 
 def load_system_prompt() -> str:
-    """从 system_prompt.md 读取系统提示词。改提示词只需要编辑那个文件。
+    """读主系统提示词(prompts/system.md),并把代码里的常量注入进去。
 
-    会把 `{max_steps}` 之类的占位符替换成代码里的实际值,免得提示词和常量对不上。
+    文案都在 prompts/ 下按用途分文件放着,改措辞不用动代码(见 agent/prompts.py)。
 
-    注意:**终端指令清单不在这里**。它由 commands.system_message() 单独生成成
-    另一条 system 消息(见 cli.main)—— 那份清单是程序自动生成的"数据",
-    不该混进系统提示词正文,免得其中的描述被当成系统指令照做。
+    注意:**终端指令清单不在这里**。它由 commands.system_message() 读
+    prompts/commands_list.md 生成成另一条 system 消息(见 cli.main)—— 那份清单是
+    程序自动生成的"数据",不该混进系统提示词正文,免得其中的描述被当成系统指令照做。
     """
-    try:
-        text = PROMPT_FILE.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        raise SystemExit(f"找不到系统提示词文件:{PROMPT_FILE}") from None
-    return text.replace("{max_steps}", str(MAX_STEPS))
+    return prompts.load("system", max_steps=MAX_STEPS)

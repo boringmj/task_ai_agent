@@ -6,6 +6,7 @@ from datetime import datetime
 
 from rich.markdown import Markdown
 
+from . import prompts
 from .core import (
     AUTO_COMPACT_RATIO,
     ROOT,
@@ -120,18 +121,10 @@ def _restore_notice(restored_count: int) -> dict:
     """
     return {
         "role": "system",
-        "content": (
-            f"【程序提示】本次对话是从上次会话恢复的(接回了 {restored_count} 条历史),"
-            f"不是新会话,发生时间 {datetime.now().strftime('%Y-%m-%d %H:%M')}。\n"
-            "几点需要你知道:\n"
-            "- 上面的内容是**上次运行时**留下的,不要重复做已经做过的事。\n"
-            "- **继续用简体中文思考和回答**。下面是历史,里面难免夹着大段英文(命令输出、\n"
-            "  文件内容、代码),那是资料;就算上一轮的思考是英文,也切回中文,别顺着惯性走。\n"
-            "- 工作区文件、长期记忆都还在。\n"
-            "- **虚拟机也被一起恢复了**:它用的是本会话自己的磁盘,上次装过的软件、"
-            "写过的文件都还在。\n"
-            "- 但虚拟机是**这次重新启动**的,所以上次在里面**跑着的服务/进程已经没了**,"
-            "要接着用就得重新拉起来。用之前先 vm_status 确认它起来了。"
+        "content": prompts.load(
+            "resume_notice",
+            count=restored_count,
+            now=datetime.now().strftime("%Y-%m-%d %H:%M"),
         ),
     }
 
@@ -205,10 +198,7 @@ def main() -> None:
     memory = _read_memory().strip()  # 跨会话记住的关键事实最先注入,始终在场
     if memory:
         messages.append(
-            {
-                "role": "system",
-                "content": f"以下是跨会话保留的长期记忆,和你的对话无关,仅供参考:\n{memory}",
-            }
+            {"role": "system", "content": prompts.load("memory_injection", memory=memory)}
         )
     # 终端指令清单单独成一条 system 消息,而不是并进主提示词 —— 它是程序自动生成的
     # "数据",里面写明信任边界,免得描述文字被当成系统指令(详见 commands.system_message)
