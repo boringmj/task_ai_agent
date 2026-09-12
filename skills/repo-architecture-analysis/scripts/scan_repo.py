@@ -89,6 +89,10 @@ JS_DYN = re.compile(r"""import\s*\(\s*['"]([^'"]+)['"]""")
 GO_BLOCK = re.compile(r"import\s*\(([^)]*)\)", re.S)
 GO_SINGLE = re.compile(r'^\s*import\s+(?:\w+\s+)?"([^"]+)"', re.M)
 JAVA_IMPORT = re.compile(r"^\s*import\s+(?:static\s+)?([\w.]+)", re.M)
+PHP_NAMESPACE = re.compile(r"^[ \t]*namespace[ \t]+([^;\s]+)[ \t]*;", re.M)
+PHP_USE = re.compile(r"^[ \t]*use[ \t]+([^;]+);", re.M)
+PHP_CLASS = re.compile(r"^[ \t]*(?:(?:final|abstract|readonly)[ \t]+)*(?:class|interface|trait|enum)[ \t]+(\w+)", re.M)
+PHP_NS = chr(92)  # PHP 命名空间分隔符
 
 JS_RESOLVE_SUFFIX = ["", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs",
                      ".vue", ".svelte",
@@ -145,6 +149,40 @@ def go_imports(text):
     names += GO_SINGLE.findall(text)
     return names
 
+
+def php_imports(text):
+    """抽取 PHP 的 use 目标(类/接口/trait/枚举的全限定名)。"""
+    out = []
+    for raw in PHP_USE.findall(text):
+        raw = raw.strip()
+        if raw.startswith("function ") or raw.startswith("const ") or "{" in raw:
+            continue
+        raw = re.split(r"[ \t]+as[ \t]+", raw)[0].strip()
+        if raw:
+            out.append(raw)
+    return out
+
+
+def build_php_classes(root):
+    """PHP:{类全限定名 -> 相对路径} 与 {文件 -> 命名空间}。"""
+    class2file = {}
+    ns_by_file = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+        for fn in filenames:
+            if not fn.endswith(".php"):
+                continue
+            rel = os.path.relpath(os.path.join(dirpath, fn), root).replace(os.sep, "/")
+            text = read_text(os.path.join(dirpath, fn))
+            if text is None:
+                continue
+            m = PHP_NAMESPACE.search(text)
+            ns = m.group(1) if m else ""
+            ns_by_file[rel] = ns
+            for cls in PHP_CLASS.findall(text):
+                fqn = (ns + PHP_NS + cls) if ns else cls
+                class2file.setdefault(fqn, rel)
+    return class2file, ns_by_file
 
 def build_py_modules(root):
     mods = {}
@@ -302,8 +340,11 @@ def scan(root, depth, top_n):
                     file_imports[rel] = ("go", go_imports(text))
                 elif ext in (".java", ".kt", ".scala"):
                     file_imports[rel] = ("java", JAVA_IMPORT.findall(text))
+                elif ext == ".php":
+                    file_imports[rel] = ("php", php_imports(text))
 
     py_mods = build_py_modules(root)
+    php_class2file, php_ns_by_file = build_php_classes(root)
     go_mod_name = None
     go_mod_path = os.path.join(root, "go.mod")
     if os.path.isfile(go_mod_path):
@@ -316,9 +357,24 @@ def scan(root, depth, top_n):
     imported_targets = Counter()
     external_counter = Counter()
     unresolved = 0
+    php_top_namespaces = {ns.split(PHP_NS)[0] for ns in php_ns_by_file.values() if ns}
+
+    # PHP 的依赖图节点取**两级命名空间**(App\Service),不是一级。
+    # 一级会退化成空图:按 PSR-4 惯例 App\ 映射到 src/,整个项目就一个顶层命名空间,
+    # 源和目标永远是同一个节点、一条边都产生不了(实测过)。取两级正好对上
+    # App\Service / App\Model 这种"一层业务分区",图才有意义。
+    PHP_NODE_DEPTH = 2
+
+    def node_of(rel, kind):
+        if kind == "php":
+            ns = php_ns_by_file.get(rel, "")
+            if not ns:
+                return "(global)"
+            return PHP_NS.join(ns.split(PHP_NS)[:PHP_NODE_DEPTH])
+        return top_node(rel)
 
     for rel, (kind, names) in file_imports.items():
-        src_node = top_node(rel)
+        src_node = node_of(rel, kind)
         cur_dir = os.path.dirname(rel).replace(os.sep, "/")
         cur_pkg_parts = [p for p in cur_dir.split("/") if p] if cur_dir else []
         for name in names:
@@ -364,12 +420,28 @@ def scan(root, depth, top_n):
                                 break
                 else:
                     external_counter[external_top(name)] += 1
+            elif kind == "php":
+                parts = name.split(PHP_NS)
+                hit = None
+                for i in range(len(parts), 0, -1):
+                    cand = PHP_NS.join(parts[:i])
+                    if cand in php_class2file:
+                        hit = cand
+                        break
+                if hit:
+                    target_rel = php_class2file[hit]
+                    imported_targets[hit] += 1
+                elif parts[0] in php_top_namespaces:
+                    # 仓库内命名空间下的类,但没定位到文件(如未定义或拼写不同)
+                    unresolved += 1
+                else:
+                    external_counter[parts[0]] += 1
             else:
                 # java 等:包名难以映射到文件,只统计外部依赖
                 external_counter[external_top(name)] += 1
 
             if target_rel:
-                dst_node = top_node(target_rel)
+                dst_node = node_of(target_rel, kind)
                 if dst_node != src_node:
                     internal_edges[(src_node, dst_node)] += 1
 
@@ -410,9 +482,11 @@ def scan(root, depth, top_n):
                 {"name": n, "count": c} for n, c in external_counter.most_common(top_n)
             ],
             "unresolved_internal_refs": unresolved,
-            "note": ("近似结果:静态抽取 import,动态导入/反射抓不到;"
-                     "未解析的相对引用只计数(unresolved_internal_refs),"
-                     "java 的 import 未做仓库内映射"),
+            "note": ("近似结果:静态抽取 import,动态导入/反射/字符串拼出的名字抓不到;"
+                     "未解析的仓库内引用只计数(unresolved_internal_refs);"
+                     "java 未做仓库内映射;php 只解析 use 语句,"
+                     "同命名空间内不经 use 的直接引用抓不到,"
+                     "且 php 的节点按两级命名空间聚合(App\\Service)"),
         },
     }
     return result
