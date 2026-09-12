@@ -23,6 +23,10 @@ MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "128000"))
 AUTO_COMPACT_RATIO = float(os.environ.get("AUTO_COMPACT_RATIO", "0.9"))
 # 单轮会话中模型与工具之间往返的最大轮数
 MAX_STEPS = int(os.environ.get("MAX_STEPS", "50"))
+# 启动恢复会话时,把最近几条对话回显出来(0 = 不回显,只看"N 条消息");
+# 每条最多显示多少字符 —— 都只是回显,不影响喂给模型的完整历史
+SESSION_RESUME_MESSAGES = int(os.environ.get("SESSION_RESUME_MESSAGES", "10"))
+SESSION_RESUME_CHARS = int(os.environ.get("SESSION_RESUME_CHARS", "400"))
 # 护栏:单次写入的字节上限,防止模型一口气写爆磁盘
 MAX_WRITE_BYTES = int(os.environ.get("MAX_WRITE_BYTES", str(3 * 1024 * 1024)))
 

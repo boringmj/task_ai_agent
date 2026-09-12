@@ -8,6 +8,8 @@ from rich.markdown import Markdown
 from .core import (
     AUTO_COMPACT_RATIO,
     ROOT,
+    SESSION_RESUME_CHARS,
+    SESSION_RESUME_MESSAGES,
     TRASH_MAX_AGE_DAYS,
     console,
 )
@@ -24,6 +26,47 @@ from .tools.container import _docker_cleanup_stale, _docker_health
 from .tools.memory import _read_memory
 from .tools.trash import purge_trash
 from .tools.vm import _vm_kickoff, _vm_state_get, vm_status
+
+
+def _clip(text: str, limit: int) -> str:
+    """把一段文本压成单行预览:折叠所有空白,超长截断。"""
+    one = " ".join(text.split())
+    return one if len(one) <= limit else one[:limit] + "…"
+
+
+def _show_history(history: list[dict]) -> None:
+    """把恢复回来的最近几条对话回显出来。
+
+    只回显 user / assistant 两类 —— tool 消息是中间产物,又长又碎,回显只会淹没重点;
+    条数按"可读的对话消息"算,不是按原始消息数,否则 10 条可能全是工具调用。
+    全部 markup=False:消息里出现 [ ] 时别被 rich 当成样式标记解析。
+    """
+    if SESSION_RESUME_MESSAGES <= 0 or not history:
+        return
+    readable = [m for m in history if m.get("role") in ("user", "assistant")]
+    shown = readable[-SESSION_RESUME_MESSAGES:]
+    if not shown:
+        return
+    console.print(
+        f"── 上次会话(共恢复 {len(readable)} 条对话,回显最近 {len(shown)} 条)──",
+        style="dim", markup=False,
+    )
+    for m in shown:
+        content = m.get("content") or ""
+        if isinstance(content, list):        # 带图片的消息
+            content = "[图片]"
+        text = content.strip()
+        if m.get("role") == "user":
+            console.print(f"你 > {_clip(text, SESSION_RESUME_CHARS)}", style="cyan", markup=False)
+        else:
+            if text:
+                console.print(f"AI > {_clip(text, SESSION_RESUME_CHARS)}", style="green", markup=False)
+            calls = m.get("tool_calls") or []
+            if calls:
+                names = "、".join(c.get("function", {}).get("name", "?") for c in calls)
+                # 标记用 ASCII:齿轮等符号 GBK 编不出来,重定向输出时会崩
+                console.print(f"     - 调用了 {names}", style="dim", markup=False)
+    console.print("─" * 46, style="dim")
 
 
 def _cleanup_trash_on_start() -> None:
@@ -69,7 +112,28 @@ def _read_multiline(prompt: str = "你 > ") -> str:
     return "\n".join(lines)
 
 
+def _make_stdio_forgiving() -> None:
+    """把标准输入输出的编码错误策略改成"替换",消掉一整类编码崩溃。
+
+    **stdout/stderr**:真实控制台上 rich 走 WriteConsoleW,什么字符都能显示;
+    但输出被重定向到文件或管道时,它退回用系统区域编码(中文 Windows 是 GBK),
+    而 `•`(U+2022)、`✻`(U+273B) 这类字符 GBK 表示不了 —— 会抛
+    UnicodeEncodeError 把整个进程带走。宁可显示成 "?",也不该让会话崩掉。
+
+    **stdin** 更要紧:Python 给它的默认策略是 surrogateescape —— 解不出的字节
+    会变成**孤立代理字符**(如 \\udca8)留在消息里,之后每次请求发给 API 时
+    utf-8 都编不出来,整个会话会持续报 "surrogates not allowed"。换成 replace
+    后最多丢一个字符,不会把会话搞废。
+    """
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:  # noqa: BLE001 - 老解释器或被替换过的流,失败就算了
+            pass
+
+
 def main() -> None:
+    _make_stdio_forgiving()
     messages: list[dict] = [{"role": "system", "content": load_system_prompt()}]
     memory = _read_memory().strip()  # 跨会话记住的关键事实最先注入,始终在场
     if memory:
@@ -109,6 +173,7 @@ def main() -> None:
     console.print(f"会话:{resume_note}", style="dim")
     if conflict:
         console.print(conflict, style="yellow")
+    _show_history(history)   # 回显上次聊到哪了,免得看着一句"已恢复 N 条"发懵
     console.print()
 
     while True:
