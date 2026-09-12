@@ -30,7 +30,7 @@ from ..core import (
 #
 # 注意:磁盘路径要**按需算**而不是在导入时定死 —— 会话 id 是运行时从索引里解析
 # 出来的(见 session.current_session_id),导入时还不知道是哪个会话。
-VM_QEMU_DIR = Path(os.environ.get("VM_QEMU_DIR", str(PROJECT_DIR / "temp")))
+VM_QEMU_DIR = Path(os.environ.get("VM_QEMU_DIR", str(PROJECT_DIR / "vm" / "qemu")))
 VM_QEMU_SYSTEM = Path(os.environ.get("VM_QEMU_SYSTEM", str(VM_QEMU_DIR / "qemu-system-x86_64.exe")))
 VM_QEMU_IMG = Path(os.environ.get("VM_QEMU_IMG", str(VM_QEMU_DIR / "qemu-img.exe")))
 VM_DIR = Path(os.environ.get("VM_DIR", str(PROJECT_DIR / "vm")))
