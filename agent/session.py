@@ -1,16 +1,19 @@
-"""会话持久化:把对话历史存进工作区,下次启动接着聊。
+"""会话持久化:一个会话一个目录,里面装这次会话的**全部**东西。
 
-存储:`.agent/sessions/<会话名>.jsonl`,一行一条消息(第一行是元信息)。
-用 append-only 而不是每次重写整个文件 —— 追加便宜,崩溃最多丢掉半行。
+目录结构(在项目根下,不在工作区里 —— 会话文件与虚拟机磁盘都不该让 agent
+自己读改删):
 
-**为将来留的口子**(现在不实现,但结构上已经就位):
+    sessions/
+      <会话名>/
+        messages.jsonl     对话历史,一行一条消息(第一行是元信息)
+        owner.json         占用者(现在只用于提醒冲突,将来可升级成锁)
+        work-<会话名>.qcow2  该会话专属的虚拟机磁盘(装过的软件、写过的文件都留在这)
+        qemu-<会话名>.log   QEMU 的输出,排查启动失败用
 
-- 文件名带**会话名**,现在是固定的 "default";将来加 `AGENT_SESSION=<名>` 只是换个
-  文件名,格式与目录都不用动,也没有迁移问题。
-- 名字里同时带上**工作区指纹**是没必要的 —— 会话本来就存在各自的工作区里,
-  换目录天然隔离。
-- 每个会话旁边放一个 `<名>.owner` 记录占用者。现在只用来**提醒冲突**;
-  将来要真正互斥,在这一层加锁即可,不影响调用方。
+为什么用 `.jsonl` 而不是 `.json`:会话是**每轮追加**的,而崩溃/强杀是常态。
+`.json` 整个文件是一个文档,追加要读全文再整体重写,且**写一半被打断就全废**
+(JSON 不完整 = 一个字符都解析不出来);`.jsonl` 一行一个对象,追加就是写一行,
+崩了最多丢最后一行,前面照读。
 
 设计上刻意**不设体积上限、不截断旧消息**:`messages` 已经被模型上下文上限和
 90% 自动压缩约束住,文件天然有界;人为截断反而会丢历史、并把前缀缓存整段打掉。
@@ -23,9 +26,13 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from .core import ROOT
+from .core import PROJECT_DIR
 
-SESSIONS_DIR = ROOT / ".agent" / "sessions"
+# 会话根目录。默认在项目根(不在工作区里):会话记录与虚拟机磁盘既不该被 agent
+# 读写,也不该混进工作区文件列表。多实例要用不同位置时用 AGENT_SESSIONS_DIR 覆盖。
+SESSIONS_DIR = Path(
+    os.environ.get("AGENT_SESSIONS_DIR") or (PROJECT_DIR / "sessions")
+).resolve()
 DEFAULT_SESSION = "default"
 _FORMAT_VERSION = 1
 
@@ -47,14 +54,26 @@ def _persistable(messages: list[dict]) -> list[dict]:
     return messages[start:]
 
 
+def _safe_name(name: str) -> str:
+    """会话名只允许简单字符,免得拼出目录之外的路径。"""
+    return "".join(c for c in name if c.isalnum() or c in "-_") or DEFAULT_SESSION
+
+
+def session_dir(name: str = DEFAULT_SESSION) -> Path:
+    """某个会话的目录 —— 它的历史、占用者、虚拟机磁盘都在这下面。
+
+    虚拟机工具的磁盘路径也取自这里,所以"一个会话 = 一个目录 + 一台自己的 VM"。
+    """
+    return SESSIONS_DIR / _safe_name(name)
+
+
 def session_file(name: str = DEFAULT_SESSION) -> Path:
-    """某个会话的存储文件。名字只允许简单字符,避免拼出工作区外的路径。"""
-    safe = "".join(c for c in name if c.isalnum() or c in "-_") or DEFAULT_SESSION
-    return SESSIONS_DIR / f"{safe}.jsonl"
+    """对话历史文件。放在会话目录里,目录名已表明是哪个会话,所以文件名不用重复。"""
+    return session_dir(name) / "messages.jsonl"
 
 
 def owner_file(name: str = DEFAULT_SESSION) -> Path:
-    return session_file(name).with_suffix(".owner")
+    return session_dir(name) / "owner.json"
 
 
 def _valid_prefix(messages: list[dict]) -> list[dict]:
@@ -136,7 +155,7 @@ def append_messages(new_messages: list[dict], name: str = DEFAULT_SESSION) -> No
     if not new_messages:
         return
     try:
-        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        session_dir(name).mkdir(parents=True, exist_ok=True)
         path = session_file(name)
         fresh = not path.exists()
         with path.open("a", encoding=_ENCODING) as fh:
@@ -156,7 +175,7 @@ def append_messages(new_messages: list[dict], name: str = DEFAULT_SESSION) -> No
 def rewrite_session(all_messages: list[dict], name: str = DEFAULT_SESSION) -> None:
     """整体重写会话(压缩把历史换掉之后用)。先写临时文件再原子替换,避免写一半崩掉。"""
     try:
-        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        session_dir(name).mkdir(parents=True, exist_ok=True)
         path = session_file(name)
         tmp = path.with_suffix(".jsonl.tmp")
         with tmp.open("w", encoding=_ENCODING) as fh:
@@ -204,15 +223,16 @@ def claim_owner(name: str = DEFAULT_SESSION) -> str:
             if other and other != os.getpid() and _pid_alive(other):
                 since = info.get("started", "?")
                 warning = (
-                    f"⚠ 这个工作区的会话正被另一个 agent 实例占用(pid {other},启动于 {since})。"
-                    f"两边会往同一个会话文件里写,历史可能互相覆盖或错乱;"
-                    f"建议给另一个实例设不同的 AGENT_WORKSPACE。"
+                    f"⚠ 这个会话正被另一个 agent 实例占用(pid {other},启动于 {since})。"
+                    f"两边会往同一个会话文件里写、还会共用同一块虚拟机磁盘,"
+                    f"历史可能互相覆盖、虚拟机也可能互相踩;"
+                    f"建议给另一个实例设不同的 AGENT_SESSIONS_DIR。"
                 )
     except Exception:  # noqa: BLE001 - 占用者文件坏了不该挡启动
         pass
 
     try:
-        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        session_dir(name).mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({
             "pid": os.getpid(),
             "instance": uuid.uuid4().hex[:8],

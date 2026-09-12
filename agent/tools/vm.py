@@ -14,6 +14,7 @@ import time
 import uuid
 from pathlib import Path
 
+from ..session import DEFAULT_SESSION, session_dir
 from ..core import (
     PROJECT_DIR,
     safe_path,
@@ -22,17 +23,25 @@ from ..core import (
 
 # ---- vm 工具专属配置(环境变量名不变,仍可在 .env 覆盖)----
 # ---- 虚拟机(QEMU)沙箱 ----
-# QEMU 二进制目录、基础盘等均可在 .env 里配置;默认指向项目内 temp/(QEMU 完整安装)。
-# 多开隔离:每个 agent 进程一个唯一实例 —— 独立 overlay 盘 + 独立 vmserver 口,
-# 基础盘只读共享。这样同时跑多个 agent,各自的虚拟机互不干扰。
+# QEMU 二进制与基础盘在 temp/、vm/(可在 .env 配置),基础盘只读共享、从不被写。
+# 每个**会话**用自己的一块 overlay 盘(在会话目录里,见 VM_DISK)—— 会话之间
+# 互不干扰,同一会话恢复时虚拟机状态也跟着回来。端口之类属于本进程的资源
+# 仍按 VM_INSTANCE 区分,避免多开时抢占。
 VM_QEMU_DIR = Path(os.environ.get("VM_QEMU_DIR", str(PROJECT_DIR / "temp")))
 VM_QEMU_SYSTEM = Path(os.environ.get("VM_QEMU_SYSTEM", str(VM_QEMU_DIR / "qemu-system-x86_64.exe")))
 VM_QEMU_IMG = Path(os.environ.get("VM_QEMU_IMG", str(VM_QEMU_DIR / "qemu-img.exe")))
 VM_DIR = Path(os.environ.get("VM_DIR", str(PROJECT_DIR / "vm")))
-VM_BASE = Path(os.environ.get("VM_BASE", str(VM_DIR / "alpine-vmserver.qcow2")))  # 预装 vmserver 的新 base
+VM_BASE = Path(os.environ.get("VM_BASE", str(VM_DIR / "alpine-vmserver.qcow2")))  # 预装 vmserver 的新 base,只读共享
 VM_ACCEL = os.environ.get("VM_ACCEL", "whpx")      # whpx 快;没开就设 tcg(慢但通用)
-VM_INSTANCE = uuid.uuid4().hex[:8]                 # 每进程唯一,决定盘和口的唯一性
-VM_DISK = VM_DIR / f"work-{VM_INSTANCE}.qcow2"     # 本实例专属 overlay;重置=删它
+VM_INSTANCE = uuid.uuid4().hex[:8]                 # 每进程唯一,决定端口等本进程资源的唯一性
+
+# 每个**会话**一台自己的虚拟机:磁盘放在该会话的目录里(见 agent/session.py),
+# 而不是按进程生成、退出即删。这样会话恢复时,虚拟机里的东西(装过的软件、
+# 写过的文件)也一并回来 —— "一个会话 = 一段对话 + 一块自己的盘"。
+# 代价:盘只增不减,想从干净状态开始得自己删掉那个 .qcow2(见 vm_reset)。
+VM_SESSION_DIR = session_dir(DEFAULT_SESSION)
+VM_DISK = VM_SESSION_DIR / f"work-{DEFAULT_SESSION}.qcow2"
+VM_LOG = VM_SESSION_DIR / f"qemu-{DEFAULT_SESSION}.log"
 VM_VMSERVER_PORT = 40000                            # vmserver 在 guest 内监听的端口(固定)
 
 _vm_port: int | None = None                        # 启动时动态分配,避免多开抢 2222
@@ -76,7 +85,7 @@ def _vm_free_port(base: int) -> int:
 
 
 def _vm_ensure() -> None:
-    VM_DIR.mkdir(parents=True, exist_ok=True)
+    VM_SESSION_DIR.mkdir(parents=True, exist_ok=True)   # 磁盘在会话目录里,不在镜像目录
     if not VM_DISK.exists():
         if not (VM_QEMU_IMG.exists() and VM_BASE.exists()):
             raise FileNotFoundError(f"缺少 QEMU 工具({VM_QEMU_IMG})或基础盘({VM_BASE})")
@@ -186,7 +195,7 @@ def _vm_spawn_and_login(serial_port: int, vmserver_host_port: int) -> None:
     # stderr 落到日志文件(不接管道:没人读的管道写满会把 QEMU 堵死)。
     # 启动失败时它的内容就是真正的原因(如 "virtfs support is disabled"),
     # 只报一句"请检查 VM_ACCEL"会让人反复猜。
-    log = VM_DIR / f"qemu-{VM_INSTANCE}.log"
+    log = VM_LOG
     with log.open("wb") as log_fp:
         _vm_proc = sp.Popen(cmd, creationflags=sp.CREATE_NO_WINDOW,
                             stdout=sp.DEVNULL, stderr=log_fp)
@@ -683,11 +692,52 @@ def vm_tunnel_stop(host_port: int | None = None) -> str:
     return "已停止指定转发。" if host_port is not None else "已停止所有转发。"
 
 
-def _vm_cleanup() -> None:
-    """agent 退出时:杀掉本实例的 QEMU,删掉本实例 overlay 和密钥,不留残 VM/盘。
+def vm_reset() -> str:
+    """把本会话的虚拟机恢复成出厂状态:停掉它、删掉会话磁盘,再用基础镜像重建。
 
-    只动本进程的 VM_DISK(_vm_proc),不 taskkill /IM 以免误杀其它 agent/用户自己的 VM。
+    磁盘现在跟着会话持久化(装过的软件、写过的文件都在里面),所以需要一个
+    "推倒重来"的口子,否则那块盘只会越长越大。**不可恢复**:VM 里所有东西都会没。
+    工作区文件与长期记忆不受影响。
     """
+    global _vm_thread
+    try:
+        if _vm_proc is not None and _vm_proc.poll() is None:
+            _vm_proc.kill()                    # 先停掉,QEMU 占着盘就删不掉
+            try:
+                _vm_proc.wait(timeout=5)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    time.sleep(0.3)                            # 等 QEMU 释放文件句柄
+
+    try:
+        VM_DISK.unlink(missing_ok=True)
+    except OSError as exc:
+        return (f"虚拟机磁盘删不掉({exc})—— 多半还有别的进程占着它。"
+                f"确认没有其它 agent 实例在跑同一个会话后重试。")
+
+    _vm_state_set("idle", "已重置,等待重新启动")
+    _vm_thread = None                          # 让 _vm_kickoff 能重新起线程
+    _vm_kickoff()
+    return "已重置虚拟机:磁盘已删除,正在用基础镜像重新启动(稍后用 vm_status 看进度)。"
+
+
+def _vm_cleanup() -> None:
+    """agent 退出时:杀掉本实例的 QEMU、关闭转发、清掉日志,**但保留磁盘**。
+
+    磁盘现在属于会话(见 VM_DISK 的注释),会话恢复时要靠它把虚拟机里的东西带回来,
+    所以这里**不能删** —— 想从干净状态重来要显式重置(见 vm_reset)。
+    只动本进程的 _vm_proc,不 taskkill /IM,以免误杀其它 agent 或用户自己的 VM。
+    """
+    # 退出前先让 guest 把页缓存刷到虚拟磁盘。磁盘是会话资产、下次要接着用,而 QEMU
+    # 是被 kill 的 —— guest 自己内存里还没落盘的写入会随它一起消失(实测:不 sync 时
+    # 刚写的文件重启就没了,sync 之后能留下)。best-effort,连不上就算了。
+    try:
+        if _vm_state_get().get("status") == "ready":
+            _vm_exec_raw("sync", timeout=15)
+    except Exception:
+        pass
     try:
         if _vm_proc is not None and _vm_proc.poll() is None:
             _vm_proc.kill()          # 仅本进程起的 QEMU
@@ -697,23 +747,12 @@ def _vm_cleanup() -> None:
                 pass
     except Exception:
         pass
-    time.sleep(0.3)  # 等 QEMU 释放对 overlay 的句柄
-    try:
-        for _ in range(4):  # 句柄释放有延迟,重试删
-            try:
-                if VM_DISK.exists():
-                    VM_DISK.unlink()
-                break
-            except OSError:
-                time.sleep(0.3)
-    except OSError:
-        pass
     try:
         vm_tunnel_stop()  # 关闭所有常驻转发
     except Exception:
         pass
     try:
-        (VM_DIR / f"qemu-{VM_INSTANCE}.log").unlink(missing_ok=True)
+        VM_LOG.unlink(missing_ok=True)
     except OSError:
         pass
 
