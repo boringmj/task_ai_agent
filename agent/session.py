@@ -34,12 +34,17 @@ _ENCODING = "utf-8"
 
 
 def _persistable(messages: list[dict]) -> list[dict]:
-    """落盘前过滤掉 system 消息。
+    """落盘前过滤掉**开头连续的** system 消息。
 
-    系统提示词和长期记忆每次启动都重新生成,存进会话文件既是浪费(约 10KB),
-    又会让过期版本跟着会话一直传下去。只留真正的对话。
+    开头那几条(系统提示词、长期记忆、指令清单)每次启动都重新生成,存下来既是
+    浪费(约 11KB)又会让过期版本一直跟着会话跑。**但中段的 system 消息要留下** ——
+    那不是每次重生的模板,而是程序在某个时刻插进对话的真实内容(例如"本次会话
+    是恢复的"这条提示)。这也和 load_session 只剥离开头 system 的做法对称。
     """
-    return [m for m in messages if m.get("role") != "system"]
+    start = 0
+    while start < len(messages) and messages[start].get("role") == "system":
+        start += 1
+    return messages[start:]
 
 
 def session_file(name: str = DEFAULT_SESSION) -> Path:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import sys
+from datetime import datetime
 
 from rich.markdown import Markdown
 
@@ -93,6 +94,34 @@ def _replay_history(history: list[dict]) -> None:
     console.print("─" * 46, style="dim")
 
 
+def _restore_notice(restored_count: int) -> dict:
+    """会话恢复时追加的那条提示(**追加在历史末尾**,不是开头)。
+
+    两个要点:
+
+    1. **位置在末尾**。插在历史前面会让整段已恢复历史的前缀失配、缓存全 miss;
+       追加在末尾则前缀完整命中,只有这条和新提问要重新算 —— 这正是"持久化能
+       提高缓存命中"的地方。它自己也会被持久化,下次恢复时同样在匹配的前缀里。
+    2. **用 system 角色**。它讲的是程序级状态(本次是恢复、VM 被重启),不是用户
+       说的话,也不该被当成助手说过的话。注意 session 落盘时只过滤**开头连续**
+       的 system 消息,所以这条中段的 system 能存下来。
+    """
+    return {
+        "role": "system",
+        "content": (
+            f"【程序提示】本次对话是从上次会话恢复的(接回了 {restored_count} 条历史),"
+            f"不是新会话,发生时间 {datetime.now().strftime('%Y-%m-%d %H:%M')}。\n"
+            "几点需要你知道:\n"
+            "- 上面的内容是**上次运行时**留下的。工作区里的文件、长期记忆都还在,"
+            "不要重复做已经做过的事。\n"
+            "- **虚拟机已经在本次启动时重启了**,是一台全新的机器:上次在 VM 里装的软件、"
+            "起的服务、写的文件**全部丢失**。\n"
+            "- 所以这次要用虚拟机时,**先用 vm_status 确认状态**再干活,不要假设里面还有上次的东西;"
+            "如果之前依赖过 VM 里的环境,需要重新装/重新搭。"
+        ),
+    }
+
+
 def _cleanup_trash_on_start() -> None:
     """启动时删除超过保留期(默认 7 天)的回收站文件。
 
@@ -175,6 +204,9 @@ def main() -> None:
     conflict = claim_owner()
     history, resume_note = load_session()
     messages.extend(history)
+    if history:
+        # 接回历史后追加一条提示(追加在末尾以保住前缀缓存,详见 _restore_notice)
+        messages.append(_restore_notice(len(history)))
     atexit.register(release_owner)   # 正常退出时摘掉占用者标记
     _cleanup_trash_on_start()
     # 预处理 Docker 健康状态(非阻断):可用则做残留清理,不可用仅警告,agent 照常启动
