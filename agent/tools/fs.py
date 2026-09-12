@@ -7,6 +7,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from .. import markdown as md
 from ..core import (
     MAX_WRITE_BYTES,
     ROOT,
@@ -367,6 +368,25 @@ def grep_files(pattern: str, path: str = ".", ignore_case: bool = False,
     return summary + skip_note + "\n" + "\n".join(out)
 
 
+def _markdown_note(target: Path) -> str:
+    """写完 .md 后自动查一遍格式,把问题附在结果里(没有就返回空串)。
+
+    为什么放在写文件这条路上、而不是做成一个"想查就查"的工具:markdown 的格式问题
+    (标题/列表/代码块前后少空行、代码块没标语言、行太长)是**一眼看不出**的 —— 写的人
+    自我感觉良好,用户打开却满屏 lint 警告。**必须由系统在写的时候就拦一道**,指望
+    模型记得主动去查是靠不住的(实测:提醒过也一样忘)。
+    """
+    if target.suffix.lower() != ".md":
+        return ""
+    issues = md.lint_file(target)
+    if not issues:
+        return "\n\nmarkdown 格式检查:通过。"
+    shown = issues[:12]
+    more = f"\n…(还有 {len(issues) - len(shown)} 处未列出)" if len(issues) > len(shown) else ""
+    return ("\n\n! markdown 格式有问题,请**现在就改掉**(用户打开文件会看到 lint 警告):\n"
+            + "\n".join(f"  {it}" for it in shown) + more)
+
+
 def _check_writable(target: Path, content: str) -> int:
     """写入前的公共校验,返回内容的字节数。"""
     size = len(content.encode("utf-8"))
@@ -415,7 +435,7 @@ def write_file(path: str, content: str, overwrite: bool = False) -> str:
 
     target.parent.mkdir(parents=True, exist_ok=True)  # 子目录不存在就顺手建出来
     target.write_text(content, encoding="utf-8")
-    return f"已{'覆盖' if existed else '创建'} {target}({size} 字节)"
+    return f"已{'覆盖' if existed else '创建'} {target}({size} 字节)" + _markdown_note(target)
 
 
 @tool(
@@ -446,7 +466,7 @@ def append_file(path: str, content: str) -> str:
     enc = _sniff_encoding(target) if target.is_file() else "utf-8"
     with target.open("a", encoding=enc) as fp:
         fp.write(content)
-    return f"已向 {target} 追加 {size} 字节(当前共 {target.stat().st_size} 字节)"
+    return f"已向 {target} 追加 {size} 字节(当前共 {target.stat().st_size} 字节)" + _markdown_note(target)
 
 
 def _load_lines(path: str) -> tuple[Path, list[str], str]:
@@ -473,7 +493,7 @@ def _save_lines(target: Path, lines: list[str], summary: str, center: int,
     lo, hi = max(1, center - 3), min(len(lines), center + 3)
     preview = "\n".join(f"{i:>4} | {lines[i - 1].rstrip(chr(10))}" for i in range(lo, hi + 1))
     tail = f"\n改动附近的内容:\n{preview}" if preview else "\n(文件现在是空的)"
-    return f"{summary},文件现共 {len(lines)} 行{tail}"
+    return f"{summary},文件现共 {len(lines)} 行{tail}" + _markdown_note(target)
 
 
 def _terminate(line: str) -> str:

@@ -1,24 +1,26 @@
-#!/usr/bin/env python3
-"""校验一个技能的 SKILL.md:frontmatter 是否合规,markdown 是否过得了 lint。
+"""markdown 结构检查:和 markdownlint 对齐的一套轻量规则,给写文件时自动把关。
 
-用法(在容器里跑):
-    python /skills/<技能名>/scripts/check_skill.py /skills/<技能名>
-    python /skills/<技能名>/scripts/check_skill.py /skills/<技能名> --md-only
+为什么要有它:agent 生成的 markdown(报告、技能、笔记)经常格式不规范,用户一打开
+就是满屏 lint 警告 —— 很影响观感,也显得不专业。与其事后让用户一条条指出来,不如
+**写的时候就查**。所以这个模块有两个消费方(见 tools/markdown.py 与 tools/fs.py):
+写文件时自动检查并附上问题;也可以用 `check_markdown` 工具单独查一个文件。
 
-为什么要有这个脚本:技能是给人看的 markdown 文件,格式不规范的话,用户一打开就是
-满屏 lint 警告。与其事后一条条改,不如**交出去之前先自己过一遍**。
+只覆盖 markdownlint 默认规则里最常踩的那些(MD 编号沿用官方编号,方便对照):
 
-检查的是 markdownlint 的默认规则里最常踩的那几条(MD 编号沿用官方编号,方便对照):
     MD041 首行要是 H1 / MD025 只能有一个 H1
     MD022 标题上下要有空行 / MD031 代码块上下要有空行 / MD032 列表上下要有空行
     MD040 代码块要标语言 / MD004 无序列表符号要统一
     MD012 不能有连续空行 / MD009 行尾不能有空格 / MD047 文件要以单个换行结尾
     MD013 行太长(只对"含空格、本来能折行"的行报 —— 纯中文行不受影响)
+    MD036 别拿加粗/斜体当标题(整行加粗自成一段)
 
-**MD013 这条我故意做得比 markdownlint 严**:实测 markdownlint 对某些 80~95 字符的行
+**MD032 和 MD036 是模型写 markdown 的重灾区**:前者是老忘了跟正文之间空行,
+后者是习惯用 `**第一步**` 顶替 `### 第一步`。这两条在检查里都按最严的口径判。
+
+**MD013 这条故意做得比 markdownlint 严**:实测 markdownlint 对某些 80~95 字符的行
 并不报(规则细节和 CJK 有关),而这里一律按"超过 80 且有词间空格"报。宁可多报几条、
-让人少写几个长行,也不要出现"脚本说没问题、一打开满屏警告" —— 后者才是真正难受的。
-换句话说:**过了这个脚本,就一定过得了 markdownlint**;反过来不保证。
+让人少写几个长行,也不要出现"说没问题、一打开满屏警告" —— 后者才是真正难受的。
+换句话说:**过了这里,就一定过得了 markdownlint**;反过来不保证。
 """
 import re
 import sys
@@ -30,21 +32,40 @@ HEADING_RE = re.compile(r"^(#{1,6})\s")
 FENCE_RE = re.compile(r"^(\s*)(```+|~~~+)\s*(\S*)")
 
 
-def check_frontmatter(text: str, dir_name: str) -> tuple[list[str], int]:
-    """查 frontmatter,返回 (问题列表, 正文起始行号)。"""
+def _emphasis_only(s: str) -> bool:
+    """整行只由一个强调元素构成吗(`**粗体**` / `*斜体*` / `__粗体__` / `_斜体_`)。
+
+    MD036 判的是"拿强调当标题"这种写法(`**第一步**` 顶替 `### 第一步`)——
+    但只有它**自成一段**时才算数,所以调用方还得确认这行前后都空着。
+    """
+    for mark in ("**", "__", "*", "_"):
+        if len(s) > 2 * len(mark) and s.startswith(mark) and s.endswith(mark):
+            inner = s[len(mark):-len(mark)]
+            if inner and mark[0] not in inner:
+                return True
+    return False
+
+
+def check_frontmatter(text: str, dir_name: str, *, is_skill: bool) -> tuple[list[str], int]:
+    """查开头的 YAML frontmatter,返回 (问题列表, 正文起始行号)。
+
+    `is_skill` 只对技能(文件名 SKILL.md)才要求 name/description —— 普通 markdown
+    带 frontmatter 是常见的(有的静态站点生成器就用),不该要求它有这两个字段。
+    """
     issues = []
     m = re.match(r"^---\n(.*?)\n---\n?", text, re.S)
     if not m:
-        return ["缺少 frontmatter(文件要以 --- 开头,再用 --- 收尾)"], 0
+        return (["缺少 frontmatter(文件要以 --- 开头,再用 --- 收尾)"] if is_skill else []), 0
     meta = m.group(1)
-    for key in ("name", "description"):
-        if not re.search(rf"^{key}\s*:\s*\S", meta, re.M):
-            issues.append(f"frontmatter 缺 {key}")
-    nm = re.search(r"^name\s*:\s*(\S+)", meta, re.M)
-    if nm and nm.group(1) != dir_name:
-        issues.append(f"name({nm.group(1)}) 与目录名({dir_name})不一致")
-    if not re.search(r"^description\s*:\s*\S", meta, re.M):
-        issues.append("description 是空的 —— 清单里只显示它,决定了模型何时会用到这个技能")
+    if is_skill:
+        for key in ("name", "description"):
+            if not re.search(rf"^{key}\s*:\s*\S", meta, re.M):
+                issues.append(f"frontmatter 缺 {key}")
+        nm = re.search(r"^name\s*:\s*(\S+)", meta, re.M)
+        if nm and nm.group(1) != dir_name:
+            issues.append(f"name({nm.group(1)}) 与目录名({dir_name})不一致")
+        if not re.search(r"^description\s*:\s*\S", meta, re.M):
+            issues.append("description 是空的 —— 清单里只显示它,决定了模型何时会用到这个技能")
     return issues, len(m.group(0).splitlines())
 
 
@@ -78,6 +99,8 @@ def check_markdown(lines: list[str], offset: int) -> list[str]:
                 # 这条很关键:要示范"本身含代码块"的 markdown 时,外层得用更长的围栏
                 # (外层 ```` + 内层 ```);否则内层会把外层提前闭合,后面全乱。
                 in_fence = False
+                if i + 1 < len(lines) and lines[i + 1].strip():
+                    out.append(f"{n}: MD031 代码块下方要空一行")
             prev_blank = False
             prev_kind = "fence"
             continue
@@ -106,6 +129,14 @@ def check_markdown(lines: list[str], offset: int) -> list[str]:
                 nxt = lines[i + 1]
                 if not nxt.startswith((" ", "\t")) and not HEADING_RE.match(nxt):
                     out.append(f"{n}: MD032 列表下方要空一行")
+
+        # MD036:整行加粗/斜体、前后都空着 = 自成一段。这是拿强调当标题用(老毛病),
+        # 必须前后都是空行才算 —— 紧跟正文的 `**重点**:` 只是段内强调,不该报。
+        if (not blank and not head and not item and prev_blank
+                and not raw[:1].isspace()
+                and (i + 1 >= len(lines) or not lines[i + 1].strip())
+                and _emphasis_only(raw.strip())):
+            out.append(f"{n}: MD036 别用加粗当标题(标题请用 #,整行加粗只会被当成强调)")
 
         if blank:
             if prev_blank and i > 0:
@@ -142,53 +173,33 @@ def check_markdown(lines: list[str], offset: int) -> list[str]:
     return out
 
 
-def main() -> int:
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    d = pathlib.Path(args[0] if args else ".")
-    f = d / "SKILL.md"
-    if not f.is_file():
-        print(f"× 没有 SKILL.md:{f}")
-        return 1
+def lint(text: str, *, filename: str = "", dir_name: str = "") -> list[str]:
+    """检查一段 markdown,返回问题列表(空列表 = 没问题)。每条形如 `12: MD022 …`。
 
-    def _md_issues(path: pathlib.Path, text: str) -> list[str]:
-        lines = [ln for ln in text.split("\n")]
-        while lines and not lines[-1].strip():
-            lines.pop()
-        out = check_markdown(lines, 0)
-        if text and not text.endswith("\n"):
-            out.append("MD047 文件结尾要有换行")
-        elif text.endswith("\n\n"):
-            out.append("MD047 文件结尾只能有一个换行")
-        return [f"{path.name} {it}" for it in out]
-
-    text = f.read_text(encoding="utf-8")
-    issues, body_start = check_frontmatter(text, d.resolve().name)
+    filename 只用于判断"是不是技能的 SKILL.md"(决定要不要要求 frontmatter);
+    dir_name 用于校验技能 name 与目录名是否一致。
+    """
+    is_skill = filename == "SKILL.md"
+    issues, body_start = check_frontmatter(text, dir_name, is_skill=is_skill)
+    lines = text.split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
     if body_start:
-        lines = text.split("\n")[body_start:]
-        while lines and not lines[-1].strip():
-            lines.pop()
-        issues += check_markdown(lines, body_start)
+        issues += check_markdown(lines[body_start:], body_start)
+    else:
+        issues += check_markdown(lines, 0)
     if text and not text.endswith("\n"):
         issues.append("MD047 文件结尾要有换行")
     elif text.endswith("\n\n"):
         issues.append("MD047 文件结尾只能有一个换行")
-
-    # 附带资源里的 markdown 也要查 —— 它们同样是用户会打开看的文件,
-    # 只查 SKILL.md 的话,警告会从 references/ 里冒出来。
-    for sub in ("references", "assets"):
-        ref_dir = d / sub
-        if ref_dir.is_dir():
-            for md in sorted(ref_dir.rglob("*.md")):
-                issues += _md_issues(md, md.read_text(encoding="utf-8"))
-
-    if not issues:
-        print(f"√ {d.name}:通过")
-        return 0
-    print(f"× {d.name} 有 {len(issues)} 处问题:")
-    for it in issues:
-        print(f"   {it}")
-    return 1
+    return issues
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+def lint_file(path) -> list[str]:
+    """检查一个 .md 文件。读不了就返回空(不该因为读不了文件而挡住写操作)。"""
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    return lint(text, filename=pathlib.Path(path).name,
+                dir_name=pathlib.Path(path).resolve().parent.name)
