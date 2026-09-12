@@ -33,14 +33,25 @@ class MissingPrompt(FileNotFoundError):
     """提示词文件不存在 —— 这是打包/部署错误,不该被静默吞掉。"""
 
 
+def _resolve(name: str) -> Path:
+    """按名字找文件:名字带了 `.md` 就照用,否则补上后缀。
+
+    一律 `.md` —— 提示词里本来就用 markdown 语法(标题、**粗体**、列表),模型也是
+    按 markdown 读的。其中 `system.md` 是完整文档(有 # 标题),其余是"读出来直接
+    塞进消息"的片段:它们不对应独立文档,首行不是(也不该是)一级标题 —— 所以
+    那些文件在 `.markdownlintignore` 里排除了,免得文档规则误报 MD041。
+    """
+    return PROMPTS_DIR / (name if name.endswith(".md") else f"{name}.md")
+
+
 def load(name: str, **variables) -> str:
     """按名字读一段提示词,并把 `{变量}` 替换成给定值。
 
-    name 可以带或不带 `.md`;只替换传进来的变量,其余花括号原样保留(提示词里会
-    出现 JSON 示例)。文件不存在直接抛错:提示词缺了,agent 的行为就不可预期,
-    与其悄悄跑下去,不如当场说清楚缺的是哪个文件。
+    只替换**传进来的**变量,其余花括号原样保留(提示词里会出现 JSON 示例,
+    用 str.format 会直接因花括号报错)。文件不存在直接抛错:提示词缺了 agent 的
+    行为就不可预期,与其悄悄跑下去,不如当场说清缺的是哪个文件。
     """
-    path = PROMPTS_DIR / (name if name.endswith(".md") else f"{name}.md")
+    path = _resolve(name)
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -53,4 +64,4 @@ def load(name: str, **variables) -> str:
 
 
 def exists(name: str) -> bool:
-    return (PROMPTS_DIR / (name if name.endswith(".md") else f"{name}.md")).exists()
+    return _resolve(name).exists()
