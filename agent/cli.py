@@ -29,17 +29,24 @@ from .tools.vm import _vm_kickoff, _vm_state_get, vm_status
 
 
 def _clip(text: str, limit: int) -> str:
-    """把一段文本压成单行预览:折叠所有空白,超长截断。"""
+    """把一段文本压成单行:折叠所有空白,超长则截断。limit<=0 表示不截断。"""
     one = " ".join(text.split())
-    return one if len(one) <= limit else one[:limit] + "…"
+    if limit <= 0 or len(one) <= limit:
+        return one
+    return one[:limit] + "…"
 
 
-def _show_history(history: list[dict]) -> None:
-    """把恢复回来的最近几条对话回显出来。
+def _replay_history(history: list[dict]) -> None:
+    """把恢复回来的对话**按当时的样子重放一遍** —— 和实时对话用同一套渲染。
 
-    只回显 user / assistant 两类 —— tool 消息是中间产物,又长又碎,回显只会淹没重点;
-    条数按"可读的对话消息"算,不是按原始消息数,否则 10 条可能全是工具调用。
-    全部 markup=False:消息里出现 [ ] 时别被 rich 当成样式标记解析。
+    刻意不做成"摘要式预览":那样和真实对话长得不一样,一眼看去分不清哪些是
+    刚才发生的、哪些是上次的。这里逐条重放:用户输入、思考、工具调用、
+    AI 回答,顺序与样式都和跑的时候一致(tool 消息在实时里本来就不显示,
+    这里同样跳过)。
+
+    唯一做了裁剪的是**思考**和**工具参数** —— 前者动辄几千字、后者可能塞着
+    整个文件内容(如 write_file 的 content),照原样打会刷屏。AI 的回答和用户的
+    输入完整显示,那才是对话本身。SESSION_RESUME_CHARS=0 表示连这两处也不裁。
     """
     if SESSION_RESUME_MESSAGES <= 0 or not history:
         return
@@ -47,25 +54,40 @@ def _show_history(history: list[dict]) -> None:
     shown = readable[-SESSION_RESUME_MESSAGES:]
     if not shown:
         return
+
+    console.print("─" * 46, style="dim")
     console.print(
-        f"── 上次会话(共恢复 {len(readable)} 条对话,回显最近 {len(shown)} 条)──",
+        f"↓ 以下是上次会话的重放(共 {len(readable)} 条对话,重放最近 {len(shown)} 条)"
+        f" —— 已经接着这段继续,不用重新说一遍",
         style="dim", markup=False,
     )
     for m in shown:
-        content = m.get("content") or ""
-        if isinstance(content, list):        # 带图片的消息
-            content = "[图片]"
-        text = content.strip()
+        content = m.get("content")
+        if isinstance(content, list):        # 图片等注入消息,不是用户打的字
+            continue
+        text = (content or "").strip()
+
         if m.get("role") == "user":
-            console.print(f"你 > {_clip(text, SESSION_RESUME_CHARS)}", style="cyan", markup=False)
-        else:
-            if text:
-                console.print(f"AI > {_clip(text, SESSION_RESUME_CHARS)}", style="green", markup=False)
-            calls = m.get("tool_calls") or []
-            if calls:
-                names = "、".join(c.get("function", {}).get("name", "?") for c in calls)
-                # 标记用 ASCII:齿轮等符号 GBK 编不出来,重定向输出时会崩
-                console.print(f"     - 调用了 {names}", style="dim", markup=False)
+            console.print("你 > ", style="bold cyan", end="")
+            console.print(text, markup=False)
+            continue
+
+        # ---- assistant:思考 → 工具调用 → 回答,顺序与实时一致 ----
+        reasoning = (m.get("reasoning_content") or "").strip()
+        if reasoning:
+            console.print("* 思考", style="dim", markup=False)
+            console.print(_clip(reasoning, SESSION_RESUME_CHARS), style="dim italic",
+                          markup=False, highlight=False, soft_wrap=True)
+        for call in (m.get("tool_calls") or []):
+            fn = call.get("function", {})
+            console.print(
+                f"• {fn.get('name', '?')}({_clip(fn.get('arguments') or '', SESSION_RESUME_CHARS)})",
+                style="dim", markup=False, highlight=False,
+            )
+        if text:
+            console.print("AI >", style="bold green")
+            # 与实时一致:拿到完整文本后交由 Markdown 渲染
+            console.print(Markdown(text))
     console.print("─" * 46, style="dim")
 
 
@@ -173,7 +195,7 @@ def main() -> None:
     console.print(f"会话:{resume_note}", style="dim")
     if conflict:
         console.print(conflict, style="yellow")
-    _show_history(history)   # 回显上次聊到哪了,免得看着一句"已恢复 N 条"发懵
+    _replay_history(history)   # 把上次对话按原样重放一遍，接着聊
     console.print()
 
     while True:
