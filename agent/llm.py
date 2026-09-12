@@ -12,8 +12,9 @@ from .tools.registry import TOOLS
 
 # 最近一次请求的 token 用量(来自 API 的 usage)。prompt_tokens 就是"当前上下文多大"。
 _last_usage: dict = {}
-# 本会话累计:请求数、总输出 token(输入每轮都要重发,累计没有意义,不计)
-_total_usage: dict = {"requests": 0, "completion": 0}
+# 本会话累计:请求数、总输出 token;以及"输入侧"的总量与总命中 ——
+# 输入每轮重发,单看累计没意义,但**命中比例**有意义(它反映缓存整体好不好使)。
+_total_usage: dict = {"requests": 0, "completion": 0, "prompt": 0, "cache_hit": 0}
 
 
 def _record_usage(usage) -> None:
@@ -25,6 +26,8 @@ def _record_usage(usage) -> None:
     _last_usage["cache_hit"] = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
     _total_usage["requests"] += 1
     _total_usage["completion"] += _last_usage["completion"]
+    _total_usage["prompt"] += _last_usage["prompt"]
+    _total_usage["cache_hit"] += _last_usage["cache_hit"]
 
 
 def _context_ratio() -> float:
@@ -34,26 +37,41 @@ def _context_ratio() -> float:
     return _last_usage.get("prompt", 0) / MAX_CONTEXT_TOKENS
 
 
+def _cache_rate(prompt: int, hit: int) -> float:
+    """缓存命中率(0~100)。命中数来自 API 的 prompt_cache_hit_tokens。"""
+    return (hit / prompt * 100) if prompt else 0.0
+
+
 def usage_line() -> str:
-    """当前上下文用量的一行摘要(还没有数据时返回空串)。"""
+    """当前上下文用量的一行摘要(还没有数据时返回空串)。
+
+    把**缓存命中率**直接写成百分比给出来 —— 只报命中的绝对 token 数,用户还得自己
+    去除以 prompt 才知道比例;而这个比例正是"缓存好不好使"最直观的指标。
+    """
     prompt = _last_usage.get("prompt")
     if not prompt:
         return ""
-    pct = (prompt / MAX_CONTEXT_TOKENS * 100) if MAX_CONTEXT_TOKENS else 0.0
-    text = (f"上下文 {prompt:,}/{MAX_CONTEXT_TOKENS:,} tokens({pct:.1f}%,"
-            f"本轮输出 {_last_usage.get('completion', 0):,}")
     hit = _last_usage.get("cache_hit", 0)
-    if hit:
-        text += f",缓存命中 {hit:,}"
-    return text + ")"
+    pct = (prompt / MAX_CONTEXT_TOKENS * 100) if MAX_CONTEXT_TOKENS else 0.0
+    return (f"上下文 {prompt:,}/{MAX_CONTEXT_TOKENS:,} tokens({pct:.1f}%)"
+            f" · 缓存命中 {_cache_rate(prompt, hit):.1f}%({hit:,})"
+            f" · 本轮输出 {_last_usage.get('completion', 0):,}")
 
 
 def usage_detail() -> str:
-    """给 /tokens 用的较详细用量:当前上下文 + 本会话累计。"""
+    """给 /tokens 用的较详细用量:最近一次请求 + 本会话累计(含整体缓存命中率)。"""
     if not _last_usage.get("prompt"):
         return "(还没有用量数据,先聊一句再看)"
-    return (f"{usage_line()}\n"
-            f"本会话:共 {_total_usage['requests']} 次请求,累计输出 {_total_usage['completion']:,} tokens")
+    total_prompt = _total_usage["prompt"]
+    total_hit = _total_usage["cache_hit"]
+    return (
+        f"{usage_line()}\n"
+        f"本会话:共 {_total_usage['requests']} 次请求,累计输出 {_total_usage['completion']:,} tokens\n"
+        f"缓存:整体命中 {_cache_rate(total_prompt, total_hit):.1f}%"
+        f"({total_hit:,}/{total_prompt:,} 输入 token 走了缓存)\n"
+        f"(缓存的是一段请求前缀 —— 对话越长、越少改前面的内容,命中率越高;"
+        f"刚改过系统提示词或工具、或隔久了缓存过期,都会让它掉下来)"
+    )
 
 
 def _stream_model(messages: list[dict]) -> tuple[str, list[dict], str]:
