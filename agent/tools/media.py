@@ -80,6 +80,20 @@ def img(path: str) -> str:
     return f"图片 {target.name} 已加载({size} 字节),将在下一轮作为图像信息交给模型。"
 
 
+def _virtual_screen_origin() -> tuple[int, int]:
+    """虚拟桌面(所有显示器拼起来的那块大画布)的原点在屏幕坐标系里的位置。
+
+    多屏时它常常不是 (0,0):副屏若在主屏左边/上边,原点就是负的。截的是整块
+    虚拟桌面,所以把图上坐标换算成点击坐标时必须加上这个偏移。
+    """
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        return u.GetSystemMetrics(76), u.GetSystemMetrics(77)  # SM_XVIRTUALSCREEN / SM_YVIRTUALSCREEN
+    except Exception:  # noqa: BLE001
+        return 0, 0
+
+
 def _image_to_data_url(image) -> str:
     """把 PIL Image 压缩到最长边不超过 MEDIA_SCREEN_MAX_DIM,再转成 PNG data URL。
 
@@ -119,17 +133,21 @@ def screen() -> str:
     except ImportError as exc:
         raise RuntimeError("截屏需要 Pillow,请先执行:pip install Pillow") from exc
 
-    image = ImageGrab.grab()
+    # all_screens=True:抓**整个虚拟桌面**(所有显示器)。默认只抓主屏,
+    # 多显示器时副屏上的窗口 agent 既看不到、也算不准点击坐标。
+    image = ImageGrab.grab(all_screens=True)
     orig_w, orig_h = image.size
+    ox, oy = _virtual_screen_origin()
     url = _image_to_data_url(image)
     _pending_images.append(url)
     cw = max(1, int(orig_w * MEDIA_SCREEN_MAX_DIM / max(orig_w, orig_h)))
     ch = max(1, int(orig_h * MEDIA_SCREEN_MAX_DIM / max(orig_w, orig_h)))
-    # 给出原分辨率与压缩后的换算,方便模型算真实点击坐标:
-    # click/move 用原始分辨率坐标;真实坐标 = 图坐标 × (orig/cw)。
+    # 给出原分辨率、压缩尺寸和虚拟桌面原点,方便模型算真实点击坐标。
     return (
-        f"已截取全屏:原始 {orig_w}×{orig_h},交给模型的压缩图为 {cw}×{ch}。"
-        f"click/move 请用原始分辨率坐标,换算:真实坐标 = 图坐标 × ({orig_w}/{cw})。"
+        f"已截取整个虚拟桌面:原始 {orig_w}×{orig_h},交给模型的压缩图为 {cw}×{ch};"
+        f"虚拟桌面原点在屏幕坐标 ({ox}, {oy})。"
+        f"click/move 用原始分辨率的屏幕坐标,换算:"
+        f"屏幕x = {ox} + 图x × {orig_w}/{cw},屏幕y = {oy} + 图y × {orig_h}/{ch}。"
     )
 
 

@@ -89,6 +89,9 @@ def _vm_ensure() -> None:
 
 class _VmSerial:
     """QEMU 串口控制台通道(参考 sandbox_demo):连接 sentinel 读取、发送、排空。"""
+
+    _KEEP = 64 * 1024   # 缓冲保留上限:超出就丢弃更早的内容,避免无限增长
+
     def __init__(self, port: int):
         import socket
         self.s = socket.create_connection(("127.0.0.1", port), timeout=15)
@@ -96,6 +99,12 @@ class _VmSerial:
         self.buf = b""
 
     def read_until(self, marker: str, timeout: float = 30.0) -> str:
+        """读到 marker 出现(或超时)为止,返回到目前为止收到的文本。
+
+        调用方只用它做子串判断,所以缓冲区只保留最近的 _KEEP 字节 —— 否则长时间
+        刷屏(如启动日志)会让 buf 无限增长;每次也只解码一遍,不再逐块重复解码整段。
+        """
+        import socket
         end = time.time() + timeout
         while time.time() < end:
             try:
@@ -105,8 +114,11 @@ class _VmSerial:
             if not d:
                 break
             self.buf += d
-            if marker in self.buf.decode("utf-8", "replace"):
-                return self.buf.decode("utf-8", "replace")
+            if len(self.buf) > self._KEEP * 2:
+                self.buf = self.buf[-self._KEEP:]
+            text = self.buf.decode("utf-8", "replace")
+            if marker in text:
+                return text
         return self.buf.decode("utf-8", "replace")
 
     def send(self, text: str) -> None:
@@ -171,11 +183,25 @@ def _vm_spawn_and_login(serial_port: int, vmserver_host_port: int) -> None:
         "-accel", VM_ACCEL,
     ]
     import subprocess as sp
-    _vm_proc = sp.Popen(cmd, creationflags=sp.CREATE_NO_WINDOW,
-                        stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+    # stderr 落到日志文件(不接管道:没人读的管道写满会把 QEMU 堵死)。
+    # 启动失败时它的内容就是真正的原因(如 "virtfs support is disabled"),
+    # 只报一句"请检查 VM_ACCEL"会让人反复猜。
+    log = VM_DIR / f"qemu-{VM_INSTANCE}.log"
+    with log.open("wb") as log_fp:
+        _vm_proc = sp.Popen(cmd, creationflags=sp.CREATE_NO_WINDOW,
+                            stdout=sp.DEVNULL, stderr=log_fp)
     time.sleep(1)
     if _vm_proc.poll() is not None and _vm_proc.returncode != 0:
-        raise RuntimeError("QEMU 启动即退出,请检查 VM_ACCEL(whpx/tcg)或镜像")
+        detail = ""
+        try:
+            detail = log.read_text(encoding="utf-8", errors="replace").strip()[-800:]
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"QEMU 启动即退出(rc={_vm_proc.returncode})。"
+            + (f"QEMU 的报错:\n{detail}" if detail
+               else "未拿到 QEMU 的报错,请检查 VM_ACCEL(whpx/tcg)或镜像是否可用。")
+        )
     _vm_ser = _vm_serial_login(serial_port)
 
 
@@ -202,7 +228,14 @@ def _vm_worker() -> None:
         _vm_token = uuid.uuid4().hex + uuid.uuid4().hex
         with _vm_serial_lock:
             _vm_ser.send(f"echo '{_vm_token}' > /root/.vm_token\n")
-            time.sleep(0.5)
+            time.sleep(0.3)
+            # 回读校验:写失败会变成"状态已就绪但 vmserver 锁死",之后每个 vm_run
+            # 都报 locked / auth failed,很难查 —— 在源头就确认写进去了。
+            _vm_ser.reset_buf()
+            _vm_ser.send("cat /root/.vm_token\n")
+            echoed = _vm_ser.read_until(_vm_token, 5)
+        if _vm_token not in echoed:
+            raise RuntimeError("token 注入校验失败:串口回读不到刚写入的 token,虚拟机不可安全使用")
         try:
             _vm_ser.s.close()   # 串口只在注入 token 用,之后 vm_run 走 socket
         except Exception:
@@ -596,7 +629,6 @@ def vm_tunnel(host_port: int, guest_port: int) -> str:
     if not _vm_vmserver_host_port or not _vm_token:
         return "虚拟机 vmserver 未就绪,请稍后再试。"
     import socket as sk
-    sk.setdefaulttimeout(1.0)
     if int(host_port) in _vm_tunnels:
         vm_tunnel_stop(int(host_port))
     srv = sk.socket(sk.AF_INET, sk.SOCK_STREAM)
@@ -676,15 +708,13 @@ def _vm_cleanup() -> None:
                 time.sleep(0.3)
     except OSError:
         pass
-    keydir = VM_DIR / f"key-{VM_INSTANCE}"
-    try:
-        if keydir.exists():
-            shutil.rmtree(keydir, ignore_errors=True)
-    except Exception:
-        pass
     try:
         vm_tunnel_stop()  # 关闭所有常驻转发
     except Exception:
+        pass
+    try:
+        (VM_DIR / f"qemu-{VM_INSTANCE}.log").unlink(missing_ok=True)
+    except OSError:
         pass
 
 

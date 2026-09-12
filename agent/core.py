@@ -106,6 +106,28 @@ client = OpenAI(
 console = Console()
 
 
+def _enable_dpi_awareness() -> None:
+    """让本进程 DPI 感知,把整套屏幕坐标统一到物理像素。
+
+    不感知时 Windows 会"虚拟化"坐标:GetSystemMetrics 返回缩放后的逻辑值
+    (150% 缩放下 1920 的屏报 1280),而截屏给的是物理像素 —— 两套坐标混用会让
+    点击整体偏移。pyautogui 导入时也会自己调一次,但 screen 可能先于它被调用,
+    于是"先截屏还是先点击"会导致坐标系不同(这是真实踩到的坑)。
+    在启动时统一定死,谁先谁后都一致。失败不影响其它功能,静默跳过。
+    """
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)   # PROCESS_SYSTEM_DPI_AWARE
+    except Exception:  # noqa: BLE001 - 老系统没有 shcore,退回旧 API
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+_enable_dpi_awareness()
+
+
 def safe_path(path: str) -> Path:
     """把模型给的路径解析为绝对路径,并确保它没有逃出 ROOT。
 

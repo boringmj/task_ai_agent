@@ -33,7 +33,8 @@ def _pyautogui():
 
 # ---- 点击标记(顶层红点)----
 # 在 agent 点击处显示一个顶层、点击穿透的红色十字标记:用户可见 AI 点了哪,
-# AI 点完也能截屏核实有没有点歪。Tk 窗口跑在独立线程,避免阻塞 agent 主循环。
+# AI 点完也能截屏核实有没有点歪。用纯 Win32(ctypes)自绘窗口跑在独立线程 ——
+# 早先用 Tk,但 Tk 必须在主线程才能渲染,放后台线程不出画面,故改用 Win32。
 # 标记通过线程安全的 queue 通信;click/move 更新位置,clear_marker 隐藏。
 
 _marker_thread = None
