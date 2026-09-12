@@ -32,7 +32,7 @@ from .session import (
 from .tools.container import _docker_cleanup_stale, _docker_health
 from .tools.memory import _read_memory
 from .tools.trash import purge_trash
-from .tools.vm import _vm_kickoff, _vm_state_get, vm_status
+from .tools.vm import _vm_kickoff, _vm_state_get, session_reset_hint, vm_status
 
 
 def _clip(text: str, limit: int) -> tuple[str, int]:
@@ -257,8 +257,13 @@ def main() -> None:
                 break
             # 终端指令(/compact、/reset、/tokens…)。注册在 agent/commands/ 里,
             # 系统提示词中那段说明也由同一份注册表生成,不用两头各维护一遍。
-            cmd_result = dispatch_command(text, CommandContext(messages))
+            cmd_ctx = CommandContext(messages)
+            cmd_result = dispatch_command(text, cmd_ctx)
             if cmd_result is not None:
+                # 会话被重置 → 顺带说清虚拟机没跟着重置。为什么补在这层:只有装配层
+                # 同时认识"会话"和"VM"两边;命令层只声明事实,不去 import VM 模块。
+                if "session_reset" in cmd_ctx.events:
+                    cmd_result += session_reset_hint()
                 if cmd_result:
                     console.print(cmd_result, style="dim")
                 continue

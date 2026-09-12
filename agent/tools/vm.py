@@ -308,6 +308,31 @@ def _vm_kickoff() -> None:
                 "虚拟机在后台启动,可能没就绪;用这个确认是否能用。",
     parameters={"type": "object", "properties": {}},
 )
+def vm_is_running() -> bool:
+    """当前这台 VM 的进程还在不在。
+
+    只看进程活着没,**不看是否 ready** —— 正在启动的也算"它就在那儿"。
+    """
+    return _vm_proc is not None and _vm_proc.poll() is None
+
+
+def session_reset_hint() -> str:
+    """会话被重置之后,如果 VM 还开着,返回一句该讲给用户听的话(否则空串)。
+
+    为什么要单独一个函数:"VM 不会跟着会话一起重置"这件事只有这里最清楚,所以话由
+    这里出;但**说不说、什么时候说**交给调用方(cli)定 —— 会话命令不该反过来 import
+    VM 模块,它只声明"会话被重置了"这个事实(见 commands/__init__.py 的 events)。
+
+    返回值是**打印给用户看的纯文本**,别写 markdown 标记(星号、反引号会原样露出来)。
+    """
+    if not vm_is_running():
+        # VM 压根没起来时,说"虚拟机没被重置"纯属噪音,让人去 /vmreset 一个不存在的
+        # 虚拟机也很怪 —— 所以这种情况什么都不说。
+        return ""
+    return ("\n\n注意:虚拟机没有跟着重置 —— 它还开着,之前装的软件、跑的服务、"
+            "写进去的文件都还在。想连它一起清掉,用 /vmreset。")
+
+
 def vm_status() -> str:
     """查看沙箱虚拟机的当前状态(进行到哪一步、是否就绪)。"""
     st = _vm_state_get()

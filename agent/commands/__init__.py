@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import importlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import prompts
@@ -30,6 +30,10 @@ class Context:
 
     messages: list[dict]
     args: str = ""      # 指令名后面的参数(dispatch 会填),如 `/switch abc123` 里的 abc123
+    # 这条指令执行期间"发生了什么"(如 session_reset)。指令**只声明事实**,不在这里
+    # 补"那要不要提醒用户 VM 没重置"之类的后续 —— 那要么让它 import 本不相干的模块、
+    # 要么让它猜别的模块的状态。谁关心这些事件,谁在装配层(cli)去接。
+    events: set[str] = field(default_factory=set)
 
 
 def command(name: str, description: str, aliases: tuple[str, ...] = ()):

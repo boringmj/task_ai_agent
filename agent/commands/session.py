@@ -23,6 +23,10 @@ def cmd_reset(ctx: Context) -> str:
         kept += 1
     del ctx.messages[kept:]
     clear_session(current_session_id())
+
+    # 只声明"会话被重置了"这个事实。虚拟机没跟着重置、要不要提醒用户 —— 那是 VM 那边
+    # 的事,由 cli 接上(见 commands/__init__.py 里 events 的说明)。
+    ctx.events.add("session_reset")
     return "已重置会话:之前的对话不再带入(文件与长期记忆未动)。"
 
 
