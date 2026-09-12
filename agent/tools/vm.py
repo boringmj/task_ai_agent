@@ -58,6 +58,15 @@ def _vm_log() -> Path:
     return session_dir(sid) / f"qemu-{sid}.log"
 
 
+def _qemu_pid_file(sid: str) -> Path:
+    """记录"本会话正在跑的 QEMU 是哪个 pid"。
+
+    这是启动时清扫孤儿的依据:光靠进程名去扫是不行的 —— 那会连别的 agent 实例
+    甚至用户自己的 VM 一起杀掉。只认**我们自己写下过的 pid**,再逐条验证。
+    """
+    return session_dir(sid) / "qemu.pid"
+
+
 VM_VMSERVER_PORT = 40000                            # vmserver 在 guest 内监听的端口(固定)
 
 _vm_port: int | None = None                        # 启动时动态分配,避免多开抢 2222
@@ -218,6 +227,11 @@ def _vm_spawn_and_login(serial_port: int, vmserver_host_port: int) -> None:
     with log.open("wb") as log_fp:
         _vm_proc = sp.Popen(cmd, creationflags=sp.CREATE_NO_WINDOW,
                             stdout=sp.DEVNULL, stderr=log_fp)
+    # 记下 pid:万一本进程被强杀(atexit 不跑),下次启动靠它把这台孤儿认出来
+    try:
+        _qemu_pid_file(current_session_id()).write_text(str(_vm_proc.pid), encoding="utf-8")
+    except OSError:
+        pass
     time.sleep(1)
     if _vm_proc.poll() is not None and _vm_proc.returncode != 0:
         detail = ""
@@ -278,6 +292,13 @@ def _vm_kickoff() -> None:
     global _vm_thread
     if _vm_thread is not None and _vm_thread.is_alive():
         return
+    # 起自己的 VM 之前先扫掉上次强杀留下的孤儿 —— 它们可能正锁着某个会话的磁盘,
+    # 不先清掉的话那个会话恢复时会撞上"盘被占用"。放在这里而不是 cli 里,
+    # 是为了让任何调用 kickoff 的入口都自动带上这道兜底。
+    try:
+        _vm_cleanup_stale()
+    except Exception:  # noqa: BLE001 - 清扫失败不该挡启动
+        pass
     _vm_thread = threading.Thread(target=_vm_worker, daemon=True)
     _vm_thread.start()
 
@@ -711,6 +732,96 @@ def vm_tunnel_stop(host_port: int | None = None) -> str:
     return "已停止指定转发。" if host_port is not None else "已停止所有转发。"
 
 
+def _pid_is_our_qemu(pid: int) -> bool:
+    """确认这个 pid 现在跑的**确实是我们那个 QEMU**。
+
+    pid 会被系统回收,光凭一个记下来的数字就去杀,有杀错无关进程的风险 ——
+    这里核一下它的可执行文件路径,对不上就不动。
+    """
+    if pid <= 0:
+        return False
+    try:
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        k = ctypes.windll.kernel32
+        handle = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = ctypes.c_uint(1024)
+            if not k.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return False
+            return Path(buf.value).name.lower() == VM_QEMU_SYSTEM.name.lower()
+        finally:
+            k.CloseHandle(handle)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _vm_cleanup_stale() -> int:
+    """启动时清扫上次异常退出留下的孤儿 QEMU,返回清掉的个数。
+
+    为什么需要:QEMU 是普通子进程,Windows 上**父进程死不会连坐**,而被强杀
+    (任务管理器、timeout、崩溃)时 atexit 根本不跑 —— 于是留下孤儿,还锁着
+    某个会话的磁盘(删不掉、/vmreset 失效)。这里兜底清一次。
+
+    **只清"三个条件同时满足"的**,一条不够都不动手:
+      1. 会话目录里记着一个 pid(qemu.pid)—— 只认我们自己写下过的;
+      2. 那个 pid 还活着,但它的**所属 agent 已经不在了** —— 有人正用着就不碰;
+      3. 该 pid 现在跑的确实是我们的 qemu 可执行文件 —— 防 pid 被回收后误杀。
+    绝不按进程名批量杀:那会误伤别的 agent 实例、甚至用户自己的虚拟机。
+    """
+    from ..session import SESSIONS_DIR, _pid_alive   # 延迟导入,避免与 session 成环
+    if not SESSIONS_DIR.exists():
+        return 0
+
+    killed = 0
+    for sid_dir in SESSIONS_DIR.iterdir():
+        if not sid_dir.is_dir():
+            continue
+        pid_file = sid_dir / "qemu.pid"
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip() or 0)
+        except Exception:  # noqa: BLE001
+            continue
+
+        if not _pid_alive(pid):
+            pid_file.unlink(missing_ok=True)          # 进程早已不在,陈迹清掉
+            continue
+
+        # 是本进程此刻正在用的那台?那不能动
+        if _vm_proc is not None and getattr(_vm_proc, "pid", None) == pid:
+            continue
+
+        # 有**别的**活着的 agent 在用这个会话?那这台 QEMU 是它的,别动。
+        # 注意要排除"owner 就是自己"的情形:启动时是先 claim_owner(写下自己的 pid)
+        # 再走到这里的,若不排除,就会把"本会话里上次残留的那台"当成自己的而被放过
+        # —— 实测正是这样漏掉了孤儿。
+        owner_pid = 0
+        try:
+            owner_pid = int(json.loads(
+                (sid_dir / "owner.json").read_text(encoding="utf-8") or "{}").get("pid") or 0)
+        except Exception:  # noqa: BLE001
+            owner_pid = 0
+        if owner_pid and owner_pid != os.getpid() and _pid_alive(owner_pid):
+            continue
+
+        if not _pid_is_our_qemu(pid):
+            pid_file.unlink(missing_ok=True)          # pid 被回收给别人了,只清记录
+            continue
+
+        try:
+            # 按**具体 pid** 杀,不是按进程名批量清 —— 后者会误伤别的实例
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True, timeout=15)
+            killed += 1
+        except Exception:  # noqa: BLE001
+            pass
+        pid_file.unlink(missing_ok=True)
+    return killed
+
+
 def vm_switch_session() -> None:
     """会话切换后重启虚拟机,让它挂到**新会话自己那块盘**上。
 
@@ -762,7 +873,14 @@ def _vm_cleanup() -> None:
     磁盘现在属于会话(见 VM_DISK 的注释),会话恢复时要靠它把虚拟机里的东西带回来,
     所以这里**不能删** —— 想从干净状态重来要显式重置(见 vm_reset)。
     只动本进程的 _vm_proc,不 taskkill /IM,以免误杀其它 agent 或用户自己的 VM。
+
+    **本进程没起过 VM 就直接返回**:这个函数是 atexit 注册的,而注册发生在**导入
+    本模块**时 —— 任何只是 import 了 vm 的短命脚本(巡检、测试、一次性工具),
+    退出时都会跑它,顺手删掉"当前会话"的 qemu.pid 和日志,把别人依赖的孤儿标记
+    抹掉。没起过 VM 就没什么要清的,直接走人。
     """
+    if _vm_proc is None:
+        return
     # 退出前先让 guest 把页缓存刷到虚拟磁盘。磁盘是会话资产、下次要接着用,而 QEMU
     # 是被 kill 的 —— guest 自己内存里还没落盘的写入会随它一起消失(实测:不 sync 时
     # 刚写的文件重启就没了,sync 之后能留下)。best-effort,连不上就算了。
@@ -786,6 +904,11 @@ def _vm_cleanup() -> None:
         pass
     try:
         _vm_log().unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        # 干净退出,把 pid 记录也清掉 —— 留着的话下次启动会把它当孤儿去查
+        _qemu_pid_file(current_session_id()).unlink(missing_ok=True)
     except OSError:
         pass
 

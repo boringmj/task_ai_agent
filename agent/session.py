@@ -339,18 +339,30 @@ def rewrite_session(all_messages: list[dict], sid: str) -> None:
 
 
 def _pid_alive(pid: int) -> bool:
-    """进程是否还活着。Windows 上**不能**用 os.kill(pid, 0) —— 那会真的去杀进程。"""
+    """进程是否**还在运行**。Windows 上**不能**用 os.kill(pid, 0) —— 那会真的去杀进程。
+
+    光看 OpenProcess 成不成功是不够的:进程被终止后,只要还有人握着它的句柄
+    (比如我们自己 Popen 出来的对象没释放),这个 pid 就不会释放、OpenProcess
+    照样成功 —— 于是"已被杀掉的进程"会被误报成活着(实测踩到)。
+    所以再问一次 GetExitCodeProcess:还在跑的话退出码是 STILL_ACTIVE(259)。
+    """
     if pid <= 0:
         return False
     try:
         import ctypes
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
         k = ctypes.windll.kernel32
         handle = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
             return False
-        k.CloseHandle(handle)
-        return True
+        try:
+            code = ctypes.c_ulong()
+            if not k.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True              # 问不出来,保守当它活着
+            return code.value == STILL_ACTIVE
+        finally:
+            k.CloseHandle(handle)
     except Exception:  # noqa: BLE001
         return True          # 查不出来就当它活着,宁可多提醒一次
 
