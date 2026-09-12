@@ -44,6 +44,8 @@ MAX_STEPS = 50
 MAX_ENTRIES = 200
 # 护栏:单次写入的字节上限,防止模型一口气写爆磁盘
 MAX_WRITE_BYTES = 3 * 1024 * 1024
+# 护栏:read_file 单次返回的字符上限。超出会明确提示(不再静默截断),让模型改用行区间读
+MAX_READ_CHARS = 3 * 1024 * 1024
 # 即使在沙箱内,这些文件也禁止读取 —— 纵深防御,防止沙箱里混入密钥文件
 DENY_READ = {".env"}
 
@@ -51,7 +53,7 @@ DENY_READ = {".env"}
 # 搜索很容易命中一大片,和列目录同理:必须设上限,否则把上下文撑爆。
 MAX_FIND_RESULTS = 300         # find_files 最多返回多少条命中
 MAX_GREP_MATCHES = 200         # grep_files 最多返回多少条命中行
-MAX_GREP_FILE_BYTES = 2 * 1024 * 1024  # 单文件超过此大小直接跳过(避免卡在超大/二进制文件上)
+MAX_GREP_FILE_BYTES = 200 * 1024 * 1024  # 单个文件超此大小才跳过(防极端超大文件);超了会在结果里说明,不静默跳过
 MAX_GREP_LINE_CHARS = 200      # 每条命中行的内容字符上限
 # 递归搜索时剪掉的目录:隐藏目录(.git/.trash/.agent/.venv…)与常见的依赖/缓存目录
 SEARCH_SKIP_DIRS = {"__pycache__", "node_modules", ".pylibs"}
@@ -200,6 +202,25 @@ def get_current_time() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _sniff_encoding(target: Path) -> str:
+    """探测一个已存在文件的编码(读头部样本;UTF-16 看 BOM)。"""
+    with target.open("rb") as fh:
+        head = fh.read(65536)
+    if head[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return "utf-16"
+    return _detect_text_encoding(head) if head else "utf-8"
+
+
+def _read_text_with_encoding(target: Path) -> tuple[str, str]:
+    """按探测到的编码读出文本,返回 (文本, 编码名)。
+
+    GBK/GB18030 等中文编码的文件也能读。读时用 errors='replace':万一探测不准,
+    也只是个别字符变乱码,不会整个读失败。(写回要用同一个编码,见 _save_lines / append_file。)
+    """
+    enc = _sniff_encoding(target)
+    return target.read_text(encoding=enc, errors="replace"), enc
+
+
 def read_file(path: str, with_line_numbers: bool = False,
               start_line: int | None = None, end_line: int | None = None) -> str:
     """读取工作区里的文本文件。可只读某个行区间(1 起始,含两端)。
@@ -210,7 +231,7 @@ def read_file(path: str, with_line_numbers: bool = False,
     target = safe_path(path)
     if target.name in DENY_READ:
         raise PermissionError(f"{target.name} 属于敏感文件,禁止读取")
-    text = target.read_text(encoding="utf-8")[:3*1024*1024]
+    text, _enc = _read_text_with_encoding(target)
     lines = text.splitlines()
     total = len(lines)
 
@@ -230,6 +251,11 @@ def read_file(path: str, with_line_numbers: bool = False,
         body = "\n".join(f"{i:>4} | {line}" for i, line in enumerate(selected, lo))
     else:
         body = "\n".join(selected)
+    if len(body) > MAX_READ_CHARS:
+        body = body[:MAX_READ_CHARS] + (
+            f"\n\n…(内容过长,只返回前 {MAX_READ_CHARS} 个字符;"
+            f"请用 start_line/end_line 分段读)"
+        )
     if (lo, hi) != (1, total):
         body += f"\n\n…(本次为第 {lo}-{hi} 行,文件共 {total} 行)"
     return body
@@ -313,10 +339,22 @@ def find_files(name: str, path: str = ".", include_dirs: bool = False) -> str:
     return "\n".join([f"匹配「{name}」共 {len(hits)} 条:", *lines]) + tail
 
 
+def _detect_text_encoding(sample: bytes) -> str:
+    """猜文本编码:优先 utf-8,其次中文常见的 gb18030/big5;都不行就按 utf-8 尽力解。"""
+    for enc in ("utf-8", "gb18030", "big5"):
+        try:
+            sample.decode(enc)
+            return enc
+        except UnicodeDecodeError:
+            continue
+    return "utf-8"
+
+
 def grep_files(pattern: str, path: str = ".", ignore_case: bool = False) -> str:
     """按内容搜索工作区里的文本文件(正则),返回命中的文件、行号与行内容。
 
-    只搜文本文件(二进制/无法按 UTF-8 解码的自动跳过),自动跳过隐藏目录与依赖目录。
+    逐行流式读取 —— 整本书、长日志这种大文件也照搜。按 utf-8 / gb18030 / big5 试解码,
+    所以 GBK 编码的中文文件也能搜到。自动跳过隐藏目录与依赖目录,二进制文件(含空字节)跳过。
     结果上限 MAX_GREP_MATCHES 条,超出会提示截断。path 可以是文件或目录。
     """
     try:
@@ -331,33 +369,45 @@ def grep_files(pattern: str, path: str = ".", ignore_case: bool = False) -> str:
     results: list[tuple[Path, int, str]] = []
     files_hit: set[Path] = set()
     truncated = False
+    too_big = 0  # 超过大小的文件数 —— 如实报出来,绝不静默跳过
     for fp in targets:
         if fp.name in DENY_READ:
             continue
         try:
             if fp.stat().st_size > MAX_GREP_FILE_BYTES:
+                too_big += 1
                 continue
-            raw = fp.read_bytes()
+            with fp.open("rb") as fh:
+                head = fh.read(65536)
         except OSError:
             continue
-        if b"\x00" in raw[:8000]:  # 含空字节 → 视为二进制,跳过
+        if not head:
             continue
+        if head[:2] in (b"\xff\xfe", b"\xfe\xff"):   # UTF-16 BOM
+            enc = "utf-16"
+        elif b"\x00" in head[:8192]:                 # 含空字节 → 视为二进制,跳过
+            continue
+        else:
+            enc = _detect_text_encoding(head)
         try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
+            with fp.open("r", encoding=enc, errors="replace") as fh:
+                for i, line in enumerate(fh, 1):
+                    if rx.search(line):
+                        results.append((fp, i, line.strip()[:MAX_GREP_LINE_CHARS]))
+                        files_hit.add(fp)
+                        if len(results) >= MAX_GREP_MATCHES:
+                            truncated = True
+                            break
+        except OSError:
             continue
-        for i, line in enumerate(text.splitlines(), 1):
-            if rx.search(line):
-                results.append((fp, i, line.strip()[:MAX_GREP_LINE_CHARS]))
-                files_hit.add(fp)
-                if len(results) >= MAX_GREP_MATCHES:
-                    truncated = True
-                    break
         if truncated:
             break
 
+    skip_note = ""
+    if too_big:
+        skip_note = f";另有 {too_big} 个文件超过 {MAX_GREP_FILE_BYTES // (1024 * 1024)}MB 未搜"
     if not results:
-        return f"没有匹配「{pattern}」的内容(搜索范围:{_rel(root)})"
+        return f"没有匹配「{pattern}」的内容(搜索范围:{_rel(root)})" + skip_note
     out: list[str] = []
     last: Path | None = None
     for fp, ln, txt in results:
@@ -368,7 +418,7 @@ def grep_files(pattern: str, path: str = ".", ignore_case: bool = False) -> str:
     summary = f"共 {len(results)} 处命中,{len(files_hit)} 个文件"
     if truncated:
         summary += f"(已达上限 {MAX_GREP_MATCHES},后续未继续)"
-    return summary + "\n" + "\n".join(out)
+    return summary + skip_note + "\n" + "\n".join(out)
 
 
 def _check_writable(target: Path, content: str) -> int:
@@ -403,26 +453,33 @@ def append_file(path: str, content: str) -> str:
     size = _check_writable(target, content)
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8") as fp:
+    # 追加要沿用原文件编码:否则会给 GBK 文件塞进 UTF-8 字节,把文件编码搞坏
+    enc = _sniff_encoding(target) if target.is_file() else "utf-8"
+    with target.open("a", encoding=enc) as fp:
         fp.write(content)
     return f"已向 {target} 追加 {size} 字节(当前共 {target.stat().st_size} 字节)"
 
 
-def _load_lines(path: str) -> tuple[Path, list[str]]:
-    """按行读出文件,保留行尾换行符,供按行编辑的工具复用。"""
+def _load_lines(path: str) -> tuple[Path, list[str], str]:
+    """按行读出文件,保留行尾换行符,供按行编辑的工具复用。返回 (路径, 行, 原编码)。"""
     target = safe_path(path)
     if target.name in DENY_READ:
         raise PermissionError(f"{target.name} 属于敏感文件,禁止编辑")
     if not target.is_file():
         raise FileNotFoundError(f"{target} 不存在;要新建文件请用 write_file")
-    return target, target.read_text(encoding="utf-8").splitlines(keepends=True)
+    text, enc = _read_text_with_encoding(target)
+    return target, text.splitlines(keepends=True), enc
 
 
-def _save_lines(target: Path, lines: list[str], summary: str, center: int) -> str:
-    """写回并返回改动摘要 + 附近几行,让模型能自己确认改对没有。"""
+def _save_lines(target: Path, lines: list[str], summary: str, center: int,
+                encoding: str = "utf-8") -> str:
+    """写回并返回改动摘要 + 附近几行,让模型能自己确认改对没有。
+
+    用文件**原来的编码**写回(不是一律 UTF-8),否则编辑一个 GBK 文件会把它悄悄转码。
+    """
     text = "".join(lines)
     _check_writable(target, text)
-    target.write_text(text, encoding="utf-8")
+    target.write_text(text, encoding=encoding)
 
     lo, hi = max(1, center - 3), min(len(lines), center + 3)
     preview = "\n".join(f"{i:>4} | {lines[i - 1].rstrip(chr(10))}" for i in range(lo, hi + 1))
@@ -436,7 +493,7 @@ def _terminate(line: str) -> str:
 
 
 def edit_lines(path: str, start_line: int, end_line: int, content: str = "") -> str:
-    target, lines = _load_lines(path)
+    target, lines, enc = _load_lines(path)
     total = len(lines)
     if not 1 <= start_line <= total or not start_line <= end_line <= total:
         raise ValueError(
@@ -452,11 +509,11 @@ def edit_lines(path: str, start_line: int, end_line: int, content: str = "") -> 
     updated = lines[:start_line - 1] + new + lines[end_line:]
     verb = "删除" if not new else "替换"
     summary = f"已{verb}第 {start_line}-{end_line} 行({replaced} 行 → {len(new)} 行)"
-    return _save_lines(target, updated, summary, start_line)
+    return _save_lines(target, updated, summary, start_line, enc)
 
 
 def insert_lines(path: str, after_line: int, content: str) -> str:
-    target, lines = _load_lines(path)
+    target, lines, enc = _load_lines(path)
     total = len(lines)
     if not 0 <= after_line <= total:
         raise ValueError(
@@ -471,7 +528,7 @@ def insert_lines(path: str, after_line: int, content: str) -> str:
 
     updated = lines[:after_line] + new + lines[after_line:]
     summary = f"已在第 {after_line} 行之后插入 {len(new)} 行"
-    return _save_lines(target, updated, summary, after_line + 1)
+    return _save_lines(target, updated, summary, after_line + 1, enc)
 
 
 def move_file(source: str, destination: str, overwrite: bool = False) -> str:
@@ -2523,7 +2580,8 @@ TOOLS = [
         "function": {
             "name": "read_file",
             "description": (
-                "读取一个文本文件的内容(最多返回前 3145728 个字符)。只能读取工作区内的文件。"
+                "读取一个文本文件的内容(单次最多返回 3145728 个字符,超出会明确提示截断)。"
+                "会自动识别编码,GBK 等中文编码的文件也能读。只能读取工作区内的文件。"
                 "用 start_line/end_line 可只读某个行区间 —— grep_files 命中某行后想看附近上下文,就用它读那几行,"
                 "不必把整个大文件读进来。准备用 edit_lines 或 insert_lines 按行修改文件前,"
                 "先带 with_line_numbers=true 读一遍(或读目标区间)确认行号。"
