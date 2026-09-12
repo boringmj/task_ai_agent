@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import uuid
+from datetime import datetime
 
 from ..core import (
     ROOT,
@@ -49,21 +50,44 @@ def _docker_health() -> tuple[bool, str]:
     return True, f"Docker 就绪(server {r.stdout.strip()})"
 
 
+# 残留清理只动"够老"的容器:容器内 timeout 到 CONTAINER_CMD_TIMEOUT 就自我了断,
+# 比它两倍还老还没死的,必然是崩溃残留。按创建时间判断而不是无脑按名字前缀清 ——
+# 否则多开 agent 时,后启动的实例会把前一个实例正在跑的容器一起杀掉。
+CONTAINER_STALE_AFTER = CONTAINER_CMD_TIMEOUT * 2
+
+
 def _docker_cleanup_stale() -> int:
     """清理上次会话残留的 agent-exec-* 容器。
 
     agent 进程一旦崩溃,容器内的 timeout 仍会在 CONTAINER_CMD_TIMEOUT 后自我了断,
-    但若崩溃发生在容器运行中、或 timeout 因故没生效,容器可能残留。启动时兜底清一把。
+    但若崩溃发生在运行中、或 timeout 因故没生效,容器可能残留。启动时兜底清一把。
+    只清"创建超过 CONTAINER_STALE_AFTER 秒"的,避免误杀其它 agent 实例正在跑的容器。
     返回清掉的容器数量。
     """
     try:
         r = subprocess.run(
-            ["docker", "ps", "-a", "--filter", "name=agent-exec-", "--format", "{{.ID}}"],
+            ["docker", "ps", "-a", "--filter", "name=agent-exec-",
+             "--format", "{{.ID}}\t{{.CreatedAt}}"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
         )
     except Exception:  # noqa: BLE001
         return 0
-    ids = [x for x in r.stdout.split() if x]
+
+    now = datetime.now().astimezone()
+    ids = []
+    for line in r.stdout.splitlines():
+        cid, _, created = line.partition("\t")
+        cid = cid.strip()
+        if not cid:
+            continue
+        try:
+            # Docker 给的是 "2026-09-13 01:41:37 +0800 CST",取到 %z 为止即可
+            born = datetime.strptime(created.strip()[:25], "%Y-%m-%d %H:%M:%S %z")
+        except ValueError:
+            continue                     # 时间解析不出就保守跳过,宁可不删也不误杀
+        if (now - born).total_seconds() >= CONTAINER_STALE_AFTER:
+            ids.append(cid)
+
     for cid in ids:
         subprocess.run(["docker", "rm", "-f", cid], capture_output=True, timeout=15)
     return len(ids)

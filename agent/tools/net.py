@@ -6,6 +6,7 @@ import html as html_lib
 import httpx
 import os
 import re
+from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 from ..core import (
@@ -172,61 +173,72 @@ def download(url: str, dest: str = "", overwrite: bool = False) -> str:
     与 fetch_url 的区别:fetch_url 读进内存、把内容交回给上下文;download 流式
     写进工作区某个文件,只返回确认信息。复用同一套 SSRF 防护和逐跳校验。
     """
-    # 先定目标路径:给了 dest 就在工作区内解析;没给就从 URL 最后一段取名
-    if dest:
-        target = safe_path(dest)
-    else:
-        # 从最终 URL 的路径取出文件名,去掉 query/fragment
-        name = os.path.basename(urlparse(url).path.rstrip("/")) or "download.bin"
-        target = safe_path(name)
-
-    if target.exists() and not overwrite:
+    # 给了 dest 就先定死目标;没给则等拿到**最终 URL** 后再取名(重定向后才是真文件名)
+    target = safe_path(dest) if dest else None
+    if target is not None and target.exists() and not overwrite:
         return (
             f"{target.name} 已存在({target.stat().st_size} 字节)。"
             f"确认要覆盖就带 overwrite=true 重新调用,否则换个目标名。"
         )
-    target.parent.mkdir(parents=True, exist_ok=True)
 
     hops: list[str] = []
     final_url = url
     status = 0
+    written = 0
+    tmp: Path | None = None
 
-    with httpx.Client(
-        follow_redirects=False,
-        timeout=NET_FETCH_TIMEOUT,
-        headers={"User-Agent": NET_USER_AGENT},
-    ) as client:
-        for _ in range(NET_MAX_REDIRECTS + 1):
-            _assert_public_url(url)  # 每一跳都校验,跳回内网会被拦
-            with client.stream("GET", url) as resp:
-                if resp.is_redirect:
-                    location = resp.headers.get("location", "")
-                    if not location:
-                        raise ConnectionError(f"HTTP {resp.status_code} 要求跳转但没给 Location")
-                    url = urljoin(url, location)
-                    hops.append(url)
-                    continue
+    try:
+        with httpx.Client(
+            follow_redirects=False,
+            timeout=NET_FETCH_TIMEOUT,
+            headers={"User-Agent": NET_USER_AGENT},
+        ) as client:
+            for _ in range(NET_MAX_REDIRECTS + 1):
+                _assert_public_url(url)  # 每一跳都校验,跳回内网会被拦
+                with client.stream("GET", url) as resp:
+                    if resp.is_redirect:
+                        location = resp.headers.get("location", "")
+                        if not location:
+                            raise ConnectionError(f"HTTP {resp.status_code} 要求跳转但没给 Location")
+                        url = urljoin(url, location)
+                        hops.append(url)
+                        continue
 
-                status = resp.status_code
-                final_url = str(resp.url)
-                written = 0
-                with target.open("wb") as fp:
-                    for chunk in resp.iter_bytes():
-                        written += len(chunk)
-                        if written > NET_DOWNLOAD_MAX_BYTES:
-                            raise ValueError(
-                                f"超过下载上限 {NET_DOWNLOAD_MAX_BYTES} 字节,已中止(未保留不完整文件)。"
+                    status = resp.status_code
+                    final_url = str(resp.url)
+                    if status != 200:
+                        # 失败就地返回:一个字节都不写,用户原有文件毫发无损
+                        return f"下载失败:HTTP {status} {final_url}"
+
+                    if target is None:  # 按最终 URL 取名,去掉 query/fragment
+                        name = os.path.basename(urlparse(final_url).path.rstrip("/")) or "download.bin"
+                        target = safe_path(name)
+                        if target.exists() and not overwrite:
+                            return (
+                                f"{target.name} 已存在({target.stat().st_size} 字节)。"
+                                f"确认要覆盖就带 overwrite=true 重新调用,否则换个目标名。"
                             )
-                        fp.write(chunk)
-                break
-        else:
-            raise ConnectionError(f"跳转超过 {NET_MAX_REDIRECTS} 次,已放弃:{' -> '.join(hops)}")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    # 先写临时文件:超限/中途失败都只留残骸在 .part 里,绝不碰目标文件
+                    tmp = target.with_name(target.name + ".part")
+                    with tmp.open("wb") as fp:
+                        for chunk in resp.iter_bytes():
+                            written += len(chunk)
+                            if written > NET_DOWNLOAD_MAX_BYTES:
+                                raise ValueError(
+                                    f"超过下载上限 {NET_DOWNLOAD_MAX_BYTES} 字节,已中止"
+                                    f"(目标文件未改动,临时文件已清理)。"
+                                )
+                            fp.write(chunk)
+                    break
+            else:
+                raise ConnectionError(f"跳转超过 {NET_MAX_REDIRECTS} 次,已放弃:{' -> '.join(hops)}")
 
-    if status != 200:
-        # 非 200 一律不留残缺文件(即使是空文件)
-        if target.exists():
-            target.unlink()
-        return f"下载失败:HTTP {status} {final_url}"
+        os.replace(tmp, target)  # 原子替换 —— 这才是真正的"覆盖":要么全成,要么原样
+        tmp = None
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)  # 无论怎么失败,临时文件都不留
 
     note = f"经过 {len(hops)} 次跳转" if hops else "直接"
     return f"已下载到 {target}({written} 字节,{note})"
