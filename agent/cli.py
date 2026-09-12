@@ -13,11 +13,12 @@ from .core import (
     TRASH_MAX_AGE_DAYS,
     console,
 )
-from .llm import usage_detail, usage_line
-from .loop import compact, load_system_prompt, run
+from .commands import Context as CommandContext
+from .commands import all_commands, dispatch as dispatch_command
+from .llm import usage_line
+from .loop import load_system_prompt, run
 from .session import (
     claim_owner,
-    clear_session,
     load_session,
     release_owner,
     rewrite_session,
@@ -189,8 +190,9 @@ def main() -> None:
     console.print("Agent 已启动。", style="bold")
     console.print("输入多行:连续输入,最后一个空行提交(支持粘贴)。", style="dim")
     console.print("执行中 Ctrl+C=取消本轮;空闲时 Ctrl+C=退出;exit 退出。", style="dim")
-    console.print(f"/compact 压缩上下文(省 token);/tokens 看用量;/new 开新会话;占用达 "
-                  f"{AUTO_COMPACT_RATIO:.0%} 会自动压缩。", style="dim")
+    console.print("指令:" + "、".join(n for n, _, _ in all_commands())
+                  + f"(敲 /help 看说明);上下文占用达 {AUTO_COMPACT_RATIO:.0%} 会自动压缩。",
+                  style="dim")
     console.print(f"工作区:{ROOT}", style="dim")
     console.print(f"会话:{resume_note}", style="dim")
     if conflict:
@@ -209,21 +211,12 @@ def main() -> None:
                 continue
             if text in {"exit", "quit"}:
                 break
-            if text == "/compact":
-                console.print(compact(messages), style="dim")
-                rewrite_session(messages)   # 历史被换掉了,磁盘上同步成压缩后的样子
-                continue
-            if text == "/tokens":
-                console.print(usage_detail(), style="dim")
-                continue
-            if text == "/new":
-                # 开新会话:只保留 system(提示词与长期记忆),其余清掉
-                kept = 0
-                while kept < len(messages) and messages[kept].get("role") == "system":
-                    kept += 1
-                del messages[kept:]
-                clear_session()
-                console.print("已开新会话,之前的对话不再带入。", style="dim")
+            # 终端指令(/compact、/reset、/tokens…)。注册在 agent/commands/ 里,
+            # 系统提示词中那段说明也由同一份注册表生成,不用两头各维护一遍。
+            cmd_result = dispatch_command(text, CommandContext(messages))
+            if cmd_result is not None:
+                if cmd_result:
+                    console.print(cmd_result, style="dim")
                 continue
 
             # 快照这一轮开始前的整份历史。存"内容"而不是长度 —— 本轮里可能发生
