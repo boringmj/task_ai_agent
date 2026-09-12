@@ -200,14 +200,39 @@ def get_current_time() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def read_file(path: str, with_line_numbers: bool = False) -> str:
+def read_file(path: str, with_line_numbers: bool = False,
+              start_line: int | None = None, end_line: int | None = None) -> str:
+    """读取工作区里的文本文件。可只读某个行区间(1 起始,含两端)。
+
+    给 start_line/end_line 就只返回那几行 —— grep_files 命中某行后想看附近上下文时用它,
+    不必整份读进来。带行号时,行号始终是**文件里的真实行号**,可直接喂给 edit_lines。
+    """
     target = safe_path(path)
     if target.name in DENY_READ:
         raise PermissionError(f"{target.name} 属于敏感文件,禁止读取")
     text = target.read_text(encoding="utf-8")[:3*1024*1024]
-    if not with_line_numbers:
-        return text
-    return "\n".join(f"{i:>4} | {line}" for i, line in enumerate(text.splitlines(), 1))
+    lines = text.splitlines()
+    total = len(lines)
+
+    if start_line is None and end_line is None:
+        lo, hi = 1, total
+    else:
+        if total == 0:
+            return "(文件是空的)"
+        lo = max(1, int(start_line or 1))
+        hi = min(total, int(end_line or total))
+        if lo > hi:
+            return (f"错误:行区间无效(start_line={start_line}, end_line={end_line},"
+                    f"文件共 {total} 行)")
+
+    selected = lines[lo - 1:hi]
+    if with_line_numbers:
+        body = "\n".join(f"{i:>4} | {line}" for i, line in enumerate(selected, lo))
+    else:
+        body = "\n".join(selected)
+    if (lo, hi) != (1, total):
+        body += f"\n\n…(本次为第 {lo}-{hi} 行,文件共 {total} 行)"
+    return body
 
 
 def get_current_directory() -> str:
@@ -2480,7 +2505,9 @@ TOOLS = [
             "name": "read_file",
             "description": (
                 "读取一个文本文件的内容(最多返回前 3145728 个字符)。只能读取工作区内的文件。"
-                "准备用 edit_lines 或 insert_lines 按行修改文件前,先带 with_line_numbers=true 读一遍确认行号。"
+                "用 start_line/end_line 可只读某个行区间 —— grep_files 命中某行后想看附近上下文,就用它读那几行,"
+                "不必把整个大文件读进来。准备用 edit_lines 或 insert_lines 按行修改文件前,"
+                "先带 with_line_numbers=true 读一遍(或读目标区间)确认行号。"
             ),
             "parameters": {
                 "type": "object",
@@ -2492,6 +2519,14 @@ TOOLS = [
                     "with_line_numbers": {
                         "type": "boolean",
                         "description": "是否在每行前面加上行号,默认 false。按行编辑前应设为 true",
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "起始行号(1 起始,含该行)。配合 end_line 只看某段;不填则从头",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "结束行号(含该行)。不填则读到末尾。带行号读区间时,行号仍是文件真实行号",
                     },
                 },
                 "required": ["path"],
