@@ -253,8 +253,6 @@ def main() -> None:
             text = user_input.rstrip()  # 去掉粘贴时多带的结尾空行,保留行内缩进
             if not text.strip():
                 continue
-            if text in {"exit", "quit"}:
-                break
             # 终端指令(/compact、/reset、/tokens…)。注册在 agent/commands/ 里,
             # 系统提示词中那段说明也由同一份注册表生成,不用两头各维护一遍。
             cmd_ctx = CommandContext(messages)
@@ -266,6 +264,8 @@ def main() -> None:
                     cmd_result += session_reset_hint()
                 if cmd_result:
                     console.print(cmd_result, style="dim")
+                if "exit" in cmd_ctx.events:      # /exit、/quit —— 收尾动作由这层做
+                    break
                 continue
 
             # 快照这一轮开始前的整份历史。存"内容"而不是长度 —— 本轮里可能发生
