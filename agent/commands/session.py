@@ -42,7 +42,7 @@ def cmd_sessions(ctx: Context) -> str:
         if s["id"] == active:
             state = "← 当前"
         elif s["busy"]:
-            state = "⚠ 被另一个 agent 占用,切不过去"
+            state = "! 被另一个 agent 占用,切不过去"
         elif s["missing"]:
             state = "(目录已丢失)"
         else:
@@ -74,7 +74,7 @@ def cmd_switch(ctx: Context) -> str:
             if s["active"]:
                 state = "← 当前"
             elif s["busy"]:
-                state = "⚠ 被另一个 agent 占用,切不过去"
+                state = "! 被另一个 agent 占用,切不过去"
             elif s["missing"]:
                 state = "(目录已丢失)"
             else:

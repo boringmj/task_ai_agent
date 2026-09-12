@@ -94,7 +94,7 @@ def run(user_input: str, messages: list[dict]) -> str:
             # 更不能让这一步之后的历史缺 tool 结果 —— 那会直接让下一次请求 400。
             try:
                 console.print(
-                    f"• {fname}({fargs})",
+                    f"· {fname}({fargs})",
                     style="dim",
                     markup=False,
                     highlight=False,

@@ -97,7 +97,7 @@ def _replay_history(history: list[dict]) -> None:
             shown, hidden = _clip(fn.get("arguments") or "", SESSION_RESUME_CHARS)
             # 提示放在右括号**外面**,否则读起来像 `…未显示))`
             tail = f"    (参数还有 {hidden} 字未显示)" if hidden else ""
-            console.print(f"• {fn.get('name', '?')}({shown}){tail}",
+            console.print(f"· {fn.get('name', '?')}({shown}){tail}",
                           style="dim", markup=False, highlight=False)
         if text:
             console.print("AI >", style="bold green")
@@ -230,7 +230,7 @@ def main() -> None:
         n = _docker_cleanup_stale()
         if n:
             console.print(f"已清理 {n} 个上次残留的容器", style="dim")
-    console.print(f"Docker:{'✅ ' if ok else '⚠ 不可用 —— '}{msg}", style="dim" if ok else "yellow")
+    console.print(f"Docker:{msg if ok else '! 不可用 —— ' + msg}", style="dim" if ok else "yellow")
     # 后台拉起虚拟机(非阻断,失败仅提示,agent 照常启动)
     try:
         _vm_kickoff()  # 后台线程启动/配置虚拟机,不阻塞
