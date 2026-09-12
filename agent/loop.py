@@ -118,14 +118,14 @@ def run(user_input: str, messages: list[dict]) -> str:
 def load_system_prompt() -> str:
     """从 system_prompt.md 读取系统提示词。改提示词只需要编辑那个文件。
 
-    会把占位符替换成代码里的实际值,免得提示词和代码对不上:
-    - `{max_steps}`   → MAX_STEPS
-    - `{commands}`    → agent/commands/ 里注册的终端指令清单(加指令不用再改提示词)
+    会把 `{max_steps}` 之类的占位符替换成代码里的实际值,免得提示词和常量对不上。
+
+    注意:**终端指令清单不在这里**。它由 commands.system_message() 单独生成成
+    另一条 system 消息(见 cli.main)—— 那份清单是程序自动生成的"数据",
+    不该混进系统提示词正文,免得其中的描述被当成系统指令照做。
     """
     try:
         text = PROMPT_FILE.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         raise SystemExit(f"找不到系统提示词文件:{PROMPT_FILE}") from None
-    from .commands import prompt_section      # 延迟导入:commands 里可能反向用到 loop
-    return (text.replace("{max_steps}", str(MAX_STEPS))
-                .replace("{commands}", prompt_section()))
+    return text.replace("{max_steps}", str(MAX_STEPS))

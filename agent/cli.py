@@ -15,6 +15,7 @@ from .core import (
 )
 from .commands import Context as CommandContext
 from .commands import all_commands, dispatch as dispatch_command
+from .commands import system_message as commands_system_message
 from .llm import usage_line
 from .loop import load_system_prompt, run
 from .session import (
@@ -166,6 +167,9 @@ def main() -> None:
                 "content": f"以下是跨会话保留的长期记忆,和你的对话无关,仅供参考:\n{memory}",
             }
         )
+    # 终端指令清单单独成一条 system 消息,而不是并进主提示词 —— 它是程序自动生成的
+    # "数据",里面写明信任边界,免得描述文字被当成系统指令(详见 commands.system_message)
+    messages.append({"role": "system", "content": commands_system_message()})
     # 会话恢复要赶在别的事情前面:先登记占用者(发现别的实例仍在用就提醒),
     # 再把上次的对话读回来接在最新的 system 消息之后。
     conflict = claim_owner()
