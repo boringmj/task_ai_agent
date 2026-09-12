@@ -7,10 +7,10 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from .trash import _is_system_dir
 from ..core import (
     MAX_WRITE_BYTES,
     ROOT,
+    _is_system_dir,
     safe_path,
     _rel,
 )

@@ -13,13 +13,14 @@ from ..core import (
     GIT_DIR,
     MEMORY_FILE,
     ROOT,
+    TRASH_DIR,
+    _is_system_dir,
     safe_path,
 )
 
 
 # ---- trash 工具专属配置(环境变量名不变,仍可在 .env 覆盖)----
 # 回收站:删除的文件移到这里,不做真删除,超过 MAX_AGE_DAYS 天后启动时自动清空
-TRASH_DIR = ROOT / ".trash"
 TRASH_DIR.mkdir(exist_ok=True)  # 回收站目录由本模块自己保证存在
 TRASH_INDEX_FILE = TRASH_DIR / "index.json"  # 记录 回收站文件名 -> 原路径,支撑还原
 
@@ -46,6 +47,13 @@ def delete_file(path: str) -> str:
         raise IsADirectoryError(f"{target} 是目录,本工具只删除单个文件")
     if TRASH_DIR == target.parent:
         raise PermissionError("该文件已在回收站中,不能重复删除")
+    # 系统目录里的**文件**同样不能挪走 —— 否则 .git/config、.agent/memory.md
+    # 会被"软删"进回收站,仓库和长期记忆当场失效。delete_dir / move_file 都挡了,
+    # 这里之前是漏的。
+    if _is_system_dir(target):
+        raise PermissionError(
+            f"{target} 在 agent 的系统目录(.trash/.git/.agent/clones)内,不允许删除。"
+        )
 
     # 软删除:移进回收站而不是真删,给用户留后悔的余地
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -58,21 +66,6 @@ def delete_file(path: str) -> str:
     target.rename(dest)
     _trash_record(dest, target)  # 记下原路径,否则没法还原到原位置
     return f"已把 {target.name} 移入回收站:{dest}(可用 restore_file 还原)"
-
-
-# agent 赖以运作、绝不能删/挪的目录。比"只在递归时检查"严格 —— 任何时候都不许碰
-PROTECTED_DIRS = (ROOT, TRASH_DIR, GIT_DIR, MEMORY_FILE.parent, CLONES_DIR)
-
-
-def _is_system_dir(path: Path) -> bool:
-    """判断一个路径是否是(或位于)agent 的系统目录内。
-
-    注意不能拿 is_relative_to(ROOT) 来判 —— 工作区里每个普通文件都在 ROOT 下,
-    那样会误挡。所以 ROOT 单独用相等判断,其余系统目录用"等于或位于其内"判断。
-    """
-    if path == ROOT:
-        return True
-    return any(path == p or path.is_relative_to(p) for p in PROTECTED_DIRS if p != ROOT)
 
 
 def _trash_dest(name: str) -> Path:

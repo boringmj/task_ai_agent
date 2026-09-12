@@ -64,6 +64,9 @@ def _resolve_workspace() -> Path:
 ROOT = _resolve_workspace()
 TRASH_MAX_AGE_DAYS = int(os.environ.get("TRASH_MAX_AGE_DAYS", "7"))
 
+# 回收站:删除的内容移到这里,不做真删除。目录本身由 trash 工具确保存在
+TRASH_DIR = ROOT / ".trash"
+
 # 长期记忆:agent 在这个文件里记录跨会话保留的关键事实,启动时注入系统提示词
 # 放在 .agent/ 隐藏目录,避免出现在用户的日常浏览里(list_files 默认过滤点开头项)
 MEMORY_FILE = ROOT / ".agent" / "memory.md"
@@ -74,6 +77,22 @@ GIT_DIR = ROOT / ".git"
 # 克隆进来的外部仓库统一放这里,每个自成一体,不干扰 workspace 根仓库的自管版本
 CLONES_DIR = ROOT / "clones"
 CLONES_DIR.mkdir(exist_ok=True)
+
+# agent 赖以运作、绝不能删/挪的目录。比"只在递归时检查"严格 —— 任何时候都不许碰。
+# 放在这里(而不是 trash 工具里)是因为 fs 的 move_file 和 trash 的删除类工具都要用,
+# 让工具之间互相 import 会成环(core 谁都不依赖,是唯一安全的公共落点)。
+PROTECTED_DIRS = (ROOT, TRASH_DIR, GIT_DIR, MEMORY_FILE.parent, CLONES_DIR)
+
+
+def _is_system_dir(path: Path) -> bool:
+    """判断一个路径是否是(或位于)agent 的系统目录内。
+
+    注意不能拿 is_relative_to(ROOT) 来判 —— 工作区里每个普通文件都在 ROOT 下,
+    那样会误挡。所以 ROOT 单独用相等判断,其余系统目录用"等于或位于其内"判断。
+    """
+    if path == ROOT:
+        return True
+    return any(path == p or path.is_relative_to(p) for p in PROTECTED_DIRS if p != ROOT)
 
 
 
