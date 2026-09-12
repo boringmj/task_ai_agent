@@ -11,6 +11,7 @@ from datetime import datetime
 
 from ..core import (
     ROOT,
+    clip_text,
 )
 
 
@@ -146,8 +147,8 @@ def _docker_run(inner: list[str]) -> str:
     # 失败才带上 stderr(真正的报错)。
     if r.returncode != 0:
         body = err or out
-        return f"执行失败(exit {r.returncode}):\n{(body[:CONTAINER_OUTPUT_MAX] or '(无输出)')}"
-    return (out[:CONTAINER_OUTPUT_MAX] if out else "(容器无输出)")
+        return f"执行失败(exit {r.returncode}):\n{(clip_text(body, CONTAINER_OUTPUT_MAX) or '(无输出)')}"
+    return (clip_text(out, CONTAINER_OUTPUT_MAX) if out else "(容器无输出)")
 
 
 @tool(

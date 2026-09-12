@@ -17,6 +17,7 @@ from pathlib import Path
 from ..session import current_session_id, session_dir
 from ..core import (
     PROJECT_DIR,
+    clip_text,
     safe_path,
 )
 
@@ -337,7 +338,7 @@ def vm_run(command: str) -> str:
         return f"vmserver 错误:{resp.get('error', 'unknown')}"
     out = resp.get("output", "")
     timed = resp.get("timed_out", False)
-    return (out[:10000] if out else "(无输出)") + ("\n[命令超时,已中断]" if timed else "")
+    return (clip_text(out, 10000) if out else "(无输出)") + ("\n[命令超时,已中断]" if timed else "")
 
 
 def _shq(s: str) -> str:
@@ -526,7 +527,7 @@ def vm_fetch(guest_url: str) -> str:
     status = data.split(b"\r\n", 1)[0].decode("utf-8", "replace")
     sep = data.find(b"\r\n\r\n")
     body = data[sep + 4:].decode("utf-8", "replace") if sep >= 0 else ""
-    return f"{status}\n--- body ---\n{body[:8000]}"
+    return f"{status}\n--- body ---\n{clip_text(body, 8000)}"
 
 
 @tool(
@@ -583,7 +584,7 @@ def vm_tcp(host: str, port: int, data: str) -> str:
     try:
         text = reply.decode("utf-8")
         if all(ord(ch) >= 32 or ch in "\r\n\t" for ch in text):
-            return text[:10000]
+            return clip_text(text, 10000)
         raise ValueError
     except Exception:
         return f"(二进制 {len(reply)} 字节,前 200 字节 hex: {reply[:200].hex()})"

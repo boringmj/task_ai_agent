@@ -32,12 +32,17 @@ from .tools.trash import purge_trash
 from .tools.vm import _vm_kickoff, _vm_state_get, vm_status
 
 
-def _clip(text: str, limit: int) -> str:
-    """把一段文本压成单行:折叠所有空白,超长则截断。limit<=0 表示不截断。"""
+def _clip(text: str, limit: int) -> tuple[str, int]:
+    """把一段文本压成单行并截断,返回 (要显示的文本, 被藏起来的字数)。
+
+    把"藏了多少"单独返回而不是拼进文本里 —— 调用方要把它放在合适的位置
+    (比如工具参数那行要塞在右括号**外面**,不然会变成 `…未显示))`)。
+    截断时务必把这个数报出去:光留一个省略号,读的人会以为原文就到这儿。
+    """
     one = " ".join(text.split())
     if limit <= 0 or len(one) <= limit:
-        return one
-    return one[:limit] + "…"
+        return one, 0
+    return one[:limit] + "…", len(one) - limit
 
 
 def _replay_history(history: list[dict]) -> None:
@@ -79,15 +84,20 @@ def _replay_history(history: list[dict]) -> None:
         # ---- assistant:思考 → 工具调用 → 回答,顺序与实时一致 ----
         reasoning = (m.get("reasoning_content") or "").strip()
         if reasoning:
+            shown, hidden = _clip(reasoning, SESSION_RESUME_CHARS)
             console.print("* 思考", style="dim", markup=False)
-            console.print(_clip(reasoning, SESSION_RESUME_CHARS), style="dim italic",
-                          markup=False, highlight=False, soft_wrap=True)
+            console.print(shown, style="dim italic", markup=False,
+                          highlight=False, soft_wrap=True, end="")
+            # 藏了就说清楚藏了多少,别让思考"戛然而止"
+            console.print(f"    (完整思考还有 {hidden} 字未显示)" if hidden else "",
+                          style="dim", markup=False)
         for call in (m.get("tool_calls") or []):
             fn = call.get("function", {})
-            console.print(
-                f"• {fn.get('name', '?')}({_clip(fn.get('arguments') or '', SESSION_RESUME_CHARS)})",
-                style="dim", markup=False, highlight=False,
-            )
+            shown, hidden = _clip(fn.get("arguments") or "", SESSION_RESUME_CHARS)
+            # 提示放在右括号**外面**,否则读起来像 `…未显示))`
+            tail = f"    (参数还有 {hidden} 字未显示)" if hidden else ""
+            console.print(f"• {fn.get('name', '?')}({shown}){tail}",
+                          style="dim", markup=False, highlight=False)
         if text:
             console.print("AI >", style="bold green")
             # 与实时一致:拿到完整文本后交由 Markdown 渲染

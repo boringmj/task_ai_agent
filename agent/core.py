@@ -152,6 +152,18 @@ def _rel(path: Path) -> str:
         return str(path)
 
 
+def clip_text(text: str, limit: int) -> str:
+    """按上限截断长文本,**并在末尾说明还藏了多少**。
+
+    只切断、不说一句,读的人(尤其是模型)会以为看到的就是全部内容 —— 明明命令
+    输出了 8 万字、只给了 1 万,却像"输出到此为止",据此判断很容易出错。
+    说清楚"还有多少没显示",它才知道该换个方式(分页、过滤、写进文件)再看。
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n…(输出过长已截断;另有 {len(text) - limit} 字未显示)"
+
+
 def _assert_public_url(url: str) -> None:
     """校验 URL 能否安全访问:协议受限,且解析出的每个 IP 都必须是公网地址。
 
