@@ -303,11 +303,6 @@ def _vm_kickoff() -> None:
     _vm_thread.start()
 
 
-@tool(
-    description="查看沙箱虚拟机的当前状态:进行到哪一步、是否已就绪、连接端口。"
-                "虚拟机在后台启动,可能没就绪;用这个确认是否能用。",
-    parameters={"type": "object", "properties": {}},
-)
 def vm_is_running() -> bool:
     """当前这台 VM 的进程还在不在。
 
@@ -333,6 +328,11 @@ def session_reset_hint() -> str:
             "写进去的文件都还在。想连它一起清掉,用 /vmreset。")
 
 
+@tool(
+    description="查看沙箱虚拟机的当前状态:进行到哪一步、是否已就绪、连接端口。"
+                "虚拟机在后台启动,可能没就绪;用这个确认是否能用。",
+    parameters={"type": "object", "properties": {}},
+)
 def vm_status() -> str:
     """查看沙箱虚拟机的当前状态(进行到哪一步、是否就绪)。"""
     st = _vm_state_get()
