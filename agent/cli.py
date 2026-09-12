@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import sys
 
 from rich.markdown import Markdown
@@ -12,6 +13,13 @@ from .core import (
 )
 from .llm import usage_detail, usage_line
 from .loop import compact, load_system_prompt, run
+from .session import (
+    claim_owner,
+    clear_session,
+    load_session,
+    release_owner,
+    rewrite_session,
+)
 from .tools.container import _docker_cleanup_stale, _docker_health
 from .tools.memory import _read_memory
 from .tools.trash import purge_trash
@@ -71,6 +79,12 @@ def main() -> None:
                 "content": f"以下是跨会话保留的长期记忆,和你的对话无关,仅供参考:\n{memory}",
             }
         )
+    # 会话恢复要赶在别的事情前面:先登记占用者(发现别的实例仍在用就提醒),
+    # 再把上次的对话读回来接在最新的 system 消息之后。
+    conflict = claim_owner()
+    history, resume_note = load_session()
+    messages.extend(history)
+    atexit.register(release_owner)   # 正常退出时摘掉占用者标记
     _cleanup_trash_on_start()
     # 预处理 Docker 健康状态(非阻断):可用则做残留清理,不可用仅警告,agent 照常启动
     ok, msg = _docker_health()
@@ -89,9 +103,13 @@ def main() -> None:
     console.print("Agent 已启动。", style="bold")
     console.print("输入多行:连续输入,最后一个空行提交(支持粘贴)。", style="dim")
     console.print("执行中 Ctrl+C=取消本轮;空闲时 Ctrl+C=退出;exit 退出。", style="dim")
-    console.print(f"/compact 压缩上下文(省 token);/tokens 看用量;占用达 "
+    console.print(f"/compact 压缩上下文(省 token);/tokens 看用量;/new 开新会话;占用达 "
                   f"{AUTO_COMPACT_RATIO:.0%} 会自动压缩。", style="dim")
-    console.print(f"工作区:{ROOT}\n", style="dim")
+    console.print(f"工作区:{ROOT}", style="dim")
+    console.print(f"会话:{resume_note}", style="dim")
+    if conflict:
+        console.print(conflict, style="yellow")
+    console.print()
 
     while True:
         try:
@@ -106,9 +124,19 @@ def main() -> None:
                 break
             if text == "/compact":
                 console.print(compact(messages), style="dim")
+                rewrite_session(messages)   # 历史被换掉了,磁盘上同步成压缩后的样子
                 continue
             if text == "/tokens":
                 console.print(usage_detail(), style="dim")
+                continue
+            if text == "/new":
+                # 开新会话:只保留 system(提示词与长期记忆),其余清掉
+                kept = 0
+                while kept < len(messages) and messages[kept].get("role") == "system":
+                    kept += 1
+                del messages[kept:]
+                clear_session()
+                console.print("已开新会话,之前的对话不再带入。", style="dim")
                 continue
 
             # 快照这一轮开始前的整份历史。存"内容"而不是长度 —— 本轮里可能发生
@@ -131,6 +159,13 @@ def main() -> None:
                 messages[:] = snapshot
                 console.print(f"\n[出错,本轮已回滚]{type(exc).__name__}: {exc}", style="bold red")
                 continue
+
+            # 这一轮成功了才落盘(回滚的两个分支上面都 continue 了,不会被写进去)。
+            # 整份重写而不是追加:本轮里可能发生过自动压缩,历史已被整体换掉,
+            # 追加会把"压缩后"和"压缩前"的消息混在一个文件里。文件本身有界
+            # (受上下文上限与压缩约束,通常几百 KB),整体重写的开销可忽略,
+            # 换来的是怎么都不会错。
+            rewrite_session(messages)
 
             console.print("AI >", style="bold green")
             # Markdown 要拿到完整文本才能正确解析,所以是等模型说完再一次性渲染
