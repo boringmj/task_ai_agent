@@ -691,12 +691,31 @@ def restore_file(trashed_name: str, overwrite: bool = False) -> str:
     return f"已还原 {trashed_name} -> {original}"
 
 
-def purge_trash(max_age_days: int | None = None) -> str:
-    """永久删除回收站里的文件。
+def purge_trash(max_age_days: int | None = None, name: str | None = None) -> str:
+    """永久删除回收站里的内容(**不可恢复**)。
 
-    max_age_days 给定 -> 只删超过该天数的(启动清理用);
-    max_age_days 为空 -> 清空全部,不设保留规则。
+    name 给定 -> 只永久删除回收站里这一项(名字取自 list_files(".trash", show_hidden=true));
+    max_age_days 给定 -> 只删超过该天数的(启动自动清理用);
+    两者都不给 -> 清空全部,不设保留规则。
     """
+    # 只删指定的一项
+    if name:
+        target = safe_path(TRASH_DIR / name)
+        if target == TRASH_DIR or not target.is_relative_to(TRASH_DIR):
+            return f"错误:{name} 不在回收站里。"
+        if target == TRASH_INDEX_FILE:
+            return "错误:那是回收站的索引文件,不能删。"
+        if not target.exists():
+            return f'回收站里没有 {name};可先 list_files(".trash", show_hidden=true) 看看。'
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        index = _trash_index()
+        index.pop(target.name, None)
+        _trash_save(index)
+        return f"已从回收站永久删除 {name}(不可恢复)。"
+
     now = datetime.now()
     index = _trash_index()
     # 先把孤儿条目清掉:索引里指向的回收站文件已不在磁盘(例如被手动删了、
@@ -2844,17 +2863,22 @@ TOOLS = [
         "function": {
             "name": "purge_trash",
             "description": (
-                "永久删除回收站里的文件。默认清空全部,过期的文件本来也会在启动时自动清理。"
+                "永久删除回收站里的内容(**不可恢复**)。给 name 就只删回收站里的那一项(不必清空全部);"
+                "不给 name 则清空全部,过期的文件本来也会在启动时自动清理。"
+                "回收站里有哪些项,用 list_files(\".trash\", show_hidden=true) 看。"
                 "永久删除不可恢复,调用前务必先让用户确认不再需要,不要自作主张。"
-                "只删单个文件的话,应先用 delete_file 删掉,或者先还原再处理。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "要永久删除的回收站项名(只删这一项);不填则清空全部",
+                    },
                     "max_age_days": {
                         "type": "integer",
                         "description": "只删除超过这个天数的文件(用于启动清理);不填则清空回收站",
-                    }
+                    },
                 },
             },
         },
