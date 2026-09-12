@@ -39,8 +39,9 @@ def remember(content: str) -> str:
     content = content.strip()
     if not content:
         raise ValueError("要记住的内容不能为空")
-    if len(content) > MAX_WRITE_BYTES:
-        raise ValueError(f"内容过大({len(content)} 字符),超过单次写入上限 {MAX_WRITE_BYTES}")
+    size = len(content.encode("utf-8"))  # 上限是字节数,不能拿字符数比 —— 中文一字 3 字节
+    if size > MAX_WRITE_BYTES:
+        raise ValueError(f"内容过大({size} 字节),超过单次写入上限 {MAX_WRITE_BYTES} 字节")
     # 记内容前先洗一遍:去掉空行,也去掉纯分隔符行(===、--- 这类),
     # 否则会把记忆文件的结构弄脏
     lines = [

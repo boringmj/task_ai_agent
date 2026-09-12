@@ -99,7 +99,16 @@ def _stream_model(messages: list[dict]) -> tuple[str, list[dict], str]:
             _close_reasoning()
             content_parts.append(delta.content)
         for tcd in (delta.tool_calls or []):
-            idx = tcd.index if tcd.index is not None else 0
+            idx = tcd.index
+            if idx is None:
+                # 提供方没给 index 时不能一律并到 0 —— 那会把并行的多个工具调用
+                # 合成一个。改用"带 id 视为新的一次调用、否则续写最后一个"来定位。
+                if getattr(tcd, "id", None):
+                    idx = len(tool_slots)
+                elif tool_slots:
+                    idx = max(tool_slots)
+                else:
+                    idx = 0
             slot = tool_slots.setdefault(
                 idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
             )

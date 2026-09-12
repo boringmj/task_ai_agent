@@ -111,12 +111,16 @@ def main() -> None:
                 console.print(usage_detail(), style="dim")
                 continue
 
-            start = len(messages)  # 快照:用于取消时回滚本轮半截改动
+            # 快照这一轮开始前的整份历史。存"内容"而不是长度 —— 本轮里可能发生
+            # 自动压缩(把历史改短),那时按长度回滚会算错位置:短了删不掉、长了会
+            # 把压缩后的新历史也削掉一截。整份快照才能精确还原。
+            # 浅拷贝即可,消息字典本身不再改动;还原用切片赋值,list 对象身份不变。
+            snapshot = list(messages)
             try:
                 reply = run(text, messages)
             except KeyboardInterrupt:
                 # 执行中 Ctrl+C:回滚半截对话,回到提示,会话不退出
-                del messages[start:]
+                messages[:] = snapshot
                 console.print("\n[已取消]", style="bold red")
                 continue
             except Exception as exc:  # noqa: BLE001
@@ -124,7 +128,7 @@ def main() -> None:
                 # 丢掉这一轮的对话会让人白等,还要从头把上下文喂一遍。
                 # 这里 **同样要回滚**:半截历史里很可能留着一个没有 tool 结果配对的
                 # tool_calls,那个发给 API 会直接 400,回滚才能保证历史始终合法。
-                del messages[start:]
+                messages[:] = snapshot
                 console.print(f"\n[出错,本轮已回滚]{type(exc).__name__}: {exc}", style="bold red")
                 continue
 
