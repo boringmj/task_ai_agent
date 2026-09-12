@@ -259,6 +259,10 @@ def _detect_text_encoding(sample: bytes) -> str:
                 "pattern 是正则(不是通配符);ignore_case=true 可忽略大小写。"
                 "只搜文本文件(二进制自动跳过),结果是「文件:行号: 内容」的形式。"
                 "想知道某个函数/变量/字符串在哪些文件里出现过时用它,比一个个 read_file 高效得多。"
+                "include 可按**文件名**收窄范围(逗号分隔的 glob,如 \"*.py\"、\"*.py,*.pyi\"),"
+                "适合「我只看某类文件」这类诉求;但**别养成上来就限定类型的习惯** —— "
+                "同一个名字常常也出现在配置(.json/.yaml/.toml)、文档(.md)、模板(.html)、脚本里,"
+                "限死 *.py 就会漏掉。不确定时先不设 include 全搜一遍。"
                 "命中数有上限,超出会提示截断。",
     parameters={
                 "type": "object",
@@ -275,17 +279,24 @@ def _detect_text_encoding(sample: bytes) -> str:
                         "type": "boolean",
                         "description": "是否忽略大小写,默认 false",
                     },
+                    "include": {
+                        "type": "string",
+                        "description": "只搜文件名匹配这些 glob 的文件,逗号分隔,如 \"*.py,*.pyi\";留空则所有文本文件都搜",
+                    },
                 },
                 "required": ["pattern"],
             },
 )
-def grep_files(pattern: str, path: str = ".", ignore_case: bool = False) -> str:
+def grep_files(pattern: str, path: str = ".", ignore_case: bool = False,
+               include: str = "") -> str:
     """按内容搜索工作区里的文本文件(正则),返回命中的文件、行号与行内容。
 
     逐行流式读取 —— 整本书、长日志这种大文件也照搜。按 utf-8 / gb18030 / big5 试解码,
     所以 GBK 编码的中文文件也能搜到。自动跳过隐藏目录与依赖目录,二进制文件(含空字节)跳过。
+    include 可按文件名收窄范围(逗号分隔的 glob,如 "*.py" 或 "*.py,*.pyi"),留空则全搜。
     结果上限 FS_MAX_GREP_MATCHES 条,超出会提示截断。path 可以是文件或目录。
     """
+    import fnmatch
     try:
         rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
     except re.error as exc:
@@ -294,6 +305,12 @@ def grep_files(pattern: str, path: str = ".", ignore_case: bool = False) -> str:
     if not root.exists():
         return f"错误:{root} 不存在"
     targets = [root] if root.is_file() else [p for p in _iter_search_paths(root) if p.is_file()]
+
+    if include.strip():
+        pats = [s.strip().lower() for s in include.split(",") if s.strip()]
+        targets = [p for p in targets if any(fnmatch.fnmatch(p.name.lower(), pat) for pat in pats)]
+        if not targets:
+            return f"没有文件名匹配「{include}」的文件(搜索范围:{_rel(root)})"
 
     results: list[tuple[Path, int, str]] = []
     files_hit: set[Path] = set()
