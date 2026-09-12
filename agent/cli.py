@@ -21,6 +21,7 @@ from .llm import usage_line
 from .loop import load_system_prompt, run
 from .session import (
     claim_owner,
+    current_session_id,
     load_session,
     release_owner,
     rewrite_session,
@@ -199,15 +200,17 @@ def main() -> None:
     # 终端指令清单单独成一条 system 消息,而不是并进主提示词 —— 它是程序自动生成的
     # "数据",里面写明信任边界,免得描述文字被当成系统指令(详见 commands.system_message)
     messages.append({"role": "system", "content": commands_system_message()})
-    # 会话恢复要赶在别的事情前面:先登记占用者(发现别的实例仍在用就提醒),
-    # 再把上次的对话读回来接在最新的 system 消息之后。
-    conflict = claim_owner()
-    history, resume_note = load_session()
+    # 定下本次的活跃会话:接回本工作区**最后跑过**的那一个,没有就新开一个
+    # (id 随机、全局唯一 —— 它才是会话的隔离单元)。解析一次后缓存,
+    # 虚拟机磁盘等路径都由它推导,所以必须在这之前定下来。
+    session_id = current_session_id()
+    conflict = claim_owner(session_id)
+    history, resume_note = load_session(session_id)
     messages.extend(history)
     if history:
         # 接回历史后追加一条提示(追加在末尾以保住前缀缓存,详见 _restore_notice)
         messages.append(_restore_notice(len(history)))
-    atexit.register(release_owner)   # 正常退出时摘掉占用者标记
+    atexit.register(release_owner, session_id)   # 正常退出时摘掉占用者标记
     _cleanup_trash_on_start()
     # 预处理 Docker 健康状态(非阻断):可用则做残留清理,不可用仅警告,agent 照常启动
     ok, msg = _docker_health()
@@ -230,7 +233,7 @@ def main() -> None:
                   + f"(敲 /help 看说明);上下文占用达 {AUTO_COMPACT_RATIO:.0%} 会自动压缩。",
                   style="dim")
     console.print(f"工作区:{ROOT}", style="dim")
-    console.print(f"会话:{resume_note}", style="dim")
+    console.print(f"会话:{session_id} — {resume_note}", style="dim")
     if conflict:
         console.print(conflict, style="yellow")
     _replay_history(history)   # 把上次对话按原样重放一遍，接着聊
@@ -281,7 +284,7 @@ def main() -> None:
             # 追加会把"压缩后"和"压缩前"的消息混在一个文件里。文件本身有界
             # (受上下文上限与压缩约束,通常几百 KB),整体重写的开销可忽略,
             # 换来的是怎么都不会错。
-            rewrite_session(messages)
+            rewrite_session(messages, session_id)
 
             console.print("AI >", style="bold green")
             # Markdown 要拿到完整文本才能正确解析,所以是等模型说完再一次性渲染

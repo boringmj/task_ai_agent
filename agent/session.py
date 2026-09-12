@@ -1,14 +1,19 @@
-"""会话持久化:一个会话一个目录,里面装这次会话的**全部**东西。
+"""会话持久化:一个会话一个目录,id 随机生成、全局唯一。
 
-目录结构(在项目根下,不在工作区里 —— 会话文件与虚拟机磁盘都不该让 agent
-自己读改删):
+会话是**隔离的单元**:每个会话有自己的对话历史、自己的虚拟机磁盘。目录在项目根下
+(不在工作区里 —— 会话记录与 VM 磁盘都不该让 agent 读改删):
 
     sessions/
-      <会话名>/
-        messages.jsonl     对话历史,一行一条消息(第一行是元信息)
-        owner.json         占用者(现在只用于提醒冲突,将来可升级成锁)
-        work-<会话名>.qcow2  该会话专属的虚拟机磁盘(装过的软件、写过的文件都留在这)
-        qemu-<会话名>.log   QEMU 的输出,排查启动失败用
+      index.json            索引:哪个工作区有哪些会话、最后跑的是哪个
+      <随机 id>/
+        messages.jsonl      对话历史,一行一条消息(第一行是元信息)
+        owner.json          占用者(现在只用来提醒冲突,将来可升级成锁)
+        work-<id>.qcow2     该会话专属的虚拟机磁盘(装过的软件、写过的文件都在这)
+        qemu-<id>.log       QEMU 的输出,排查启动失败用
+
+索引把"工作区"和"会话"关联起来,于是:**同一个工作区可以有多段互不干扰的会话**,
+启动时默认接回**最后跑过的那一个**;将来要切换活跃会话,改索引里的 `last` 再重新
+加载即可(见 set_current_session / list_sessions)。
 
 为什么用 `.jsonl` 而不是 `.json`:会话是**每轮追加**的,而崩溃/强杀是常态。
 `.json` 整个文件是一个文档,追加要读全文再整体重写,且**写一半被打断就全废**
@@ -26,18 +31,21 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from .core import PROJECT_DIR
+from .core import PROJECT_DIR, ROOT
 
 # 会话根目录。默认在项目根(不在工作区里):会话记录与虚拟机磁盘既不该被 agent
 # 读写,也不该混进工作区文件列表。多实例要用不同位置时用 AGENT_SESSIONS_DIR 覆盖。
 SESSIONS_DIR = Path(
     os.environ.get("AGENT_SESSIONS_DIR") or (PROJECT_DIR / "sessions")
 ).resolve()
-DEFAULT_SESSION = "default"
+INDEX_FILE = SESSIONS_DIR / "index.json"
+_INDEX_VERSION = 1
 _FORMAT_VERSION = 1
 
 # 写入用 UTF-8;消息里可能有中文与 base64 图片,别让编码出岔子
 _ENCODING = "utf-8"
+
+_current_session: str | None = None      # 本进程的活跃会话,首次解析后缓存
 
 
 def _persistable(messages: list[dict]) -> list[dict]:
@@ -54,26 +62,120 @@ def _persistable(messages: list[dict]) -> list[dict]:
     return messages[start:]
 
 
-def _safe_name(name: str) -> str:
-    """会话名只允许简单字符,免得拼出目录之外的路径。"""
-    return "".join(c for c in name if c.isalnum() or c in "-_") or DEFAULT_SESSION
+def _safe_name(sid: str) -> str:
+    """会话 id 只允许简单字符,免得拼出目录之外的路径。"""
+    return "".join(c for c in sid if c.isalnum() or c in "-_") or "invalid"
 
 
-def session_dir(name: str = DEFAULT_SESSION) -> Path:
+def new_session_id() -> str:
+    """生成一个新的会话 id。随机、足够长,正常使用不会撞(48 位)。"""
+    return uuid.uuid4().hex[:12]
+
+
+def session_dir(sid: str) -> Path:
     """某个会话的目录 —— 它的历史、占用者、虚拟机磁盘都在这下面。
 
     虚拟机工具的磁盘路径也取自这里,所以"一个会话 = 一个目录 + 一台自己的 VM"。
     """
-    return SESSIONS_DIR / _safe_name(name)
+    return SESSIONS_DIR / _safe_name(sid)
 
 
-def session_file(name: str = DEFAULT_SESSION) -> Path:
+def session_file(sid: str) -> Path:
     """对话历史文件。放在会话目录里,目录名已表明是哪个会话,所以文件名不用重复。"""
-    return session_dir(name) / "messages.jsonl"
+    return session_dir(sid) / "messages.jsonl"
 
 
-def owner_file(name: str = DEFAULT_SESSION) -> Path:
-    return session_dir(name) / "owner.json"
+def owner_file(sid: str) -> Path:
+    return session_dir(sid) / "owner.json"
+
+
+# ---------------- 索引:工作区 ↔ 会话 ----------------
+
+
+def _workspace_key() -> str:
+    """标识"哪个工作区"。用工作区的绝对路径 —— 索引要回答的是
+    「这个工作区里以前跑过哪几段会话」。"""
+    return str(ROOT.resolve())
+
+
+def _index_load() -> dict:
+    """读索引。坏了或不存在都当成空索引,不能让一个坏文件挡住启动。"""
+    try:
+        data = json.loads(INDEX_FILE.read_text(encoding=_ENCODING) or "{}")
+        if isinstance(data, dict) and isinstance(data.get("workspaces"), dict):
+            return data
+    except Exception:  # noqa: BLE001
+        pass
+    return {"version": _INDEX_VERSION, "workspaces": {}}
+
+
+def _index_save(index: dict) -> None:
+    """原子写索引(临时文件 + 替换),免得写一半崩掉把索引搞坏。"""
+    try:
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = INDEX_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(index, ensure_ascii=False, indent=1), encoding=_ENCODING)
+        os.replace(tmp, INDEX_FILE)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def register_session(sid: str, set_last: bool = True) -> None:
+    """把会话登记到当前工作区名下(幂等)。"""
+    now = datetime.now().isoformat(timespec="seconds")
+    index = _index_load()
+    entry = index["workspaces"].setdefault(_workspace_key(), {"last": None, "sessions": {}})
+    session = entry["sessions"].setdefault(sid, {"created": now})
+    session["last_used"] = now
+    if set_last:
+        entry["last"] = sid
+    _index_save(index)
+
+
+def set_current_session(sid: str) -> None:
+    """切换活跃会话(将来供指令使用)。只改内存与索引指向,不动历史内容。"""
+    global _current_session
+    _current_session = _safe_name(sid)
+    register_session(_current_session)
+
+
+def current_session_id() -> str:
+    """本进程的活跃会话 id:接回本工作区**最后跑过的那一个**;没有就新建一个。
+
+    首次调用时解析并缓存 —— 会话 id 一旦定下来,整个进程都用它(虚拟机磁盘路径等
+    都由它推导),中途换意味着连 VM 都要换,那是"切换会话"指令才做的事。
+    """
+    global _current_session
+    if _current_session is not None:
+        return _current_session
+
+    entry = _index_load()["workspaces"].get(_workspace_key()) or {}
+    last = entry.get("last")
+    if last and session_dir(last).exists():
+        _current_session = _safe_name(last)
+        register_session(_current_session)          # 顺手更新 last_used
+    else:
+        _current_session = new_session_id()
+        register_session(_current_session)
+    return _current_session
+
+
+def list_sessions() -> list[dict]:
+    """本工作区名下的会话,最近使用的排在前面。供列表/切换类指令使用。"""
+    entry = _index_load()["workspaces"].get(_workspace_key()) or {}
+    sessions = entry.get("sessions") or {}
+    out = []
+    for sid, meta in sessions.items():
+        exists = session_dir(sid).exists()
+        out.append({
+            "id": sid,
+            "created": (meta or {}).get("created", "?"),
+            "last_used": (meta or {}).get("last_used", "?"),
+            "active": sid == _current_session,
+            "missing": not exists,      # 目录被手工删了,但索引还记着
+        })
+    out.sort(key=lambda s: s["last_used"], reverse=True)
+    return out
 
 
 def _valid_prefix(messages: list[dict]) -> list[dict]:
@@ -104,13 +206,13 @@ def _valid_prefix(messages: list[dict]) -> list[dict]:
     return out
 
 
-def load_session(name: str = DEFAULT_SESSION) -> tuple[list[dict], str]:
+def load_session(sid: str) -> tuple[list[dict], str]:
     """读回上次的对话。返回 (消息列表, 说明)。
 
     开头的 system 消息**不返回** —— 系统提示词和长期记忆每次启动都重新生成,
     沿用旧的那份等于把过期提示词冻在会话里。调用方自己补上最新的。
     """
-    path = session_file(name)
+    path = session_file(sid)
     if not path.exists():
         return [], "无历史会话(这是第一次)"
 
@@ -150,13 +252,13 @@ def load_session(name: str = DEFAULT_SESSION) -> tuple[list[dict], str]:
     return kept, note
 
 
-def append_messages(new_messages: list[dict], name: str = DEFAULT_SESSION) -> None:
+def append_messages(new_messages: list[dict], sid: str) -> None:
     """把新产生的消息追加到会话文件末尾。写失败不抛 —— 存不下不该打断对话。"""
     if not new_messages:
         return
     try:
-        session_dir(name).mkdir(parents=True, exist_ok=True)
-        path = session_file(name)
+        session_dir(sid).mkdir(parents=True, exist_ok=True)
+        path = session_file(sid)
         fresh = not path.exists()
         with path.open("a", encoding=_ENCODING) as fh:
             if fresh:
@@ -172,11 +274,11 @@ def append_messages(new_messages: list[dict], name: str = DEFAULT_SESSION) -> No
         pass
 
 
-def rewrite_session(all_messages: list[dict], name: str = DEFAULT_SESSION) -> None:
+def rewrite_session(all_messages: list[dict], sid: str) -> None:
     """整体重写会话(压缩把历史换掉之后用)。先写临时文件再原子替换,避免写一半崩掉。"""
     try:
-        session_dir(name).mkdir(parents=True, exist_ok=True)
-        path = session_file(name)
+        session_dir(sid).mkdir(parents=True, exist_ok=True)
+        path = session_file(sid)
         tmp = path.with_suffix(".jsonl.tmp")
         with tmp.open("w", encoding=_ENCODING) as fh:
             fh.write(json.dumps(
@@ -212,10 +314,10 @@ def _pid_alive(pid: int) -> bool:
         return True          # 查不出来就当它活着,宁可多提醒一次
 
 
-def claim_owner(name: str = DEFAULT_SESSION) -> str:
+def claim_owner(sid: str) -> str:
     """登记本实例为占用者;若发现另一个活着的实例也在用,返回提醒文案(空串表示没冲突)。"""
     warning = ""
-    path = owner_file(name)
+    path = owner_file(sid)
     try:
         if path.exists():
             info = json.loads(path.read_text(encoding=_ENCODING) or "{}")
@@ -232,7 +334,7 @@ def claim_owner(name: str = DEFAULT_SESSION) -> str:
         pass
 
     try:
-        session_dir(name).mkdir(parents=True, exist_ok=True)
+        session_dir(sid).mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({
             "pid": os.getpid(),
             "instance": uuid.uuid4().hex[:8],
@@ -244,10 +346,10 @@ def claim_owner(name: str = DEFAULT_SESSION) -> str:
     return warning
 
 
-def release_owner(name: str = DEFAULT_SESSION, instance: str | None = None) -> None:
+def release_owner(sid: str, instance: str | None = None) -> None:
     """退出时摘掉占用者标记 —— 只摘自己那个,别把别人的顺手删了。"""
     try:
-        path = owner_file(name)
+        path = owner_file(sid)
         if not path.exists():
             return
         info = json.loads(path.read_text(encoding=_ENCODING) or "{}")
@@ -257,9 +359,9 @@ def release_owner(name: str = DEFAULT_SESSION, instance: str | None = None) -> N
         pass
 
 
-def clear_session(name: str = DEFAULT_SESSION) -> None:
+def clear_session(sid: str) -> None:
     """丢掉这个会话的历史(用户要开新会话时用)。"""
     try:
-        session_file(name).unlink(missing_ok=True)
+        session_file(sid).unlink(missing_ok=True)
     except OSError:
         pass

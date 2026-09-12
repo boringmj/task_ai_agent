@@ -14,7 +14,7 @@ import time
 import uuid
 from pathlib import Path
 
-from ..session import DEFAULT_SESSION, session_dir
+from ..session import current_session_id, session_dir
 from ..core import (
     PROJECT_DIR,
     safe_path,
@@ -24,9 +24,12 @@ from ..core import (
 # ---- vm 工具专属配置(环境变量名不变,仍可在 .env 覆盖)----
 # ---- 虚拟机(QEMU)沙箱 ----
 # QEMU 二进制与基础盘在 temp/、vm/(可在 .env 配置),基础盘只读共享、从不被写。
-# 每个**会话**用自己的一块 overlay 盘(在会话目录里,见 VM_DISK)—— 会话之间
-# 互不干扰,同一会话恢复时虚拟机状态也跟着回来。端口之类属于本进程的资源
-# 仍按 VM_INSTANCE 区分,避免多开时抢占。
+# 每个**会话**用自己的一块 overlay 盘(放在该会话的目录里,见下面的 _vm_disk())
+# —— 会话之间互不干扰,同一会话恢复时虚拟机状态也跟着回来。端口之类属于本进程的
+# 资源仍按 VM_INSTANCE 区分,避免多开时抢占。
+#
+# 注意:磁盘路径要**按需算**而不是在导入时定死 —— 会话 id 是运行时从索引里解析
+# 出来的(见 session.current_session_id),导入时还不知道是哪个会话。
 VM_QEMU_DIR = Path(os.environ.get("VM_QEMU_DIR", str(PROJECT_DIR / "temp")))
 VM_QEMU_SYSTEM = Path(os.environ.get("VM_QEMU_SYSTEM", str(VM_QEMU_DIR / "qemu-system-x86_64.exe")))
 VM_QEMU_IMG = Path(os.environ.get("VM_QEMU_IMG", str(VM_QEMU_DIR / "qemu-img.exe")))
@@ -39,9 +42,21 @@ VM_INSTANCE = uuid.uuid4().hex[:8]                 # 每进程唯一,决定端�
 # 而不是按进程生成、退出即删。这样会话恢复时,虚拟机里的东西(装过的软件、
 # 写过的文件)也一并回来 —— "一个会话 = 一段对话 + 一块自己的盘"。
 # 代价:盘只增不减,想从干净状态开始得自己删掉那个 .qcow2(见 vm_reset)。
-VM_SESSION_DIR = session_dir(DEFAULT_SESSION)
-VM_DISK = VM_SESSION_DIR / f"work-{DEFAULT_SESSION}.qcow2"
-VM_LOG = VM_SESSION_DIR / f"qemu-{DEFAULT_SESSION}.log"
+def _vm_session_dir() -> Path:
+    return session_dir(current_session_id())
+
+
+def _vm_disk() -> Path:
+    """本会话的虚拟机磁盘。随会话持久化 —— 会话恢复时它也跟着回来。"""
+    sid = current_session_id()
+    return session_dir(sid) / f"work-{sid}.qcow2"
+
+
+def _vm_log() -> Path:
+    sid = current_session_id()
+    return session_dir(sid) / f"qemu-{sid}.log"
+
+
 VM_VMSERVER_PORT = 40000                            # vmserver 在 guest 内监听的端口(固定)
 
 _vm_port: int | None = None                        # 启动时动态分配,避免多开抢 2222
@@ -85,13 +100,13 @@ def _vm_free_port(base: int) -> int:
 
 
 def _vm_ensure() -> None:
-    VM_SESSION_DIR.mkdir(parents=True, exist_ok=True)   # 磁盘在会话目录里,不在镜像目录
-    if not VM_DISK.exists():
+    _vm_session_dir().mkdir(parents=True, exist_ok=True)   # 磁盘在会话目录里,不在镜像目录
+    if not _vm_disk().exists():
         if not (VM_QEMU_IMG.exists() and VM_BASE.exists()):
             raise FileNotFoundError(f"缺少 QEMU 工具({VM_QEMU_IMG})或基础盘({VM_BASE})")
         subprocess.run(
             [str(VM_QEMU_IMG), "create", "-f", "qcow2", "-F", "qcow2",
-             "-b", str(VM_BASE), str(VM_DISK)],
+             "-b", str(VM_BASE), str(_vm_disk())],
             check=True, capture_output=True,
         )
 
@@ -183,7 +198,7 @@ def _vm_spawn_and_login(serial_port: int, vmserver_host_port: int) -> None:
     global _vm_proc, _vm_ser
     cmd = [
         str(VM_QEMU_SYSTEM),
-        "-drive", f"file={VM_DISK},if=virtio",
+        "-drive", f"file={_vm_disk()},if=virtio",
         # 只把 vmserver 的 40000 口转发到宿主;其余 guest 口不暴露(vmserver 可代理)
         "-netdev", f"user,id=n0,hostfwd=tcp::{vmserver_host_port}-:{VM_VMSERVER_PORT}",
         "-device", "virtio-net-pci,netdev=n0",
@@ -195,7 +210,7 @@ def _vm_spawn_and_login(serial_port: int, vmserver_host_port: int) -> None:
     # stderr 落到日志文件(不接管道:没人读的管道写满会把 QEMU 堵死)。
     # 启动失败时它的内容就是真正的原因(如 "virtfs support is disabled"),
     # 只报一句"请检查 VM_ACCEL"会让人反复猜。
-    log = VM_LOG
+    log = _vm_log()
     with log.open("wb") as log_fp:
         _vm_proc = sp.Popen(cmd, creationflags=sp.CREATE_NO_WINDOW,
                             stdout=sp.DEVNULL, stderr=log_fp)
@@ -712,7 +727,7 @@ def vm_reset() -> str:
     time.sleep(0.3)                            # 等 QEMU 释放文件句柄
 
     try:
-        VM_DISK.unlink(missing_ok=True)
+        _vm_disk().unlink(missing_ok=True)
     except OSError as exc:
         return (f"虚拟机磁盘删不掉({exc})—— 多半还有别的进程占着它。"
                 f"确认没有其它 agent 实例在跑同一个会话后重试。")
@@ -752,7 +767,7 @@ def _vm_cleanup() -> None:
     except Exception:
         pass
     try:
-        VM_LOG.unlink(missing_ok=True)
+        _vm_log().unlink(missing_ok=True)
     except OSError:
         pass
 
