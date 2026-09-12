@@ -200,8 +200,11 @@ def _vm_spawn_and_login(serial_port: int, vmserver_host_port: int) -> None:
     cmd = [
         str(VM_QEMU_SYSTEM),
         "-drive", f"file={_vm_disk()},if=virtio",
-        # 只把 vmserver 的 40000 口转发到宿主;其余 guest 口不暴露(vmserver 可代理)
-        "-netdev", f"user,id=n0,hostfwd=tcp::{vmserver_host_port}-:{VM_VMSERVER_PORT}",
+        # 只把 vmserver 的 40000 口转发到宿主;其余 guest 口不暴露(vmserver 可代理)。
+        # 主机地址必须显式写 127.0.0.1:留空的话 QEMU 会绑到 0.0.0.0(实测如此),
+        # 等于把"能在 guest 里执行任意命令"的服务摆到局域网上 —— 虽然还有 token 挡着,
+        # 但没理由开这么大,本机用就只绑本机。
+        "-netdev", f"user,id=n0,hostfwd=tcp:127.0.0.1:{vmserver_host_port}-:{VM_VMSERVER_PORT}",
         "-device", "virtio-net-pci,netdev=n0",
         "-m", "1024", "-smp", "2", "-display", "none",
         "-serial", f"tcp:127.0.0.1:{serial_port},server=on,wait=off",
