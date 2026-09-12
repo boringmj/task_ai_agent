@@ -9,20 +9,28 @@ import re
 from urllib.parse import urljoin, urlparse
 
 from ..core import (
-    DOWNLOAD_MAX_BYTES,
-    FETCH_TIMEOUT,
-    MAX_FETCH_BYTES,
-    MAX_FETCH_CHARS,
-    MAX_REDIRECTS,
-    MAX_SEARCHES_PER_TURN,
-    MAX_SEARCH_RESULTS,
-    MAX_SNIPPET_CHARS,
-    SEARCH_API_KEY,
-    SEARCH_PROVIDER,
-    USER_AGENT,
     safe_path,
     _assert_public_url,
 )
+
+
+# ---- net 工具专属配置(环境变量名不变,仍可在 .env 覆盖)----
+# ---- 联网相关的护栏 ----
+NET_FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "10.0"))  # 单次请求超时(秒)
+NET_MAX_FETCH_BYTES = int(os.environ.get("MAX_FETCH_BYTES", str(3 * 1024 * 1024)))  # 最多下载多少字节,超出直接截断
+NET_MAX_FETCH_CHARS = int(os.environ.get("MAX_FETCH_CHARS", str(3 * 1024 * 1024)))  # 正文进上下文的字符上限,别把窗口撑爆
+NET_MAX_REDIRECTS = int(os.environ.get("MAX_REDIRECTS", "5"))  # 最多跟几次跳转,每一跳都要重新校验
+NET_USER_AGENT = os.environ.get("USER_AGENT", "task-ai-agent/0.1")
+# 下载单个文件的字节上限。与 fetch_url 不同,下载是写盘、内容不进上下文,
+# 所以上限按磁盘/带宽来设,不用迁就上下文窗口。
+NET_DOWNLOAD_MAX_BYTES = int(os.environ.get("DOWNLOAD_MAX_BYTES", str(100 * 1024 * 1024)))  # 100MB,可据需要调
+# ---- 搜索相关 ----
+# 换搜索服务只改这两个环境变量,不用动代码
+NET_SEARCH_PROVIDER = os.environ.get("SEARCH_PROVIDER", "").strip().lower()
+NET_SEARCH_API_KEY = os.environ.get("SEARCH_API_KEY", "").strip()
+NET_MAX_SEARCH_RESULTS = int(os.environ.get("MAX_SEARCH_RESULTS", "10"))  # 单次搜索最多返回几条
+NET_MAX_SEARCHES_PER_TURN = int(os.environ.get("MAX_SEARCHES_PER_TURN", "5"))  # 单轮对话最多搜几次 —— agent 会自动循环,必须自带刹车
+NET_MAX_SNIPPET_CHARS = int(os.environ.get("MAX_SNIPPET_CHARS", "500"))  # 每条摘要的字符上限
 
 
 # ---------------- 联网工具 ----------------
@@ -84,10 +92,10 @@ def fetch_url(url: str) -> str:
 
     with httpx.Client(
         follow_redirects=False,  # 自己跟跳转,才能逐跳校验
-        timeout=FETCH_TIMEOUT,
-        headers={"User-Agent": USER_AGENT},
+        timeout=NET_FETCH_TIMEOUT,
+        headers={"User-Agent": NET_USER_AGENT},
     ) as client:
-        for _ in range(MAX_REDIRECTS + 1):
+        for _ in range(NET_MAX_REDIRECTS + 1):
             # 每一跳都重新校验:首跳落在公网、次跳跳回内网,是绕过 SSRF 防护的经典手法
             _assert_public_url(url)
             with client.stream("GET", url) as resp:
@@ -102,7 +110,7 @@ def fetch_url(url: str) -> str:
                 chunks, size = [], 0
                 for chunk in resp.iter_bytes():  # 边下边截,不信任 Content-Length
                     size += len(chunk)
-                    if size > MAX_FETCH_BYTES:
+                    if size > NET_MAX_FETCH_BYTES:
                         truncated = True
                         break
                     chunks.append(chunk)
@@ -112,7 +120,7 @@ def fetch_url(url: str) -> str:
                 content_type = resp.headers.get("content-type", "")
                 break
         else:
-            raise ConnectionError(f"跳转超过 {MAX_REDIRECTS} 次,已放弃:{' -> '.join(hops)}")
+            raise ConnectionError(f"跳转超过 {NET_MAX_REDIRECTS} 次,已放弃:{' -> '.join(hops)}")
 
     if "html" in content_type.lower():
         title, text = _html_to_text(raw)
@@ -125,12 +133,12 @@ def fetch_url(url: str) -> str:
     if title:
         header.append(f"标题:{title}")
     if truncated:
-        header.append(f"响应体超过 {MAX_FETCH_BYTES} 字节,下载阶段已截断")
-    if len(text) > MAX_FETCH_CHARS:
-        header.append(f"正文超过 {MAX_FETCH_CHARS} 字符,只返回开头部分")
+        header.append(f"响应体超过 {NET_MAX_FETCH_BYTES} 字节,下载阶段已截断")
+    if len(text) > NET_MAX_FETCH_CHARS:
+        header.append(f"正文超过 {NET_MAX_FETCH_CHARS} 字符,只返回开头部分")
 
     # 用显式边界把外部内容围起来,降低网页里的注入指令被当成命令执行的概率
-    return _wrap_external(header, text[:MAX_FETCH_CHARS])
+    return _wrap_external(header, text[:NET_MAX_FETCH_CHARS])
 
 
 @tool(
@@ -185,10 +193,10 @@ def download(url: str, dest: str = "", overwrite: bool = False) -> str:
 
     with httpx.Client(
         follow_redirects=False,
-        timeout=FETCH_TIMEOUT,
-        headers={"User-Agent": USER_AGENT},
+        timeout=NET_FETCH_TIMEOUT,
+        headers={"User-Agent": NET_USER_AGENT},
     ) as client:
-        for _ in range(MAX_REDIRECTS + 1):
+        for _ in range(NET_MAX_REDIRECTS + 1):
             _assert_public_url(url)  # 每一跳都校验,跳回内网会被拦
             with client.stream("GET", url) as resp:
                 if resp.is_redirect:
@@ -205,14 +213,14 @@ def download(url: str, dest: str = "", overwrite: bool = False) -> str:
                 with target.open("wb") as fp:
                     for chunk in resp.iter_bytes():
                         written += len(chunk)
-                        if written > DOWNLOAD_MAX_BYTES:
+                        if written > NET_DOWNLOAD_MAX_BYTES:
                             raise ValueError(
-                                f"超过下载上限 {DOWNLOAD_MAX_BYTES} 字节,已中止(未保留不完整文件)。"
+                                f"超过下载上限 {NET_DOWNLOAD_MAX_BYTES} 字节,已中止(未保留不完整文件)。"
                             )
                         fp.write(chunk)
                 break
         else:
-            raise ConnectionError(f"跳转超过 {MAX_REDIRECTS} 次,已放弃:{' -> '.join(hops)}")
+            raise ConnectionError(f"跳转超过 {NET_MAX_REDIRECTS} 次,已放弃:{' -> '.join(hops)}")
 
     if status != 200:
         # 非 200 一律不留残缺文件(即使是空文件)
@@ -234,9 +242,9 @@ def download(url: str, dest: str = "", overwrite: bool = False) -> str:
 def _search_tavily(query: str, count: int) -> list[dict]:
     resp = httpx.post(
         "https://api.tavily.com/search",
-        headers={"Authorization": f"Bearer {SEARCH_API_KEY}"},
+        headers={"Authorization": f"Bearer {NET_SEARCH_API_KEY}"},
         json={"query": query, "max_results": count},
-        timeout=FETCH_TIMEOUT,
+        timeout=NET_FETCH_TIMEOUT,
     )
     resp.raise_for_status()
     return [
@@ -248,9 +256,9 @@ def _search_tavily(query: str, count: int) -> list[dict]:
 def _search_bocha(query: str, count: int) -> list[dict]:
     resp = httpx.post(
         "https://api.bochaai.com/v1/web-search",
-        headers={"Authorization": f"Bearer {SEARCH_API_KEY}"},
+        headers={"Authorization": f"Bearer {NET_SEARCH_API_KEY}"},
         json={"query": query, "count": count, "summary": True},
-        timeout=FETCH_TIMEOUT,
+        timeout=NET_FETCH_TIMEOUT,
     )
     resp.raise_for_status()
     pages = resp.json().get("data", {}).get("webPages", {}).get("value", [])
@@ -314,34 +322,34 @@ _searches_this_turn = 0  # 每轮用户提问前清零,见 run()
 def web_search(query: str, count: int = 5) -> str:
     global _searches_this_turn
 
-    provider = SEARCH_PROVIDERS.get(SEARCH_PROVIDER)
+    provider = SEARCH_PROVIDERS.get(NET_SEARCH_PROVIDER)
     if provider is None:
         raise RuntimeError(
-            f"尚未配置搜索服务。请在 .env 里设置 SEARCH_PROVIDER "
-            f"(可选:{'、'.join(SEARCH_PROVIDERS)}),需要密钥的服务还要设置 SEARCH_API_KEY。"
+            f"尚未配置搜索服务。请在 .env 里设置 NET_SEARCH_PROVIDER "
+            f"(可选:{'、'.join(SEARCH_PROVIDERS)}),需要密钥的服务还要设置 NET_SEARCH_API_KEY。"
         )
-    if SEARCH_PROVIDER != "duckduckgo" and not SEARCH_API_KEY:
-        raise RuntimeError(f"搜索服务 {SEARCH_PROVIDER} 需要密钥,请在 .env 里设置 SEARCH_API_KEY。")
+    if NET_SEARCH_PROVIDER != "duckduckgo" and not NET_SEARCH_API_KEY:
+        raise RuntimeError(f"搜索服务 {NET_SEARCH_PROVIDER} 需要密钥,请在 .env 里设置 NET_SEARCH_API_KEY。")
 
     # agent 会自动循环调用,搜索通常按次计费,必须有刹车
-    if _searches_this_turn >= MAX_SEARCHES_PER_TURN:
+    if _searches_this_turn >= NET_MAX_SEARCHES_PER_TURN:
         raise RuntimeError(
-            f"本轮对话的搜索次数已达上限({MAX_SEARCHES_PER_TURN} 次)。"
+            f"本轮对话的搜索次数已达上限({NET_MAX_SEARCHES_PER_TURN} 次)。"
             f"请基于已有结果作答,或让用户重新提问。"
         )
     _searches_this_turn += 1
 
-    count = max(1, min(count, MAX_SEARCH_RESULTS))
+    count = max(1, min(count, NET_MAX_SEARCH_RESULTS))
     results = provider(query, count)
     if not results:
         return f"搜索「{query}」没有得到任何结果。"
 
     lines = []
     for i, item in enumerate(results[:count], 1):
-        snippet = " ".join(item["snippet"].split())[:MAX_SNIPPET_CHARS]
+        snippet = " ".join(item["snippet"].split())[:NET_MAX_SNIPPET_CHARS]
         lines.append(f"{i}. {item['title']}\n   {item['url']}\n   {snippet}")
 
-    header = [f"搜索「{query}」,由 {SEARCH_PROVIDER} 返回 {len(lines)} 条结果"]
+    header = [f"搜索「{query}」,由 {NET_SEARCH_PROVIDER} 返回 {len(lines)} 条结果"]
     return _wrap_external(header, "\n\n".join(lines))
 
 

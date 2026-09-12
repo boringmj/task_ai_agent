@@ -10,15 +10,26 @@ from pathlib import Path
 from ..core import (
     CLONES_DIR,
     GIT_DIR,
-    GIT_EXCLUDE,
-    GIT_FORBIDDEN,
-    GIT_MAX_OUTPUT,
-    GIT_RISKY,
-    GIT_SAFE,
     ROOT,
     safe_path,
     _assert_public_url,
 )
+
+
+# ---- git 工具专属配置(环境变量名不变,仍可在 .env 覆盖)----
+GIT_MAX_OUTPUT = int(os.environ.get("GIT_MAX_OUTPUT", "20000"))  # 单次命令输出进上下文的字符上限
+# 正常管理版本所需的安全指令;不在白名单里的指令一律拒绝(不管 confirm)
+GIT_SAFE = {
+    "status", "add", "commit", "log", "diff", "show", "rm", "mv",
+    "branch", "switch", "checkout", "stash", "restore", "ls-files",
+    "init", "rev-parse", "tag",
+}
+# 会改写工作区或历史的:威力中等,执行前必须 confirm=true
+GIT_RISKY = {"reset", "revert", "merge", "pull", "push"}
+# 彻底不可逆或对纯本地版本管理无用:即使用户确认也拒绝
+GIT_FORBIDDEN = {"gc", "clean", "rebase", "filter-branch"}
+# 工作区仓库要忽略的本地状态目录(含容器持久化的 .pylibs 包)
+GIT_EXCLUDE = (".agent/", ".trash/", "clones/", "__pycache__/", ".pylibs/")
 
 
 # ---------------- git:工作区内容的版本管理 ----------------

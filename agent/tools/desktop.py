@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from .registry import tool
 
+import os
+
 import queue
 import threading
 import time
 from datetime import datetime
 
-from ..core import (
-    MAX_CLIPBOARD_CHARS,
-)
+# ---- desktop 工具专属配置(环境变量名不变,仍可在 .env 覆盖)----
+# 剪贴板读进上下文的字符上限(读太长会白白占窗口)
+DESKTOP_MAX_CLIPBOARD_CHARS = int(os.environ.get("MAX_CLIPBOARD_CHARS", "10000"))
 
 
 # ---------------- 模拟输入(键盘/鼠标) ----------------
@@ -330,9 +332,9 @@ def read_clipboard() -> str:
         return f"错误:读取剪贴板失败:{exc}"
     if not text:
         return "剪贴板里没有文本(可能是空的,或只含图片/文件等非文本内容)。"
-    if len(text) > MAX_CLIPBOARD_CHARS:
-        return (f"剪贴板文本(共 {len(text)} 字符,已截断到前 {MAX_CLIPBOARD_CHARS}):\n"
-                + text[:MAX_CLIPBOARD_CHARS])
+    if len(text) > DESKTOP_MAX_CLIPBOARD_CHARS:
+        return (f"剪贴板文本(共 {len(text)} 字符,已截断到前 {DESKTOP_MAX_CLIPBOARD_CHARS}):\n"
+                + text[:DESKTOP_MAX_CLIPBOARD_CHARS])
     return f"剪贴板文本({len(text)} 字符):\n{text}"
 
 

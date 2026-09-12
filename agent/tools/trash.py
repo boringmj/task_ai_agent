@@ -13,10 +13,15 @@ from ..core import (
     GIT_DIR,
     MEMORY_FILE,
     ROOT,
-    TRASH_DIR,
-    TRASH_INDEX_FILE,
     safe_path,
 )
+
+
+# ---- trash 工具专属配置(环境变量名不变,仍可在 .env 覆盖)----
+# 回收站:删除的文件移到这里,不做真删除,超过 MAX_AGE_DAYS 天后启动时自动清空
+TRASH_DIR = ROOT / ".trash"
+TRASH_DIR.mkdir(exist_ok=True)  # 回收站目录由本模块自己保证存在
+TRASH_INDEX_FILE = TRASH_DIR / "index.json"  # 记录 回收站文件名 -> 原路径,支撑还原
 
 @tool(
     description="删除工作区内的一个文件。实际行为是移入 .trash/ 回收站而非物理删除,用户可以自行恢复。"

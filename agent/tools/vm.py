@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from .registry import tool
 
+import os
+
 import atexit
 import json
 import socket
@@ -10,18 +12,28 @@ import subprocess
 import threading
 import time
 import uuid
+from pathlib import Path
 
 from ..core import (
-    QEMU_IMG,
-    QEMU_SYSTEM,
-    VM_ACCEL,
-    VM_BASE,
-    VM_DIR,
-    VM_DISK,
-    VM_INSTANCE,
-    VM_VMSERVER_PORT,
+    PROJECT_DIR,
     safe_path,
 )
+
+
+# ---- vm 工具专属配置(环境变量名不变,仍可在 .env 覆盖)----
+# ---- 虚拟机(QEMU)沙箱 ----
+# QEMU 二进制目录、基础盘等均可在 .env 里配置;默认指向项目内 temp/(QEMU 完整安装)。
+# 多开隔离:每个 agent 进程一个唯一实例 —— 独立 overlay 盘 + 独立 vmserver 口,
+# 基础盘只读共享。这样同时跑多个 agent,各自的虚拟机互不干扰。
+VM_QEMU_DIR = Path(os.environ.get("VM_QEMU_DIR", str(PROJECT_DIR / "temp")))
+VM_QEMU_SYSTEM = Path(os.environ.get("VM_QEMU_SYSTEM", str(VM_QEMU_DIR / "qemu-system-x86_64.exe")))
+VM_QEMU_IMG = Path(os.environ.get("VM_QEMU_IMG", str(VM_QEMU_DIR / "qemu-img.exe")))
+VM_DIR = Path(os.environ.get("VM_DIR", str(PROJECT_DIR / "vm")))
+VM_BASE = Path(os.environ.get("VM_BASE", str(VM_DIR / "alpine-vmserver.qcow2")))  # 预装 vmserver 的新 base
+VM_ACCEL = os.environ.get("VM_ACCEL", "whpx")      # whpx 快;没开就设 tcg(慢但通用)
+VM_INSTANCE = uuid.uuid4().hex[:8]                 # 每进程唯一,决定盘和口的唯一性
+VM_DISK = VM_DIR / f"work-{VM_INSTANCE}.qcow2"     # 本实例专属 overlay;重置=删它
+VM_VMSERVER_PORT = 40000                            # vmserver 在 guest 内监听的端口(固定)
 
 _vm_port: int | None = None                        # 启动时动态分配,避免多开抢 2222
 _vm_token = ""                                     # 每启动随机生成、经串口注入 guest,服务端每次请求读它
@@ -66,10 +78,10 @@ def _vm_free_port(base: int) -> int:
 def _vm_ensure() -> None:
     VM_DIR.mkdir(parents=True, exist_ok=True)
     if not VM_DISK.exists():
-        if not (QEMU_IMG.exists() and VM_BASE.exists()):
-            raise FileNotFoundError(f"缺少 QEMU 工具({QEMU_IMG})或基础盘({VM_BASE})")
+        if not (VM_QEMU_IMG.exists() and VM_BASE.exists()):
+            raise FileNotFoundError(f"缺少 QEMU 工具({VM_QEMU_IMG})或基础盘({VM_BASE})")
         subprocess.run(
-            [str(QEMU_IMG), "create", "-f", "qcow2", "-F", "qcow2",
+            [str(VM_QEMU_IMG), "create", "-f", "qcow2", "-F", "qcow2",
              "-b", str(VM_BASE), str(VM_DISK)],
             check=True, capture_output=True,
         )
@@ -149,7 +161,7 @@ def _vm_spawn_and_login(serial_port: int, vmserver_host_port: int) -> None:
     """boot QEMU(映射 guest:40000 的 vmserver)+ 串口登录,设置 _vm_proc/_vm_ser。"""
     global _vm_proc, _vm_ser
     cmd = [
-        str(QEMU_SYSTEM),
+        str(VM_QEMU_SYSTEM),
         "-drive", f"file={VM_DISK},if=virtio",
         # 只把 vmserver 的 40000 口转发到宿主;其余 guest 口不暴露(vmserver 可代理)
         "-netdev", f"user,id=n0,hostfwd=tcp::{vmserver_host_port}-:{VM_VMSERVER_PORT}",

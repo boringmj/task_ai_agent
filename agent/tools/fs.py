@@ -9,19 +9,28 @@ from pathlib import Path
 
 from .trash import _is_system_dir
 from ..core import (
-    DENY_READ,
-    MAX_ENTRIES,
-    MAX_FIND_RESULTS,
-    MAX_GREP_FILE_BYTES,
-    MAX_GREP_LINE_CHARS,
-    MAX_GREP_MATCHES,
-    MAX_READ_CHARS,
     MAX_WRITE_BYTES,
     ROOT,
-    SEARCH_SKIP_DIRS,
     safe_path,
     _rel,
 )
+
+
+# ---- fs 工具专属配置(环境变量名不变,仍可在 .env 覆盖)----
+# `list_files` 单次返回的条目数上限(含文件与子目录),避免超大目录撑爆上下文
+FS_MAX_ENTRIES = int(os.environ.get("MAX_ENTRIES", "200"))
+# 护栏:read_file 单次返回的字符上限。超出会明确提示(不再静默截断),让模型改用行区间读
+FS_MAX_READ_CHARS = int(os.environ.get("MAX_READ_CHARS", str(3 * 1024 * 1024)))
+# 即使在沙箱内,这些文件也禁止读取 —— 纵深防御,防止沙箱里混入密钥文件
+FS_DENY_READ = {".env"}
+# ---- 文件搜索(按名 / 按内容)护栏 ----
+# 搜索很容易命中一大片,和列目录同理:必须设上限,否则把上下文撑爆。
+FS_MAX_FIND_RESULTS = int(os.environ.get("MAX_FIND_RESULTS", "300"))         # find_files 最多返回多少条命中
+FS_MAX_GREP_MATCHES = int(os.environ.get("MAX_GREP_MATCHES", "200"))         # grep_files 最多返回多少条命中行
+FS_MAX_GREP_FILE_BYTES = 200 * 1024 * 1024  # 单个文件超此大小才跳过(防极端超大文件);超了会在结果里说明,不静默跳过
+FS_MAX_GREP_LINE_CHARS = int(os.environ.get("MAX_GREP_LINE_CHARS", "200"))      # 每条命中行的内容字符上限
+# 递归搜索时剪掉的目录:隐藏目录(.git/.trash/.agent/.venv…)与常见的依赖/缓存目录
+FS_SEARCH_SKIP_DIRS = {"__pycache__", "node_modules", ".pylibs"}
 
 @tool(
     description="获取当前的日期和时间。当用户询问「现在几点」「今天几号」时使用。",
@@ -87,7 +96,7 @@ def read_file(path: str, with_line_numbers: bool = False,
     不必整份读进来。带行号时,行号始终是**文件里的真实行号**,可直接喂给 edit_lines。
     """
     target = safe_path(path)
-    if target.name in DENY_READ:
+    if target.name in FS_DENY_READ:
         raise PermissionError(f"{target.name} 属于敏感文件(如 .env),禁止读取")
     text, _enc = _read_text_with_encoding(target)
     lines = text.splitlines()
@@ -109,9 +118,9 @@ def read_file(path: str, with_line_numbers: bool = False,
         body = "\n".join(f"{i:>4} | {line}" for i, line in enumerate(selected, lo))
     else:
         body = "\n".join(selected)
-    if len(body) > MAX_READ_CHARS:
-        body = body[:MAX_READ_CHARS] + (
-            f"\n\n…(内容过长,只返回前 {MAX_READ_CHARS} 个字符;"
+    if len(body) > FS_MAX_READ_CHARS:
+        body = body[:FS_MAX_READ_CHARS] + (
+            f"\n\n…(内容过长,只返回前 {FS_MAX_READ_CHARS} 个字符;"
             f"请用 start_line/end_line 分段读)"
         )
     if (lo, hi) != (1, total):
@@ -157,10 +166,10 @@ def list_files(path: str = ".", show_hidden: bool = False) -> str:
 
     lines = [
         f"{e.name}/" if e.is_dir() else f"{e.name}  ({e.stat().st_size} B)"
-        for e in entries[:MAX_ENTRIES]
+        for e in entries[:FS_MAX_ENTRIES]
     ]
-    if len(entries) > MAX_ENTRIES:
-        lines.append(f"…(共 {len(entries)} 项,只显示前 {MAX_ENTRIES} 项)")
+    if len(entries) > FS_MAX_ENTRIES:
+        lines.append(f"…(共 {len(entries)} 项,只显示前 {FS_MAX_ENTRIES} 项)")
     return "\n".join([f"{target}(共 {len(entries)} 项):", *lines])
 
 
@@ -172,7 +181,7 @@ def _iter_search_paths(root: Path):
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [
             d for d in dirnames
-            if not d.startswith(".") and d not in SEARCH_SKIP_DIRS
+            if not d.startswith(".") and d not in FS_SEARCH_SKIP_DIRS
         ]
         base = Path(dirpath)
         for d in dirnames:
@@ -228,9 +237,9 @@ def find_files(name: str, path: str = ".", include_dirs: bool = False) -> str:
         what = "文件或目录" if include_dirs else "文件"
         return f"没有匹配「{name}」的{what}(搜索范围:{_rel(root)})"
     hits.sort(key=lambda p: _rel(p).lower())
-    shown = hits[:MAX_FIND_RESULTS]
+    shown = hits[:FS_MAX_FIND_RESULTS]
     lines = [f"{_rel(p)}{'/' if p.is_dir() else ''}" for p in shown]
-    tail = f"\n…(共 {len(hits)} 条,只显示前 {MAX_FIND_RESULTS} 条)" if len(hits) > MAX_FIND_RESULTS else ""
+    tail = f"\n…(共 {len(hits)} 条,只显示前 {FS_MAX_FIND_RESULTS} 条)" if len(hits) > FS_MAX_FIND_RESULTS else ""
     return "\n".join([f"匹配「{name}」共 {len(hits)} 条:", *lines]) + tail
 
 
@@ -275,7 +284,7 @@ def grep_files(pattern: str, path: str = ".", ignore_case: bool = False) -> str:
 
     逐行流式读取 —— 整本书、长日志这种大文件也照搜。按 utf-8 / gb18030 / big5 试解码,
     所以 GBK 编码的中文文件也能搜到。自动跳过隐藏目录与依赖目录,二进制文件(含空字节)跳过。
-    结果上限 MAX_GREP_MATCHES 条,超出会提示截断。path 可以是文件或目录。
+    结果上限 FS_MAX_GREP_MATCHES 条,超出会提示截断。path 可以是文件或目录。
     """
     try:
         rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
@@ -291,10 +300,10 @@ def grep_files(pattern: str, path: str = ".", ignore_case: bool = False) -> str:
     truncated = False
     too_big = 0  # 超过大小的文件数 —— 如实报出来,绝不静默跳过
     for fp in targets:
-        if fp.name in DENY_READ:
+        if fp.name in FS_DENY_READ:
             continue
         try:
-            if fp.stat().st_size > MAX_GREP_FILE_BYTES:
+            if fp.stat().st_size > FS_MAX_GREP_FILE_BYTES:
                 too_big += 1
                 continue
             with fp.open("rb") as fh:
@@ -313,9 +322,9 @@ def grep_files(pattern: str, path: str = ".", ignore_case: bool = False) -> str:
             with fp.open("r", encoding=enc, errors="replace") as fh:
                 for i, line in enumerate(fh, 1):
                     if rx.search(line):
-                        results.append((fp, i, line.strip()[:MAX_GREP_LINE_CHARS]))
+                        results.append((fp, i, line.strip()[:FS_MAX_GREP_LINE_CHARS]))
                         files_hit.add(fp)
-                        if len(results) >= MAX_GREP_MATCHES:
+                        if len(results) >= FS_MAX_GREP_MATCHES:
                             truncated = True
                             break
         except OSError:
@@ -325,7 +334,7 @@ def grep_files(pattern: str, path: str = ".", ignore_case: bool = False) -> str:
 
     skip_note = ""
     if too_big:
-        skip_note = f";另有 {too_big} 个文件超过 {MAX_GREP_FILE_BYTES // (1024 * 1024)}MB 未搜"
+        skip_note = f";另有 {too_big} 个文件超过 {FS_MAX_GREP_FILE_BYTES // (1024 * 1024)}MB 未搜"
     if not results:
         return f"没有匹配「{pattern}」的内容(搜索范围:{_rel(root)})" + skip_note
     out: list[str] = []
@@ -337,7 +346,7 @@ def grep_files(pattern: str, path: str = ".", ignore_case: bool = False) -> str:
         out.append(f"  {ln}: {txt}")
     summary = f"共 {len(results)} 处命中,{len(files_hit)} 个文件"
     if truncated:
-        summary += f"(已达上限 {MAX_GREP_MATCHES},后续未继续)"
+        summary += f"(已达上限 {FS_MAX_GREP_MATCHES},后续未继续)"
     return summary + skip_note + "\n" + "\n".join(out)
 
 
@@ -426,7 +435,7 @@ def append_file(path: str, content: str) -> str:
 def _load_lines(path: str) -> tuple[Path, list[str], str]:
     """按行读出文件,保留行尾换行符,供按行编辑的工具复用。返回 (路径, 行, 原编码)。"""
     target = safe_path(path)
-    if target.name in DENY_READ:
+    if target.name in FS_DENY_READ:
         raise PermissionError(f"{target.name} 属于敏感文件,禁止编辑")
     if not target.is_file():
         raise FileNotFoundError(f"{target} 不存在;要新建文件请用 write_file")

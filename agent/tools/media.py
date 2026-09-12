@@ -2,15 +2,24 @@ from __future__ import annotations
 
 from .registry import tool
 
+import os
+
 import base64
 
 from ..core import (
-    IMG_MAX_BYTES,
-    IMG_MIME,
-    SCREEN_MAX_DIM,
     safe_path,
     _pending_images,
 )
+
+
+# ---- media 工具专属配置(环境变量名不变,仍可在 .env 覆盖)----
+# ---- 图像(多模态)相关 ----
+MEDIA_IMG_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+            ".webp": "image/webp", ".gif": "image/gif"}
+MEDIA_IMG_MAX_BYTES = int(os.environ.get("IMG_MAX_BYTES", str(3 * 1024 * 1024)))  # 单张图片的字节上限,超出拒绝(避免 base64 后撑爆上下文)
+# 截屏:最长边会被压缩到这个像素数。视觉模型对大图会内部缩小,原样送 4K 截图
+# 只会浪费图像 token 甚至被拒,所以发送前自己压成小数。
+MEDIA_SCREEN_MAX_DIM = int(os.environ.get("SCREEN_MAX_DIM", "1280"))
 
 
 def _img_magic_ok(ext: str, data: bytes) -> bool:
@@ -56,23 +65,23 @@ def img(path: str) -> str:
     if not target.is_file():
         raise FileNotFoundError(f"{target} 不存在或不是文件")
     ext = target.suffix.lower()
-    if ext not in IMG_MIME:
-        raise ValueError(f"不支持的图片格式 {ext},支持:{'、'.join(sorted(IMG_MIME))}")
+    if ext not in MEDIA_IMG_MIME:
+        raise ValueError(f"不支持的图片格式 {ext},支持:{'、'.join(sorted(MEDIA_IMG_MIME))}")
     size = target.stat().st_size
-    if size > IMG_MAX_BYTES:
-        raise ValueError(f"图片过大({size} 字节),上限 {IMG_MAX_BYTES} 字节")
+    if size > MEDIA_IMG_MAX_BYTES:
+        raise ValueError(f"图片过大({size} 字节),上限 {MEDIA_IMG_MAX_BYTES} 字节")
 
     data = target.read_bytes()
     if not _img_magic_ok(ext, data):
         raise ValueError(f"{target.name} 的文件头与 {ext} 格式不符,可能不是有效的 {ext} 图片。")
 
     b64 = base64.b64encode(data).decode("ascii")
-    _pending_images.append(f"data:{IMG_MIME[ext]};base64,{b64}")
+    _pending_images.append(f"data:{MEDIA_IMG_MIME[ext]};base64,{b64}")
     return f"图片 {target.name} 已加载({size} 字节),将在下一轮作为图像信息交给模型。"
 
 
 def _image_to_data_url(image) -> str:
-    """把 PIL Image 压缩到最长边不超过 SCREEN_MAX_DIM,再转成 PNG data URL。
+    """把 PIL Image 压缩到最长边不超过 MEDIA_SCREEN_MAX_DIM,再转成 PNG data URL。
 
     这是回答"大图"问题的核心:屏幕截图通常远超视力模型能接受的分辨率,
     先在本地压小再发,而不是原样送一个 4K 图给模型内部缩小。
@@ -81,8 +90,8 @@ def _image_to_data_url(image) -> str:
 
     if image.mode not in ("RGB", "RGBA"):
         image = image.convert("RGB")
-    if max(image.size) > SCREEN_MAX_DIM:
-        scale = SCREEN_MAX_DIM / max(image.size)
+    if max(image.size) > MEDIA_SCREEN_MAX_DIM:
+        scale = MEDIA_SCREEN_MAX_DIM / max(image.size)
         image = image.resize(
             (max(1, int(image.size[0] * scale)), max(1, int(image.size[1] * scale))),
             Image.LANCZOS,
@@ -114,8 +123,8 @@ def screen() -> str:
     orig_w, orig_h = image.size
     url = _image_to_data_url(image)
     _pending_images.append(url)
-    cw = max(1, int(orig_w * SCREEN_MAX_DIM / max(orig_w, orig_h)))
-    ch = max(1, int(orig_h * SCREEN_MAX_DIM / max(orig_w, orig_h)))
+    cw = max(1, int(orig_w * MEDIA_SCREEN_MAX_DIM / max(orig_w, orig_h)))
+    ch = max(1, int(orig_h * MEDIA_SCREEN_MAX_DIM / max(orig_w, orig_h)))
     # 给出原分辨率与压缩后的换算,方便模型算真实点击坐标:
     # click/move 用原始分辨率坐标;真实坐标 = 图坐标 × (orig/cw)。
     return (
