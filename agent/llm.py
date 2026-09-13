@@ -12,6 +12,9 @@ from .tools.registry import TOOLS
 
 # 最近一次请求的 token 用量(来自 API 的 usage)。prompt_tokens 就是"当前上下文多大"。
 _last_usage: dict = {}
+# 本轮的起点快照(见 begin_turn)。一轮对话里模型可能调好几次工具,每次都会发出新请求、
+# 重发整个历史;只报"最后一次请求"会把前面几次全漏掉,而用户关心的恰恰是"这一句花了多少"。
+_turn_start: dict = {}
 # 本会话累计:请求数、总输出 token;以及"输入侧"的总量与总命中 ——
 # 输入每轮重发,单看累计没意义,但**命中比例**有意义(它反映缓存整体好不好使)。
 _total_usage: dict = {"requests": 0, "completion": 0, "prompt": 0, "cache_hit": 0}
@@ -42,32 +45,62 @@ def _cache_rate(prompt: int, hit: int) -> float:
     return (hit / prompt * 100) if prompt else 0.0
 
 
-def usage_line() -> str:
-    """当前上下文用量的一行摘要(还没有数据时返回空串)。
+def begin_turn() -> None:
+    """记下本轮起点(在 run() 开头调一次),之后 _turn_usage() 就能给出这一轮的真实消耗。
 
-    把**缓存命中率**直接写成百分比给出来 —— 只报命中的绝对 token 数,用户还得自己
-    去除以 prompt 才知道比例;而这个比例正是"缓存好不好使"最直观的指标。
+    为什么不能只看最后一次请求:一轮里每调一次工具就多发一次请求,每次都要重发整个
+    历史。用户问一句话触发了三次工具调用,那是四次请求 —— 只看最后那次,消耗被少算成
+    四分之一,而且上下文越大、工具越多,少算得越离谱。
     """
-    prompt = _last_usage.get("prompt")
-    if not prompt:
+    global _turn_start
+    _turn_start = dict(_total_usage)
+
+
+def _turn_usage() -> dict:
+    """本轮至今的消耗(字段与 _total_usage 相同)。"""
+    return {k: _total_usage.get(k, 0) - _turn_start.get(k, 0) for k in _total_usage}
+
+
+def usage_line() -> str:
+    """每轮结尾的一行摘要:当前上下文大小 + **本轮**消耗(还没有数据时返回空串)。
+
+    两个口径刻意分开:
+    - **上下文**:取最后一次请求的 prompt —— 那才是"现在的历史有多长",报本轮之和没意义
+    - **其余**:一律报本轮 —— 缓存命中率、输出 token 都是"这一轮整体如何",只报最后一次
+      会把中间几次工具调用白算进去的那部分漏掉
+    """
+    ctx = _last_usage.get("prompt")
+    if not ctx:
         return ""
-    hit = _last_usage.get("cache_hit", 0)
-    pct = (prompt / MAX_CONTEXT_TOKENS * 100) if MAX_CONTEXT_TOKENS else 0.0
-    return (f"上下文 {prompt:,}/{MAX_CONTEXT_TOKENS:,} tokens({pct:.1f}%)"
-            f" · 缓存命中 {_cache_rate(prompt, hit):.1f}%({hit:,})"
-            f" · 本轮输出 {_last_usage.get('completion', 0):,}")
+    t = _turn_usage()
+    pct = (ctx / MAX_CONTEXT_TOKENS * 100) if MAX_CONTEXT_TOKENS else 0.0
+    return (f"上下文 {ctx:,}/{MAX_CONTEXT_TOKENS:,}({pct:.1f}%)"
+            f" · 本轮 {t['requests']} 次请求"
+            f" · 缓存命中 {_cache_rate(t['prompt'], t['cache_hit']):.1f}%"
+            f" · 输出 {t['completion']:,} tokens")
 
 
 def usage_detail() -> str:
-    """给 /tokens 用的较详细用量:最近一次请求 + 本会话累计(含整体缓存命中率)。"""
+    """给 /tokens 用的用量:当前上下文 + **本轮**消耗 + 本会话累计。
+
+    分三段是因为口径不同,混在一起最容易误读 —— 上下文是"现在有多大",本轮是"这句话
+    花了多少",累计是"这个会话一共花了多少"。只报最后那次请求是没意义的:一轮里调了几次
+    工具就有几次请求,每次都重发了整个历史。
+    """
     if not _last_usage.get("prompt"):
         return "(还没有用量数据)"
-    total_prompt = _total_usage["prompt"]
-    total_hit = _total_usage["cache_hit"]
+    ctx = _last_usage["prompt"]
+    pct = (ctx / MAX_CONTEXT_TOKENS * 100) if MAX_CONTEXT_TOKENS else 0.0
+    t = _turn_usage()
+    tp, th, tc, tr = t["prompt"], t["cache_hit"], t["completion"], t["requests"]
+    ap, ah, ac, ar = (_total_usage["prompt"], _total_usage["cache_hit"],
+                      _total_usage["completion"], _total_usage["requests"])
     return (
-        f"{usage_line()}\n"
-        f"本会话:{_total_usage['requests']} 次请求,累计输出 {_total_usage['completion']:,} tokens\n"
-        f"整体缓存命中 {_cache_rate(total_prompt, total_hit):.1f}%({total_hit:,}/{total_prompt:,})"
+        f"上下文 {ctx:,}/{MAX_CONTEXT_TOKENS:,} tokens({pct:.1f}%)\n"
+        f"本轮:{tr} 次请求,输出 {tc:,} tokens,缓存命中 "
+        f"{_cache_rate(tp, th):.1f}%({th:,}/{tp:,})\n"
+        f"本会话:{ar} 次请求,累计输出 {ac:,} tokens,整体缓存命中 "
+        f"{_cache_rate(ap, ah):.1f}%({ah:,}/{ap:,})"
     )
 
 

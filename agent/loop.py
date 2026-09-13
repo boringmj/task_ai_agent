@@ -9,7 +9,7 @@ from .core import (
     console,
     _pending_images,
 )
-from .llm import stream_model, context_ratio
+from .llm import stream_model, context_ratio, begin_turn
 from .tools.media import inject_pending_images
 from .tools.net import reset_turn_searches
 from .tools.registry import TOOLS, dispatch
@@ -56,6 +56,8 @@ def compact(messages: list[dict], keep_recent: int = 0) -> str:
 def run(user_input: str, messages: list[dict]) -> str:
     reset_turn_searches()  # 搜索配额按轮重置,而不是整个会话共用一份
     _pending_images.clear()  # 图像也按轮清空,避免上一轮的图带到下一轮
+    begin_turn()           # 记下用量起点 —— 一轮里每调一次工具就多发一次请求,
+                           # 结尾那行统计要把这一轮的全部算进来,不能只看最后一次
 
     messages.append({"role": "user", "content": user_input})
 
