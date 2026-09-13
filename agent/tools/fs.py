@@ -34,11 +34,14 @@ FS_MAX_GREP_LINE_CHARS = int(os.environ.get("MAX_GREP_LINE_CHARS", "200"))      
 FS_SEARCH_SKIP_DIRS = {"__pycache__", "node_modules", ".pylibs"}
 
 @tool(
-    description="获取当前的日期和时间。当用户询问「现在几点」「今天几号」时使用。",
+    description="获取当前的日期、时间和星期。当用户询问「现在几点」「今天几号」「今天星期几」,"
+                "或需要判断某个日期是工作日还是周末时使用。",
     parameters={"type": "object", "properties": {}},
 )
 def get_current_time() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    """当前时间。**带上星期几** —— 只给日期的话,模型要么让用户自己算,要么张口猜错。"""
+    now = datetime.now()
+    return f"{now:%Y-%m-%d %H:%M:%S} 星期{'一二三四五六日'[now.weekday()]}"
 
 
 def _sniff_encoding(target: Path) -> str:

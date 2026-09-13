@@ -99,13 +99,24 @@ def _vm_state_get() -> dict:
 
 
 def _vm_free_port(base: int) -> int:
+    """从 base 起找一个**真的绑得上**的端口。
+
+    为什么用 bind 探测,而不是"connect 得上就算被占用":
+    端口被占着有三种表现 —— 立即拒绝、接受连接、以及**超时**(端口被绑着,但对方
+    accept 队列不响应;QEMU 的串口 `wait=off` 正是这样)。后两种都会让 connect 失败,
+    而 `except OSError` 把它们和"没人监听"一视同仁地当成空闲。实测的后果是:
+    我们兴冲冲把端口交给 QEMU → 它 bind 失败报 "Failed to find an available port"
+    → 而我们的串口**连到了别人家那个进程上**,登录卡在"未进入 shell"。
+    bind 是唯一和 QEMU 一致的判据:能绑,才是真的空。
+    """
     import socket
     for port in range(base, base + 60):
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
-                continue
-        except OSError:
-            return port
+        with socket.socket() as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+                return port          # 绑得上 = 空闲(随即随 with 关闭,交给 QEMU 去绑)
+            except OSError:
+                continue             # 绑不上 = 真被占,试下一个
     raise RuntimeError(f"端口分配失败({base} 起 60 个都被占用)")
 
 

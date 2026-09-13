@@ -119,6 +119,9 @@ def cmd_switch(ctx: Context) -> str:
     })
 
     vm_switch_session()          # 每会话一块盘,换会话就得换 VM
+    # 请终端把刚切到的这段历史重放出来。指令的返回值只是一行文本,打不了对话,
+    # 所以照旧只声明事实、由 cli 那层去重放(和 session_reset 一个套路)。
+    ctx.events.add("session_switched")
     kind = "已新建并切到" if creating else "已切到"
     return f"{kind}会话 {target}({note})。虚拟机正在按该会话的磁盘重启,可稍后用 vm_status 看。"
 

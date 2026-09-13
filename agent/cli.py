@@ -48,8 +48,10 @@ def _clip(text: str, limit: int) -> tuple[str, int]:
     return one[:limit] + "…", len(one) - limit
 
 
-def _replay_history(history: list[dict]) -> None:
-    """把恢复回来的对话**按当时的样子重放一遍** —— 和实时对话用同一套渲染。
+def _replay_history(history: list[dict], source: str = "上次会话") -> None:
+    """把恢复/切换回来的对话**按当时的样子重放一遍** —— 和实时对话用同一套渲染。
+
+    source 只改开头那句说明:启动恢复时是"上次会话",/switch 之后是"刚切到的会话"。
 
     刻意不做成"摘要式预览":那样和真实对话长得不一样,一眼看去分不清哪些是
     刚才发生的、哪些是上次的。这里逐条重放:用户输入、思考、工具调用、
@@ -69,7 +71,7 @@ def _replay_history(history: list[dict]) -> None:
 
     console.print("─" * 46, style="dim")
     console.print(
-        f"↓ 以下是上次会话的重放(共 {len(readable)} 条对话,重放最近 {len(shown)} 条)"
+        f"↓ 以下是{source}的重放(共 {len(readable)} 条对话,重放最近 {len(shown)} 条)"
         f" —— 已经接着这段继续,不用重新说一遍",
         style="dim", markup=False,
     )
@@ -279,6 +281,10 @@ def main() -> None:
                     cmd_result += session_reset_hint()
                 if cmd_result:
                     console.print(cmd_result, style="dim")
+                if "session_switched" in cmd_ctx.events:
+                    # 切完会话,把新会话的历史按原样重放一遍 —— 只说一句"已切到 X",
+                    # 用户看不到里面聊过什么。和启动时的重放共用同一套渲染,长得一样。
+                    _replay_history(messages, source="刚切到的会话")
                 if "exit" in cmd_ctx.events:      # /exit、/quit —— 收尾动作由这层做
                     break
                 continue
@@ -309,7 +315,10 @@ def main() -> None:
             # 追加会把"压缩后"和"压缩前"的消息混在一个文件里。文件本身有界
             # (受上下文上限与压缩约束,通常几百 KB),整体重写的开销可忽略,
             # 换来的是怎么都不会错。
-            rewrite_session(messages, session_id)
+            # 会话 id 每次现取 —— /switch 会换掉它,而启动时那个 session_id 是局部变量、
+            # 切完就过期了。取错的那个会把**新会话的历史写进旧会话的文件**,而且落盘是
+            # 整份重写,旧会话原有内容会被直接覆盖掉(实测踩过:切一次会话丢一份记录)。
+            rewrite_session(messages, current_session_id())
 
             console.print("AI >", style="bold green")
             # Markdown 要拿到完整文本才能正确解析,所以是等模型说完再一次性渲染
