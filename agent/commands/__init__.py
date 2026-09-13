@@ -113,8 +113,13 @@ def system_message() -> str:
     lines = []
     for name, desc, hint, aliases in all_commands():
         suffix = f"(也可写成 {'、'.join(aliases.split('、'))})" if aliases else ""
-        # 用 hint(给模型看的时机);没写就退回 description
-        lines.append(f"- `{name}`{suffix} —— {hint or desc}")
+        # description 是**公共信息** —— 用户和模型都该知道这条指令是做什么的;
+        # hint 才是额外给模型的"什么场合值得建议用户用"。两者不是互斥的两半,
+        # 模型只拿到 hint 的话,用户问"这个指令是干嘛的"它就答不上来。
+        line = f"- `{name}`{suffix} —— {desc}"
+        if hint:
+            line += f"\n  建议时机:{hint}"
+        lines.append(line)
     return prompts.load("commands_list", commands="\n".join(lines))
 
 
