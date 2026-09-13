@@ -913,6 +913,10 @@ def vm_ssh_login(host_port: int = 0) -> str:
         "set -e\n"
         "[ -x /usr/sbin/sshd ] || { echo MISSING_SSHD; exit 3; }\n"
         f"id -u {_shq(user)} >/dev/null 2>&1 || adduser -D -s /bin/ash {_shq(user)}\n"
+        # 保证它在 wheel 组里 —— doas 按组授权。镜像里已经预置好,但从**旧镜像**派生的
+        # 会话盘没有,那些会话开出来的 dev 就提不了权。幂等:已在组里时 adduser 会报错,
+        # 所以吞掉(这是唯一一处"故意忽略失败"的地方)。
+        f"adduser {_shq(user)} wheel 2>/dev/null || true\n"
         "if command -v chpasswd >/dev/null 2>&1; then\n"
         f"    echo {_shq(f'{user}:{password}')} | chpasswd\n"
         "else\n"
