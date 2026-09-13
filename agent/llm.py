@@ -61,14 +61,13 @@ def usage_line() -> str:
 def usage_detail() -> str:
     """给 /tokens 用的较详细用量:最近一次请求 + 本会话累计(含整体缓存命中率)。"""
     if not _last_usage.get("prompt"):
-        return "(还没有用量数据,先聊一句再看)"
+        return "(还没有用量数据)"
     total_prompt = _total_usage["prompt"]
     total_hit = _total_usage["cache_hit"]
     return (
         f"{usage_line()}\n"
-        f"本会话:共 {_total_usage['requests']} 次请求,累计输出 {_total_usage['completion']:,} tokens\n"
-        f"缓存:整体命中 {_cache_rate(total_prompt, total_hit):.1f}%"
-        f"({total_hit:,}/{total_prompt:,} 输入 token 走了缓存)"
+        f"本会话:{_total_usage['requests']} 次请求,累计输出 {_total_usage['completion']:,} tokens\n"
+        f"整体缓存命中 {_cache_rate(total_prompt, total_hit):.1f}%({total_hit:,}/{total_prompt:,})"
     )
 
 

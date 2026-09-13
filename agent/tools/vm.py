@@ -423,7 +423,7 @@ def vm_status() -> str:
         return f"虚拟机就绪(实例 {VM_INSTANCE[:8]},串口 {st['port']})。"
     if st["status"] == "error":
         return f"虚拟机出错:{st['error']}"
-    return "虚拟机会在后台启动,agent 退出后会自动销毁。"
+    return "虚拟机在后台启动中(agent 退出时销毁)。"
 
 
 @tool(
@@ -966,7 +966,7 @@ def vm_reset() -> str:
 
     _vm_state_set("idle", "已重置,等待重新启动")
     vm_kickoff()
-    return "已重置虚拟机:磁盘已删除,正在用基础镜像重新启动(稍后用 vm_status 看进度)。"
+    return "虚拟机已重置,正在用基础镜像重启。"
 
 
 def _vm_cleanup() -> None:

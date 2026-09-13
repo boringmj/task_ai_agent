@@ -27,7 +27,7 @@ def cmd_reset(ctx: Context) -> str:
     # 只声明"会话被重置了"这个事实。虚拟机没跟着重置、要不要提醒用户 —— 那是 VM 那边
     # 的事,由 cli 接上(见 commands/__init__.py 里 events 的说明)。
     ctx.events.add("session_reset")
-    return "已重置会话:之前的对话不再带入(文件与长期记忆未动)。"
+    return "会话已重置(文件与长期记忆未动)。"
 
 
 @command(
@@ -42,7 +42,7 @@ def cmd_sessions(ctx: Context) -> str:
     if not rows:
         return "(这个工作区还没有会话记录)"
     active = current_session_id()
-    lines = [f"当前活跃会话:{active}", "", "这个工作区里的会话(最近用的在前):"]
+    lines = [f"当前活跃会话:{active}", "", "全部会话(最近在前):"]
     for s in rows:
         # 状态要一眼看出来:哪个是当前、哪个被别的 agent 占着(切不过去)、
         # 哪个是空的、哪个目录已经没了
@@ -124,7 +124,7 @@ def cmd_switch(ctx: Context) -> str:
     # 所以照旧只声明事实、由 cli 那层去重放(和 session_reset 一个套路)。
     ctx.events.add("session_switched")
     kind = "已新建并切到" if creating else "已切到"
-    return f"{kind}会话 {target}({note})。虚拟机正在按该会话的磁盘重启,可稍后用 vm_status 看。"
+    return f"{kind}会话 {target}({note}),虚拟机正在按该会话的磁盘重启。"
 
 
 @command(

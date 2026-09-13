@@ -71,8 +71,8 @@ def _replay_history(history: list[dict], source: str = "上次会话") -> None:
 
     console.print("─" * 46, style="dim")
     console.print(
-        f"↓ 以下是{source}的重放(共 {len(readable)} 条对话,重放最近 {len(shown)} 条)"
-        f" —— 已经接着这段继续,不用重新说一遍",
+        f"↓ 以下是{source}的重放(共 {len(readable)} 条,最近 {len(shown)} 条)"
+        f" —— 已接着继续,不用重说",
         style="dim", markup=False,
     )
     for m in shown:
@@ -246,11 +246,9 @@ def main() -> None:
         console.print(f"VM:{vm_status()}", style="dim" if ready else "yellow")
     except Exception as exc:  # noqa: BLE001
         console.print(f"VM:启动失败(不影响 agent)—— {exc}", style="yellow")
-    console.print("Agent 已启动。", style="bold")
-    console.print("输入多行:连续输入,最后一个空行提交(支持粘贴)。", style="dim")
-    console.print("执行中 Ctrl+C=取消本轮;空闲时 Ctrl+C=退出;exit 退出。", style="dim")
+    console.print("多行输入用空行提交;执行中 Ctrl+C 取消本轮,空闲时退出。", style="dim")
     console.print("指令:" + "、".join(n for n, *_ in all_commands())
-                  + f"(敲 /help 看说明);上下文占用达 {AUTO_COMPACT_RATIO:.0%} 会自动压缩。",
+                  + f"(/help 有说明);上下文到 {AUTO_COMPACT_RATIO:.0%} 自动压缩。",
                   style="dim")
     console.print(f"工作区:{ROOT}", style="dim")
     console.print(f"会话:{session_id} — {session_note};{resume_note}", style="dim")
