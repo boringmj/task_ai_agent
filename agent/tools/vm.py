@@ -918,10 +918,18 @@ def vm_ssh_login(host_port: int = 0) -> str:
         "else\n"
         f"    printf '%s\\n%s\\n' {_shq(password)} {_shq(password)} | passwd {_shq(user)}\n"
         "fi\n"
-        "grep -qE '^[[:space:]]*PasswordAuthentication[[:space:]]+yes'"
-        " /etc/ssh/sshd_config 2>/dev/null"
-        " || echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config\n"
-        "pgrep -x sshd >/dev/null 2>&1 || /usr/sbin/sshd\n"
+        # 允许密码登录。**不能只往后追加**:sshd 只认第一个出现的值,配置里若已有一条
+        # 非注释的 PasswordAuthentication no,追加的那行永远不会生效 —— 而工具照样报告
+        # "已开好",用户却连不上、也不知道该往哪看。先删掉所有非注释的同类行,再写唯一一条。
+        "sed -i '/^[[:space:]]*PasswordAuthentication[[:space:]]/d' /etc/ssh/sshd_config\n"
+        "echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config\n"
+        # 改完得让**正在跑**的 sshd 重新读配置(SIGHUP 重载,不会断已有连接);
+        # 没在跑就直接起。原来只判断"没跑才起",于是对已运行的 sshd 这次改动等于没改。
+        "if pgrep -x sshd >/dev/null 2>&1; then\n"
+        "    killall -HUP sshd 2>/dev/null || true\n"
+        "else\n"
+        "    /usr/sbin/sshd\n"
+        "fi\n"
         "echo SSH_READY\n"
     )
     r = _vm_exec_raw(script, timeout=30)
