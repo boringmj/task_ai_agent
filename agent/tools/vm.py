@@ -82,6 +82,10 @@ _vm_tunnels: dict = {}                              # host_port -> 常驻转发�
 
 _vm_proc = None
 _vm_thread: "threading.Thread | None" = None
+# 启动代次:每逢"重置/切换会话"就 +1,让**还在跑的旧启动流程自己作废**。
+# 光靠 kill + join 堵不住:线程可能正卡在串口登录的重试里,join 超时返回后它又接着
+# spawn 一台 QEMU —— 那台就成了没人认领的孤儿,把盘锁住(实测 /vmreset 报 WinError 32)。
+_vm_gen = 0
 _vm_serial_port: int | None = None
 # 线程安全的状态:{status, step, port, error}
 _vm_state: dict = {"status": "idle", "step": "", "port": None, "error": ""}
@@ -261,7 +265,7 @@ _vm_ser: "_VmSerial | None" = None        # 保持登录态的串口会话
 _vm_serial_lock = threading.Lock()          # 串口只用于启动时注入 token,加锁避免冲突
 
 
-def _vm_spawn_and_login(serial_port: int, vmserver_host_port: int) -> None:
+def _vm_spawn_and_login(serial_port: int, vmserver_host_port: int, gen: int) -> None:
     """boot QEMU(映射 guest:40000 的 vmserver)+ 串口登录,设置 _vm_proc/_vm_ser。"""
     global _vm_proc, _vm_ser
     # 起新的之前先收掉上一台 —— _vm_proc 是唯一句柄,直接赋值覆盖就等于把旧 QEMU
@@ -295,6 +299,11 @@ def _vm_spawn_and_login(serial_port: int, vmserver_host_port: int) -> None:
     except OSError:
         pass
     time.sleep(1)
+    if gen != _vm_gen:
+        # 刚拉起来就被作废了(重置/切换会话正好插在这一瞬)—— 当场收掉。
+        # 留着它就是孤儿:占着磁盘和串口端口,连 /vmreset 都会栽在 WinError 32 上。
+        _vm_kill_current()
+        return
     if _vm_proc.poll() is not None and _vm_proc.returncode != 0:
         detail = ""
         try:
@@ -309,24 +318,34 @@ def _vm_spawn_and_login(serial_port: int, vmserver_host_port: int) -> None:
     _vm_ser = _vm_serial_login(serial_port)
 
 
-def _vm_worker() -> None:
+def _vm_worker(gen: int) -> None:
     """后台线程:boot → 串口登录 → 注入每启动随机 token → READY。
 
     之后 vm_run 走 socket 到 vmserver,不再用裸串口;串口只在启动时注入 token。
+
+    gen 是本次启动的代次。流程中途被"重置/切换会话"作废(见 _vm_gen)时,**每个关键
+    步骤前**都自行退出 —— 尤其是拉起 QEMU 之前那次:旧流程要是已经没人管了还把 QEMU
+    硬拉起来,那台就是谁也杀不掉的孤儿。
     """
     global _vm_token, _vm_vmserver_host_port
     try:
+        if gen != _vm_gen:
+            return
         if not VM_BASE.exists():
             raise FileNotFoundError(
                 f"缺少 vmserver 基础盘 {VM_BASE}。请先用 qemu-img convert 生成 vm/alpine-vmserver.qcow2。")
         _vm_ensure()
+        if gen != _vm_gen:
+            return
         serial_port = _vm_free_port(3000)
         vmserver_host_port = _vm_free_port(5000)
         global _vm_serial_port
         _vm_serial_port = serial_port
         _vm_vmserver_host_port = vmserver_host_port
         _vm_state_set("booting", "启动 QEMU…", port=vmserver_host_port)
-        _vm_spawn_and_login(serial_port, vmserver_host_port)
+        _vm_spawn_and_login(serial_port, vmserver_host_port, gen)
+        if gen != _vm_gen:
+            return                      # 启动期间被作废,别再往下走
 
         # 生成并注入每启动随机 token(vmserver 每次请求读 /root/.vm_token,无需重启服务)
         _vm_token = uuid.uuid4().hex + uuid.uuid4().hex
@@ -351,9 +370,11 @@ def _vm_worker() -> None:
 
 def _vm_kickoff() -> None:
     """启动后台线程(幂等)。"""
-    global _vm_thread
+    global _vm_thread, _vm_gen
     if _vm_thread is not None and _vm_thread.is_alive():
         return
+    _vm_gen += 1                       # 新一代:顺带让任何还在跑的旧流程作废
+    gen = _vm_gen
     # 起自己的 VM 之前先扫掉上次强杀留下的孤儿 —— 它们可能正锁着某个会话的磁盘,
     # 不先清掉的话那个会话恢复时会撞上"盘被占用"。放在这里而不是 cli 里,
     # 是为了让任何调用 kickoff 的入口都自动带上这道兜底。
@@ -361,7 +382,7 @@ def _vm_kickoff() -> None:
         _vm_cleanup_stale()
     except Exception:  # noqa: BLE001 - 清扫失败不该挡启动
         pass
-    _vm_thread = threading.Thread(target=_vm_worker, daemon=True)
+    _vm_thread = threading.Thread(target=_vm_worker, args=(gen,), daemon=True)
     _vm_thread.start()
 
 
@@ -916,6 +937,8 @@ def vm_switch_session() -> None:
     机器接着用,两边对不上(你以为在 A 的环境里,实际操作的是 B 的文件系统)。
     收掉当前这台时会先让 guest 刷盘(见 _vm_cleanup),不会丢数据。
     """
+    global _vm_gen
+    _vm_gen += 1                       # 先作废正在跑的启动流程(见 _vm_worker 的说明)
     _vm_cleanup()                      # 刷盘 + 停掉旧会话的 VM + 关转发
     _vm_stop_thread()                  # 还要等线程真的结束 —— 原来只是置 None,线程仍在跑
     _vm_state_set("idle", "会话已切换,虚拟机将重新启动")
@@ -929,9 +952,11 @@ def vm_reset() -> str:
     "推倒重来"的口子,否则那块盘只会越长越大。**不可恢复**:VM 里所有东西都会没。
     工作区文件与长期记忆不受影响。
     """
-    _vm_kill_current()          # 先停掉 QEMU —— 它占着盘就删不掉(实测 WinError 32)
-    _vm_stop_thread()           # 线程也得收工,否则它随后又拉起一台(见该函数注释)
-    time.sleep(0.3)             # 再留一点时间让系统彻底放掉文件句柄
+    global _vm_gen
+    _vm_gen += 1                # 先作废正在跑的启动流程 —— 它会在下一个检查点自行退出
+    _vm_kill_current()          # 再停掉已经起来的 QEMU:它占着盘就删不掉(实测 WinError 32)
+    _vm_stop_thread()           # 等线程收工;它此时已知自己作废,不会再去拉新的
+    time.sleep(0.3)             # 最后留一点时间让系统彻底放掉文件句柄
 
     try:
         _vm_disk().unlink(missing_ok=True)
