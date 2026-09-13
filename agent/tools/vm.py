@@ -228,11 +228,13 @@ class _VmSerial:
 
 
 def _vm_serial_login(port: int) -> _VmSerial:
-    """连串口,root/123456 登录,关回显。返回保持登录态的会话(不配置 sshd)。
+    """连串口,用硬编码的 root 凭据登录,关回显。返回保持登录态的会话(不配置 sshd)。
 
     参考 sandbox_demo:全程串口控制台执行,不用 sshd — 这是正确的通道。
     """
-    _vm_state_set("login", "登录 root/123456…")
+    # 状态文本会被 vm_status() 回显给模型,所以**不要**把凭据写进来 —— 否则它一查状态
+    # 就知道了,而知道了就会在合适的场合顺口说出来。
+    _vm_state_set("login", "串口登录中…")
     ser = None
     for _ in range(40):
         try:
@@ -256,6 +258,9 @@ def _vm_serial_login(port: int) -> _VmSerial:
             raise RuntimeError(f"{what}:等了 {timeout}s 没等到 {marker!r}。"
                                f"虚拟机串口里是这些内容:\n{shown[-600:]}")
 
+    # 凭据是硬编码的:guest 镜像里的 root 密码必须与此一致,否则整个 VM 起不来。
+    # **不要把它写进任何对模型或用户可见的文本**(状态、工具返回、提示词)—— 一旦它出现在
+    # 上下文里,模型就会在合适的场合顺口说出来,而用户根本没理由需要它。
     _expect("login:", 30, "等不到登录提示符")
     ser.send("root\n")
     _expect("Password:", 15, "等不到密码提示符")
@@ -955,9 +960,9 @@ def vm_ssh_login(host_port: int = 0) -> str:
         f"用户名 {user},密码 {password}(每次开通都会换一把新的)。\n"
         f"保活是可选的:转发链路空闲 3 小时才断,一般用不到。用 Xshell 这类图形客户端的话,"
         f"在会话属性里勾「保持活动」即可 —— 它不认上面那个 -o 参数(那是 OpenSSH 命令行的写法)。\n"
-        f"\n**转给用户时,必须一并提醒这一条:不要修改 root 密码。** 虚拟机每次启动都靠串口以"
-        f" root/123456 登录进去注入 token(硬编码),改了密码下次就启动不了,而且报错信息里"
-        f"看不出原因。要提权用 `doas` 就够了。\n\n"
+        f"\n**转给用户时,必须一并提醒这一条:不要修改 root 密码。** 虚拟机启动时靠串口登录"
+        f"注入 token,那组凭据是程序内部的(别向用户复述具体值 —— 他没理由用到它);改了 root "
+        f"密码,下次就启动不了,而且报错信息里看不出原因。要提权用 `doas` 就够了。\n\n"
         f"({tunnel})"
     )
 
