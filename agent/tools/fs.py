@@ -684,8 +684,8 @@ def _move_one(source: str, destination: str, overwrite: bool) -> str:
 
 @tool(
     description="移动或重命名工作区内的文件、目录。同一目录内换个名字就是重命名,换到别的目录就是移动。"
-                "**source 可以给数组,一次移多个**(上限 20 个)—— 这时候 destination 必须是"
-                "一个**已存在的目录**,它们各自沿用原名移进去。"
+                "**source 可以给数组,一次移多个**(上限 20 个)—— 这时候 destination 要是个**目录**"
+                "(它们各自沿用原名移进去),目录不存在会自动创建;目标若是个已存在的文件则报错,"
                 "目标的父目录不存在会自动创建;目标是一个已存在的目录时,会把源移动进去并沿用原名。"
                 "默认不允许覆盖已存在的目标文件,需要覆盖时先征求用户同意再带 overwrite=true 重试。",
     parameters={
@@ -726,10 +726,19 @@ def move_file(source, destination: str, overwrite: bool = False) -> str:
         return _move_one(sources[0], destination, overwrite)
 
     dest = safe_path(destination)
+    created = ""
     if not dest.is_dir():
-        why = "不存在" if not dest.exists() else "不是目录"
-        return (f"错误:一次移多个时,destination 必须是**已存在的目录**(让它们各自沿用原名"
-                f"移进去);而 {dest} {why}")
+        if dest.exists():
+            return (f"错误:一次移多个时 destination 得是目录,而 {dest} 是个已存在的文件 —— "
+                    f"它们没法共用一个文件名。换个目录名,或者分开移。")
+        # 不存在就建出来。单文件时本来就会自动建父目录,多文件时建"目标目录"是同一个道理,
+        # 不该反过来卡住。但返回里要明说建了什么 —— 万一模型把 out.txt 当目录传进来,
+        # 它得看见自己凭空造了个目录,而不是以为文件被移进去了。
+        try:
+            dest.mkdir(parents=True)
+            created = f"(目标目录 {dest} 原先不存在,已创建)\n"
+        except OSError as exc:
+            return f"错误:创建目标目录 {dest} 失败:{exc}"
 
     ok, bad = [], []
     for s in sources:
@@ -741,4 +750,4 @@ def move_file(source, destination: str, overwrite: bool = False) -> str:
     lines += [f"  {x}" for x in ok]
     if bad:
         lines += [f"失败 {len(bad)} 个:"] + bad
-    return "\n".join(lines)
+    return created + "\n".join(lines)
