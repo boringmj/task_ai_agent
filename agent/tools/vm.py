@@ -234,7 +234,7 @@ def _vm_serial_login(port: int) -> _VmSerial:
     """
     # 状态文本会被 vm_status() 回显给模型,所以**不要**把凭据写进来 —— 否则它一查状态
     # 就知道了,而知道了就会在合适的场合顺口说出来。
-    _vm_state_set("login", "串口登录中…")
+    _vm_state_set("login", "串口登录")
     ser = None
     for _ in range(40):
         try:
@@ -352,7 +352,7 @@ def _vm_worker(gen: int) -> None:
         global _vm_serial_port
         _vm_serial_port = serial_port
         _vm_vmserver_host_port = vmserver_host_port
-        _vm_state_set("booting", "启动 QEMU…", port=vmserver_host_port)
+        _vm_state_set("booting", "启动 QEMU", port=vmserver_host_port)
         _vm_spawn_and_login(serial_port, vmserver_host_port, gen)
         if gen != _vm_gen:
             return                      # 启动期间被作废,别再往下走
@@ -422,18 +422,36 @@ def session_reset_hint() -> str:
 
 
 @tool(
-    description="查看沙箱虚拟机的当前状态:进行到哪一步、是否已就绪、连接端口。"
-                "虚拟机在后台启动,可能没就绪;用这个确认是否能用。",
+    description="查看沙箱虚拟机的当前状态:进行到哪一步、是否已就绪。"
+                "**别反复查** —— 只在 `vm_start` 之后确认一次,或者别的 vm 命令回了"
+                "「未就绪」时看一遍;`vm_run` / `vm_fetch` 能正常返回就说明虚拟机是好的,"
+                "不需要再确认状态。启动通常要 10~30 秒,这期间查几次都一样。",
     parameters={"type": "object", "properties": {}},
 )
 def vm_status() -> str:
-    """查看沙箱虚拟机的当前状态(进行到哪一步、是否就绪)。"""
+    """查看沙箱虚拟机的当前状态(进行到哪一步、是否就绪)。
+
+    每种状态都要**分别说清楚**,并且把 state 里的 step 一并带出来 —— 原来把 idle /
+    booting / login 全糊成一句"在后台启动中",模型分不清"还没开始"和"正在起",
+    只能隔几秒问一遍。返回值里还要直接写明"别反复查",因为这张表就是给模型看的。
+    """
     st = vm_state_get()
-    if st["status"] == "ready":
-        return f"虚拟机就绪(实例 {VM_INSTANCE[:8]},串口 {st['port']})。"
-    if st["status"] == "error":
-        return f"虚拟机出错:{st['error']}"
-    return "虚拟机在后台启动中(agent 退出时销毁)。"
+    status, step = st["status"], st["step"]
+    if status == "ready":
+        return (f"虚拟机就绪(实例 {VM_INSTANCE[:8]},串口 {st['port']}),可以正常使用。"
+                f"后续 vm_run / vm_fetch / vm_push 等能正常返回,就**不必再查状态**。")
+    if status == "error":
+        return f"虚拟机启动失败:{st['error']}(可 /vmreset 重置后重来)"
+    if status == "booting":
+        return (f"虚拟机正在启动:{step or '启动 QEMU'}。约 10~30 秒 —— "
+                f"**这期间反复查不会有新结果**,先去做别的或稍后再问一次。")
+    if status == "login":
+        return f"虚拟机已启动,{step or '正在串口登录'},再等几秒即可。"
+    # idle:要么压根没请求过启动,要么刚被 /vmreset 或会话切换清掉 —— 后者会自动重启,
+    # 这时候叫人去手动 vm_start 是错的,所以两种情况要分开说
+    if step:
+        return f"{step}。它会在后台自动重启,等十几秒再问即可。"
+    return "虚拟机尚未启动。要用就先调 vm_start。"
 
 
 @tool(
