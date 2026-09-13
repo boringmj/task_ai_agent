@@ -49,7 +49,7 @@ def cmd_sessions(ctx: Context) -> str:
         if s["id"] == active:
             state = "← 当前"
         elif s["busy"]:
-            state = "! 被另一个 agent 占用,切不过去"
+            state = "! 被另一个 agent 占用"
         elif s["missing"]:
             state = "(目录已丢失)"
         else:
@@ -81,7 +81,7 @@ def cmd_switch(ctx: Context) -> str:
             if s["active"]:
                 state = "← 当前"
             elif s["busy"]:
-                state = "! 被另一个 agent 占用,切不过去"
+                state = "! 被另一个 agent 占用"
             elif s["missing"]:
                 state = "(目录已丢失)"
             else:
@@ -94,14 +94,14 @@ def cmd_switch(ctx: Context) -> str:
         target = new_session_id()
     else:
         if not session_dir(target).exists():
-            return f"没有会话 {target}。用 /sessions 看有哪些。"
+            return f"没有会话 {target}。用 /sessions 查询 id。"
 
     if target == cur:
         return f"已经在会话 {target} 上了。"
 
     # 原子认领目标:抢不到说明别人正在用,就不切
     if not try_claim(target):
-        return f"会话 {target} 正被另一个 agent 占用,不能切过去(换一个,或 /switch new)。"
+        return f"会话 {target} 正被另一个 agent 占用(换一个,或 /switch new)。"
 
     release_owner(cur)          # 先拿到新的,再放旧的 —— 反过来的话认领失败就没主了
     set_current_session(target)
