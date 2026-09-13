@@ -120,6 +120,40 @@ def _vm_free_port(base: int) -> int:
     raise RuntimeError(f"端口分配失败({base} 起 60 个都被占用)")
 
 
+def _vm_kill_current(timeout: int = 5) -> None:
+    """杀掉本进程起的这台 QEMU,并**等它真的退出**。
+
+    等这一下不是讲究:kill 只负责发信号,进程没退干净时**磁盘句柄还开着** ——
+    紧接着的删除或重建就会撞上 WinError 32("另一个程序正在使用此文件"),
+    也就是 /vmreset 报的那个错。
+    """
+    global _vm_proc
+    proc, _vm_proc = _vm_proc, None
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=timeout)
+    except Exception:  # noqa: BLE001 - 杀不掉也只能继续,后面还有启动时的孤儿清扫兜底
+        pass
+
+
+def _vm_stop_thread(timeout: int = 10) -> None:
+    """等后台启动线程收工,并让 _vm_kickoff 可以重新拉起。
+
+    不 join 的后果很实在:_vm_kickoff 的幂等判断是"线程还活着就别起新的",而
+    vm_reset / vm_switch_session 会先把 _vm_thread 置 None 绕过它。旧线程还没结束
+    (比如卡在串口登录的重试循环里)时新线程就起来了 —— **两个 worker 各起一台
+    QEMU**,其中一台当场失去引用变成孤儿,占着磁盘和串口端口不放(实测:那种情况下
+    /vmreset 删不掉盘,而该会话的 VM 再也起不来)。
+    """
+    global _vm_thread
+    t, _vm_thread = _vm_thread, None
+    if t is not None and t.is_alive():
+        t.join(timeout=timeout)
+
+
 def _vm_ensure() -> None:
     _vm_session_dir().mkdir(parents=True, exist_ok=True)   # 磁盘在会话目录里,不在镜像目录
     if not _vm_disk().exists():
@@ -230,6 +264,10 @@ _vm_serial_lock = threading.Lock()          # 串口只用于启动时注入 tok
 def _vm_spawn_and_login(serial_port: int, vmserver_host_port: int) -> None:
     """boot QEMU(映射 guest:40000 的 vmserver)+ 串口登录,设置 _vm_proc/_vm_ser。"""
     global _vm_proc, _vm_ser
+    # 起新的之前先收掉上一台 —— _vm_proc 是唯一句柄,直接赋值覆盖就等于把旧 QEMU
+    # 扔在后台当孤儿:它继续占着磁盘和串口端口,谁都杀不掉(下次启动的孤儿清扫也
+    # 未必认得它)。这是最后一道保险,前面几处 kill 各有各的竞态。
+    _vm_kill_current()
     cmd = [
         str(VM_QEMU_SYSTEM),
         "-drive", f"file={_vm_disk()},if=virtio",
@@ -878,9 +916,8 @@ def vm_switch_session() -> None:
     机器接着用,两边对不上(你以为在 A 的环境里,实际操作的是 B 的文件系统)。
     收掉当前这台时会先让 guest 刷盘(见 _vm_cleanup),不会丢数据。
     """
-    global _vm_thread
     _vm_cleanup()                      # 刷盘 + 停掉旧会话的 VM + 关转发
-    _vm_thread = None                  # 线程已结束,允许重新拉起
+    _vm_stop_thread()                  # 还要等线程真的结束 —— 原来只是置 None,线程仍在跑
     _vm_state_set("idle", "会话已切换,虚拟机将重新启动")
     _vm_kickoff()
 
@@ -892,17 +929,9 @@ def vm_reset() -> str:
     "推倒重来"的口子,否则那块盘只会越长越大。**不可恢复**:VM 里所有东西都会没。
     工作区文件与长期记忆不受影响。
     """
-    global _vm_thread
-    try:
-        if _vm_proc is not None and _vm_proc.poll() is None:
-            _vm_proc.kill()                    # 先停掉,QEMU 占着盘就删不掉
-            try:
-                _vm_proc.wait(timeout=5)
-            except Exception:
-                pass
-    except Exception:
-        pass
-    time.sleep(0.3)                            # 等 QEMU 释放文件句柄
+    _vm_kill_current()          # 先停掉 QEMU —— 它占着盘就删不掉(实测 WinError 32)
+    _vm_stop_thread()           # 线程也得收工,否则它随后又拉起一台(见该函数注释)
+    time.sleep(0.3)             # 再留一点时间让系统彻底放掉文件句柄
 
     try:
         _vm_disk().unlink(missing_ok=True)
@@ -911,7 +940,6 @@ def vm_reset() -> str:
                 f"确认没有其它 agent 实例在跑同一个会话后重试。")
 
     _vm_state_set("idle", "已重置,等待重新启动")
-    _vm_thread = None                          # 让 _vm_kickoff 能重新起线程
     _vm_kickoff()
     return "已重置虚拟机:磁盘已删除,正在用基础镜像重新启动(稍后用 vm_status 看进度)。"
 
