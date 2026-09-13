@@ -199,12 +199,25 @@ def _vm_serial_login(port: int) -> _VmSerial:
             time.sleep(0.5)
     if ser is None:
         raise ConnectionError("连不上虚拟机串口")
-    ser.read_until("login:", 30)
+    def _expect(marker: str, timeout: int, what: str) -> None:
+        """等一个标志串;等不到就**把 guest 实际说的话一并报出来**。
+
+        以前这里直接丢掉 read_until 的返回值,失败时只有一句干巴巴的结论 ——
+        guest 是卡在引导、内核 panic、还是压根没启动,全无线索(实测排查一次
+        "进不去 shell"为此绕了大圈)。串口在这一刻收到的那段文本就是唯一现场,
+        没有理由扔掉。
+        """
+        got = ser.read_until(marker, timeout)
+        if marker not in got:
+            shown = got.strip() or "(这段时间串口一个字节都没有)"
+            raise RuntimeError(f"{what}:等了 {timeout}s 没等到 {marker!r}。"
+                               f"虚拟机串口里是这些内容:\n{shown[-600:]}")
+
+    _expect("login:", 30, "等不到登录提示符")
     ser.send("root\n")
-    ser.read_until("Password:", 15)
+    _expect("Password:", 15, "等不到密码提示符")
     ser.send("123456\n")
-    if "#" not in ser.read_until("#", 25):  # 等 shell 提示符,确认真进入 shell
-        raise RuntimeError("串口登录未进入 shell")
+    _expect("#", 25, "登录后没进到 shell")
     ser.send("stty -echo\n")  # 关回显:命令输出与输入回声分离,避免误判
     ser.drain()
     return ser
