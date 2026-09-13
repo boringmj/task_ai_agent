@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from rich.markdown import Markdown
+
 from .core import (
     MODEL,
     MAX_CONTEXT_TOKENS,
@@ -171,5 +173,15 @@ def stream_model(messages: list[dict]) -> tuple[str, list[dict], str]:
     _close_reasoning()
 
     tool_calls = [tool_slots[i] for i in sorted(tool_slots)]
-    return "".join(content_parts), tool_calls, "".join(reason_parts)
+    content = "".join(content_parts)
+
+    # 这一轮**还要继续调工具**时,它说的那几句话也当场打出来 —— 通常是"我先看看这个文件"
+    # 这类过程说明。原来这些话是隐形的:run() 只在最后一轮 return content,中间轮只把
+    # content 存进 messages,而 cli 只渲染最终 reply —— 于是用户只能靠事后重放才看得到。
+    # 既然就在上下文里,没道理不显示。(最后一轮不打,那个由 cli 用它自己的样式渲染。)
+    if tool_calls and content.strip():
+        console.print("AI >", style="bold green", markup=False)
+        console.print(Markdown(content.strip()))
+
+    return content, tool_calls, "".join(reason_parts)
 
