@@ -24,6 +24,11 @@ import threading
 PORT = int(os.environ.get("VMSERVER_PORT", "40000"))
 TOKEN_FILE = os.environ.get("VMSERVER_TOKEN_FILE", "/root/.vm_token")
 MAX_OUTPUT = 200_000       # 单次命令输出上限,防撑爆内存
+# proxy 链路的空闲超时。原来 conn/upstream 两边都设 30 秒 —— 后果是 SSH 挂上半分钟不动
+# 就断,而且断得莫名其妙(HTTP 那种请求-响应太快,根本碰不到这条路径,所以一直没暴露)。
+# 给足 3 小时,和宿主侧 relay 的 VM_LONG_TIMEOUT 对齐;对端**真的**断开时 recv 会返回空串
+# 正常收尾,不靠这个超时兜底,所以放大是安全的。
+PROXY_IDLE_TIMEOUT = 10800
 DEFAULT_TIMEOUT = 60
 # 上限放到 3 小时:构建/测试/下载这类长任务够用,同时仍然兜住"挂死的命令"——
 # 超时是回收它们的唯一机制,所以不设成"永不超时"(那样一条等输入的 cat 会永久
@@ -96,8 +101,8 @@ def handle_proxy(conn, req) -> None:
         respond(conn, {"ok": False, "error": f"connect {host}:{port} failed: {exc}"})
         return
     respond(conn, {"ok": True, "proxy": True})
-    conn.settimeout(30)
-    upstream.settimeout(30)
+    conn.settimeout(PROXY_IDLE_TIMEOUT)
+    upstream.settimeout(PROXY_IDLE_TIMEOUT)
     t1 = threading.Thread(target=_pump, args=(conn, upstream), daemon=True)
     t2 = threading.Thread(target=_pump, args=(upstream, conn), daemon=True)
     t1.start()
