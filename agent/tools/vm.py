@@ -7,6 +7,7 @@ import os
 import atexit
 import json
 import socket
+import secrets
 import shutil
 import subprocess
 import threading
@@ -68,6 +69,10 @@ def _qemu_pid_file(sid: str) -> Path:
 
 
 VM_VMSERVER_PORT = 40000                            # vmserver 在 guest 内监听的端口(固定)
+VM_CMD_TIMEOUT = int(os.environ.get("VM_CMD_TIMEOUT", "60"))     # vm_run 默认额度(秒)
+# 长任务额度,给 3 小时。是折中而不是"永不超时":vmserver 每条连接一个线程,超时是回收
+# 挂死命令的唯一机制 —— 一条等输入的 cat 会一直占着线程,而调用方早忘了它。
+VM_LONG_TIMEOUT = int(os.environ.get("VM_LONG_TIMEOUT", "10800"))
 
 _vm_port: int | None = None                        # 启动时动态分配,避免多开抢 2222
 _vm_token = ""                                     # 每启动随机生成、经串口注入 guest,服务端每次请求读它
@@ -429,7 +434,10 @@ def vm_status() -> str:
 @tool(
     description="在沙箱虚拟机里执行一条命令,通过 socket 连 guest 内的 vmserver 执行(JSON 协议,非 SSH)。"
                 "适合在隔离的完整系统里装软件、跑服务、做重活。若虚拟机还没就绪,会返回当前进度并让你稍后再试。"
-                "命令自带超时;别用交互式命令(vim/top 等,它们没有终端会直接失败)。"
+                "命令默认最长跑 60 秒;构建、测试、下载这类长任务传 long_lived=true(上限 3 小时)。"
+                "**特别久的活更推荐丢后台**:`nohup 命令 > /tmp/x.log 2>&1 &`,再隔一会儿查一次 —— "
+                "连接是短的,中途断了也不影响任务本身。"
+                "别用交互式命令(vim/top 等,它们没有终端会直接失败)。"
                 "路径注意:客户机是 Linux,路径风格与宿主不同(没有 D:\\ 那套)。",
     parameters={
                 "type": "object",
@@ -437,16 +445,22 @@ def vm_status() -> str:
                     "command": {
                         "type": "string",
                         "description": "要在客户机里执行的 shell 命令",
-                    }
+                    },
+                    "long_lived": {
+                        "type": "boolean",
+                        "description": "长任务模式:超时上限从 60 秒提到 3 小时。构建/测试/下载用",
+                    },
                 },
                 "required": ["command"],
             },
 )
-def vm_run(command: str) -> str:
+def vm_run(command: str, long_lived: bool = False) -> str:
     """在沙箱虚拟机里执行一条命令 —— 连接 guest 里的 vmserver(socket, JSON 协议)。
 
     vmserver 用无 TTY 的 subprocess 跑命令、自带超时(超时就 kill,返回 timed_out),
     所以交互程序(vim/top)会直接秒失败、不会卡死会话;命令输出是结构化 JSON,无壳提示符。
+
+    long_lived=True 把上限从 60 秒提到 3 小时,给构建/测试/下载这类长任务用。
     """
     st = vm_state_get()
     if st["status"] != "ready":
@@ -455,10 +469,13 @@ def vm_run(command: str) -> str:
         return "虚拟机 vmserver 未就绪,请稍后再试。"
 
     import socket as sk, json
-    req = {"token": _vm_token, "cmd": "exec", "command": command, "timeout": 60}
+    timeout = VM_LONG_TIMEOUT if long_lived else VM_CMD_TIMEOUT
+    req = {"token": _vm_token, "cmd": "exec", "command": command, "timeout": timeout}
     try:
         s = sk.create_connection(("127.0.0.1", _vm_vmserver_host_port), timeout=10)
-        s.settimeout(90)
+        # 跟 timeout 联动,别硬编码 —— 原来是死值 90,长任务会被宿主先掐断,
+        # 而 guest 那边还在跑(结果就没人接了)。
+        s.settimeout(timeout + 30)
         s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
         line = s.makefile("rb").readline()
         s.close()
@@ -727,7 +744,10 @@ def _vm_proxy_relay(guest_port: int, client) -> None:
     import socket as sk, json
     try:
         up = sk.create_connection(("127.0.0.1", _vm_vmserver_host_port), timeout=10)
-        up.settimeout(60)
+        # 空闲超时给足(3 小时)。原来是 60 秒:HTTP 那种请求-响应太快、碰不到,但 SSH
+        # 这类长连接空闲一分钟就会被关掉方向、会话卡死。对端**真的**断开时 recv 会返回
+        # 空串正常收尾,不靠这个超时兜底,所以放大它是安全的。
+        up.settimeout(VM_LONG_TIMEOUT)
         req = {"token": _vm_token, "cmd": "proxy", "host": "127.0.0.1", "port": guest_port}
         up.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
         ack = json.loads(up.makefile("rb").readline().decode("utf-8", "replace"))
@@ -838,6 +858,75 @@ def vm_tunnel_stop(host_port: int | None = None) -> str:
         except Exception:
             pass
     return "已停止指定转发。" if host_port is not None else "已停止所有转发。"
+
+
+_VM_SSH_USER = os.environ.get("VM_SSH_USER", "dev")             # 登录名固定,可用 .env 覆盖
+_VM_SSH_PORT_BASE = int(os.environ.get("VM_SSH_PORT", "2222"))  # 宿主导从这儿开始找空闲的
+
+
+@tool(
+    description="为用户开一个「从宿主 SSH 登录虚拟机」的入口:重置登录用户的密码(每次都是"
+                "新的随机密码)、确保 sshd 在运行且允许密码登录,再把 guest 的 22 端口映射到"
+                "宿主导,最后给出**可直接复制给用户的连接命令**。"
+                "用户说「我想 SSH 进去自己装/自己操作」「给我一个能连虚拟机的端口」时用它。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "host_port": {"type": "integer",
+                                  "description": "宿主导口;不填会自动挑一个空闲的"},
+                },
+            },
+)
+def vm_ssh_login(host_port: int = 0) -> str:
+    """开一个宿主 → guest 的 SSH 入口,返回给用户看的连接信息。
+
+    为什么做成一个工具、而不是写几条命令让模型自己拼:这套动作里有一串必须做对的细节
+    —— 密码要随机、配置改动要幂等(反复调用不能把 sshd 弄坏)、隧道要挑空闲端口、连接
+    命令里的保活参数还不能漏。漏任何一步,用户拿到的就是连不上、或者连上就断的命令。
+    顺带,密码只在这里生成并交给用户,不会随着命令回显长期停在对话上下文里。
+    """
+    st = vm_state_get()
+    if st["status"] != "ready":
+        return f"虚拟机还没就绪({st['step'] or st['status']}),稍后再试。"
+
+    user = _VM_SSH_USER
+    password = secrets.token_urlsafe(12)        # 每次调用都换一把新的
+
+    # 一条脚本做完:确认 sshd 在(基础镜像预装的,不装它)、建用户(幂等)、重置密码、
+    # 确保允许密码登录、没在跑就起。guest 里没有交互式终端,拆成多条跑没有意义。
+    script = (
+        "set -e\n"
+        "[ -x /usr/sbin/sshd ] || { echo MISSING_SSHD; exit 3; }\n"
+        f"id -u {_shq(user)} >/dev/null 2>&1 || adduser -D -s /bin/ash {_shq(user)}\n"
+        "if command -v chpasswd >/dev/null 2>&1; then\n"
+        f"    echo {_shq(f'{user}:{password}')} | chpasswd\n"
+        "else\n"
+        f"    printf '%s\\n%s\\n' {_shq(password)} {_shq(password)} | passwd {_shq(user)}\n"
+        "fi\n"
+        "grep -qE '^[[:space:]]*PasswordAuthentication[[:space:]]+yes'"
+        " /etc/ssh/sshd_config 2>/dev/null"
+        " || echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config\n"
+        "pgrep -x sshd >/dev/null 2>&1 || /usr/sbin/sshd\n"
+        "echo SSH_READY\n"
+    )
+    r = _vm_exec_raw(script, timeout=30)
+    body = f"{r.get('error') or ''}\n{r.get('output') or ''}".strip()
+    if not r.get("ok") or "SSH_READY" not in body:
+        if "MISSING_SSHD" in body:
+            return ("虚拟机里没有 /usr/sbin/sshd —— 这个基础镜像没预装 openssh。"
+                    "换回预装了它的镜像,或在 guest 里装上再试。")
+        return f"启动 sshd 失败:{body[:400] or '(无输出)'}"
+
+    port = int(host_port) or _vm_free_port(_VM_SSH_PORT_BASE)
+    tunnel = vm_tunnel(port, 22)                # guest:22 → 宿主:port(字节透明,SSH 能过)
+
+    return (
+        f"已开好 SSH 入口。把下面这行给用户(可直接复制):\n\n"
+        f"    ssh -o ServerAliveInterval=30 ssh://{user}@127.0.0.1:{port}\n\n"
+        f"用户名 {user},密码 {password}(每次开通都会换一把新的)。\n"
+        f"保活参数建议留着:转发链路空闲 3 小时才会断,带着更稳,也能及早发现对面已经掉了。\n"
+        f"({tunnel})"
+    )
 
 
 def _pid_is_our_qemu(pid: int) -> bool:

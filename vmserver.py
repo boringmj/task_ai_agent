@@ -25,7 +25,10 @@ PORT = int(os.environ.get("VMSERVER_PORT", "40000"))
 TOKEN_FILE = os.environ.get("VMSERVER_TOKEN_FILE", "/root/.vm_token")
 MAX_OUTPUT = 200_000       # 单次命令输出上限,防撑爆内存
 DEFAULT_TIMEOUT = 60
-MAX_TIMEOUT = 600
+# 上限放到 3 小时:构建/测试/下载这类长任务够用,同时仍然兜住"挂死的命令"——
+# 超时是回收它们的唯一机制,所以不设成"永不超时"(那样一条等输入的 cat 会永久
+# 占着一个线程,而调用方早就忘了它)。
+MAX_TIMEOUT = 10800
 
 
 def current_token() -> str:
