@@ -169,7 +169,9 @@ def _read_multiline(prompt: str = "你 > ") -> str:
             if len(lines) == 1 and (lines[0].lstrip().startswith("/")
                                     or lines[0].strip().lower() in _EXIT_WORDS):
                 break               # 指令:回车即走,连续行提示符都不打
-            console.print("… ", style="dim", end="")
+            # 续行提示符用 ASCII 的 "+",别用省略号 —— 那个符号在终端里基本等于
+            # "加载中/思考中",看到它会以为程序正忙、在那儿干等一个不会来的回复。
+            console.print("+ ", style="dim", end="")
     except KeyboardInterrupt:
         # 空闲时 Ctrl+C = 退出信号(返回 None)。
         # 必须包住整个函数(含提示打印),否则中断落在 console.print 里的
