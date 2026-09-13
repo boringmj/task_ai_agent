@@ -809,8 +809,23 @@ def vm_tunnel(host_port: int, guest_port: int) -> str:
     if int(host_port) in _vm_tunnels:
         vm_tunnel_stop(int(host_port))
     srv = sk.socket(sk.AF_INET, sk.SOCK_STREAM)
-    srv.setsockopt(sk.SOL_SOCKET, sk.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", int(host_port)))
+    # Windows 上 SO_REUSEADDR 的语义是"允许抢占":两个 socket 绑同一端口不报错,
+    # 连接最终落到谁手里不确定。实测的表现是 —— 端口已被占用时这里照样"开通成功",
+    # 用户 SSH 过来可能连到别的程序上。Windows 必须用 SO_EXCLUSIVEADDRUSE(独占);
+    # 其它平台沿用 SO_REUSEADDR:那里它只为跨过 TIME_WAIT,不会抢占活跃的监听。
+    if hasattr(sk, "SO_EXCLUSIVEADDRUSE"):
+        srv.setsockopt(sk.SOL_SOCKET, sk.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        srv.setsockopt(sk.SOL_SOCKET, sk.SO_REUSEADDR, 1)
+    try:
+        srv.bind(("127.0.0.1", int(host_port)))
+    except OSError as exc:
+        # 别把原始的 WinError 10048 抛出去 —— 模型看到"套接字地址只允许使用一次"
+        # 根本不知道该干什么;而 vm_ssh_login 那头连"用户和 sshd 都已经弄好了、
+        # 只是端口没开成"也说不清楚。这里给个人话的说法,顺带指出出路。
+        srv.close()
+        return (f"宿主导 {host_port} 开不了({exc.strerror or exc}),多半已经被占用 —— "
+                f"换一个,或者不指定端口(工具会自动从 {_VM_SSH_PORT_BASE} 起挑一个空闲的)。")
     srv.listen(16)
     srv.settimeout(1.0)
 
