@@ -14,7 +14,7 @@ from ..core import (
     MEMORY_FILE,
     ROOT,
     TRASH_DIR,
-    _is_system_dir,
+    is_system_dir,
     safe_path,
 )
 
@@ -50,7 +50,7 @@ def delete_file(path: str) -> str:
     # 系统目录里的**文件**同样不能挪走 —— 否则 .git/config、.agent/memory.md
     # 会被"软删"进回收站,仓库和长期记忆当场失效。delete_dir / move_file 都挡了,
     # 这里之前是漏的。
-    if _is_system_dir(target):
+    if is_system_dir(target):
         raise PermissionError(
             f"{target} 在 agent 的系统目录(.trash/.git/.agent/clones)内,不允许删除。"
         )
@@ -115,7 +115,7 @@ def delete_dir(path: str, recursive: bool = False) -> str:
     resolved = (ROOT / path).resolve()
     if resolved == ROOT:
         raise PermissionError("不允许删除工作区根目录")
-    if _is_system_dir(resolved):
+    if is_system_dir(resolved):
         raise PermissionError(f"{target} 是 agent 的系统目录(.trash/.git/.agent/clones),不允许删除。")
 
     if not recursive:

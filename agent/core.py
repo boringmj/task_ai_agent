@@ -89,7 +89,7 @@ CLONES_DIR.mkdir(exist_ok=True)
 PROTECTED_DIRS = (ROOT, TRASH_DIR, GIT_DIR, MEMORY_FILE.parent, CLONES_DIR)
 
 
-def _is_system_dir(path: Path) -> bool:
+def is_system_dir(path: Path) -> bool:
     """判断一个路径是否是(或位于)agent 的系统目录内。
 
     注意不能拿 is_relative_to(ROOT) 来判 —— 工作区里每个普通文件都在 ROOT 下,
@@ -175,7 +175,6 @@ def _assert_public_url(url: str) -> None:
     if parsed.scheme not in ("http", "https"):
         raise PermissionError(
             f"只允许 http/https,收到 {parsed.scheme or '(空)'}。"
-            f"file:// 之类的协议能绕过工作区限制去读本地文件。"
         )
     host = parsed.hostname
     if not host:

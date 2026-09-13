@@ -11,7 +11,7 @@ from .. import markdown as md
 from ..core import (
     MAX_WRITE_BYTES,
     ROOT,
-    _is_system_dir,
+    is_system_dir,
     safe_path,
     _rel,
 )
@@ -624,7 +624,7 @@ def move_file(source: str, destination: str, overwrite: bool = False) -> str:
 
     # 源或目标都不能是 agent 的系统目录(.trash/.git/.agent/clones),否则能挪走
     # 回收站、版本库、记忆,把整个 agent 搞致残 —— move_file 之前漏了这个检查。
-    if _is_system_dir(src) or _is_system_dir(dest):
+    if is_system_dir(src) or is_system_dir(dest):
         raise PermissionError("不允许移动或重命名 agent 的系统目录(.trash/.git/.agent/clones)。")
 
     if src == dest:
