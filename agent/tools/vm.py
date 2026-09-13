@@ -939,7 +939,8 @@ def vm_ssh_login(host_port: int = 0) -> str:
         f"已开好 SSH 入口。把下面这行给用户(可直接复制):\n\n"
         f"    ssh -o ServerAliveInterval=30 ssh://{user}@127.0.0.1:{port}\n\n"
         f"用户名 {user},密码 {password}(每次开通都会换一把新的)。\n"
-        f"保活参数建议留着:转发链路空闲 3 小时才会断,带着更稳,也能及早发现对面已经掉了。\n"
+        f"保活是可选的:转发链路空闲 3 小时才断,一般用不到。用 Xshell 这类图形客户端的话,"
+        f"在会话属性里勾「保持活动」即可 —— 它不认上面那个 -o 参数(那是 OpenSSH 命令行的写法)。\n"
         f"({tunnel})"
     )
 
