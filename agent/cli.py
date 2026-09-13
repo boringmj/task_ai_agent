@@ -29,10 +29,10 @@ from .session import (
     session_note as session_note_text,
     rewrite_session,
 )
-from .tools.container import _docker_cleanup_stale, _docker_health
-from .tools.memory import _read_memory
+from .tools.container import docker_cleanup_stale, docker_health
+from .tools.memory import memory_text
 from .tools.trash import purge_trash
-from .tools.vm import _vm_kickoff, _vm_state_get, session_reset_hint, vm_status
+from .tools.vm import vm_kickoff, vm_state_get, session_reset_hint, vm_status
 
 
 def _clip(text: str, limit: int) -> tuple[str, int]:
@@ -209,7 +209,7 @@ def _make_stdio_forgiving() -> None:
 def main() -> None:
     _make_stdio_forgiving()
     messages: list[dict] = [{"role": "system", "content": load_system_prompt()}]
-    memory = _read_memory().strip()  # 跨会话记住的关键事实最先注入,始终在场
+    memory = memory_text().strip()  # 跨会话记住的关键事实最先注入,始终在场
     if memory:
         messages.append(
             {"role": "system", "content": prompts.load("memory_injection", memory=memory)}
@@ -233,16 +233,16 @@ def main() -> None:
     atexit.register(release_owner, session_id)   # 正常退出时摘掉占用者标记
     _cleanup_trash_on_start()
     # 预处理 Docker 健康状态(非阻断):可用则做残留清理,不可用仅警告,agent 照常启动
-    ok, msg = _docker_health()
+    ok, msg = docker_health()
     if ok:
-        n = _docker_cleanup_stale()
+        n = docker_cleanup_stale()
         if n:
             console.print(f"已清理 {n} 个上次残留的容器", style="dim")
     console.print(f"Docker:{msg if ok else '! 不可用 —— ' + msg}", style="dim" if ok else "yellow")
     # 后台拉起虚拟机(非阻断,失败仅提示,agent 照常启动)
     try:
-        _vm_kickoff()  # 后台线程启动/配置虚拟机,不阻塞
-        ready = _vm_state_get()["status"] == "ready"
+        vm_kickoff()  # 后台线程启动/配置虚拟机,不阻塞
+        ready = vm_state_get()["status"] == "ready"
         console.print(f"VM:{vm_status()}", style="dim" if ready else "yellow")
     except Exception as exc:  # noqa: BLE001
         console.print(f"VM:启动失败(不影响 agent)—— {exc}", style="yellow")

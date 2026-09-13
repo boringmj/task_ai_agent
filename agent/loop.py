@@ -9,8 +9,8 @@ from .core import (
     console,
     _pending_images,
 )
-from .llm import _stream_model, _context_ratio
-from .tools.media import _inject_pending_images
+from .llm import stream_model, context_ratio
+from .tools.media import inject_pending_images
 from .tools.net import reset_turn_searches
 from .tools.registry import TOOLS, dispatch
 
@@ -32,7 +32,7 @@ def compact(messages: list[dict], keep_recent: int = 0) -> str:
             cut -= 1                         # 往前挪到 user 消息,别把 assistant/tool 配对拆开
     head, tail = messages[head_start:cut], messages[cut:]
     if len(head) < 2:
-        return "对话还很短,不需要压缩。"
+        return "对话过短, 无法压缩。"
 
     req = head + [{"role": "user", "content": prompts.load("compact_instruction")}]
     try:
@@ -44,13 +44,13 @@ def compact(messages: list[dict], keep_recent: int = 0) -> str:
     except Exception as exc:  # noqa: BLE001
         return f"压缩失败:{type(exc).__name__}: {exc}"
     if not summary:
-        return "压缩失败:模型没有返回摘要。"
+        return "压缩失败: 模型没有返回摘要。"
 
     messages[head_start:] = [{
         "role": "user",
         "content": prompts.load("compact_summary", summary=summary),
     }] + tail
-    return f"已压缩上下文:{len(head)} 条消息 → 1 条摘要({len(summary)} 字)"
+    return f"已压缩上下文: {len(head)} 条消息 → 1 条摘要({len(summary)} 字)"
 
 
 def run(user_input: str, messages: list[dict]) -> str:
@@ -62,13 +62,13 @@ def run(user_input: str, messages: list[dict]) -> str:
     auto_compressed = False
     for _ in range(MAX_STEPS):
         # 上下文快满了就先压缩(工具调用过程中也照做),免得下一次请求超限;每轮最多压一次
-        if not auto_compressed and _context_ratio() >= AUTO_COMPACT_RATIO:
+        if not auto_compressed and context_ratio() >= AUTO_COMPACT_RATIO:
             auto_compressed = True
             console.print(f"[自动压缩上下文] {compact(messages, keep_recent=2)}", style="dim")
         try:
-            content, tool_calls, reasoning = _stream_model(messages)
+            content, tool_calls, reasoning = stream_model(messages)
         except Exception as exc:  # noqa: BLE001 - 网络/流中断,给提示而不是崩掉
-            return f"错误:调用模型失败({type(exc).__name__}: {exc})"
+            return f"错误: 调用模型失败({type(exc).__name__}: {exc})"
 
         # 把模型这一轮的回复放回对话历史,messages 就是 agent 的全部记忆。
         # reasoning_content 必须一并带着:DeepSeek V4 在带 tools 的请求里要求历史轮
@@ -110,9 +110,9 @@ def run(user_input: str, messages: list[dict]) -> str:
             )
 
         # 这一轮若调用了 img,把登记好的图片作为 image_url 注入,给下一轮模型看
-        _inject_pending_images(messages)
+        inject_pending_images(messages)
 
-    return f"(已达到最大步数 {MAX_STEPS},中止)"
+    return f"[强制终止] 已达到最大步数 {MAX_STEPS},对话强制中止"
 
 
 def load_system_prompt() -> str:

@@ -151,7 +151,7 @@ def screen() -> str:
     )
 
 
-def _inject_pending_images(messages: list[dict]) -> None:
+def inject_pending_images(messages: list[dict]) -> None:
     """把本轮登记的图片作为 image_url 内容段注入对话,让视觉模型能真正看到。
 
     图像只能出现在消息的 content 列表里(tool 结果只能是字符串),所以单独

@@ -13,7 +13,7 @@ from ..core import (
 # 它持久化在工作区,下次启动时读回并注入系统提示词,人可读、可编辑、可回退。
 
 
-def _read_memory() -> str:
+def memory_text() -> str:
     if not MEMORY_FILE.exists():
         return ""
     return MEMORY_FILE.read_text(encoding="utf-8")
@@ -68,5 +68,5 @@ def remember(content: str) -> str:
 )
 def read_memory() -> str:
     """读取当前的全部长期记忆。"""
-    content = _read_memory().strip()
+    content = memory_text().strip()
     return content if content else "(长期记忆目前是空的。要记住重要信息,用 remember 工具。)"

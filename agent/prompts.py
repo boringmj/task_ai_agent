@@ -56,7 +56,7 @@ def load(name: str, **variables) -> str:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         raise MissingPrompt(
-            f"缺少提示词文件 {path};提示词都在 {PROMPTS_DIR} 下,按用途分文件存放"
+            f"缺少提示词文件 {path}"
         ) from None
     for key, value in variables.items():
         text = text.replace("{" + key + "}", str(value))

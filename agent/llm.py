@@ -30,7 +30,7 @@ def _record_usage(usage) -> None:
     _total_usage["cache_hit"] += _last_usage["cache_hit"]
 
 
-def _context_ratio() -> float:
+def context_ratio() -> float:
     """最近一次请求的上下文占用比例(0~1),用于判断要不要自动压缩。"""
     if MAX_CONTEXT_TOKENS <= 0:
         return 0.0
@@ -68,13 +68,11 @@ def usage_detail() -> str:
         f"{usage_line()}\n"
         f"本会话:共 {_total_usage['requests']} 次请求,累计输出 {_total_usage['completion']:,} tokens\n"
         f"缓存:整体命中 {_cache_rate(total_prompt, total_hit):.1f}%"
-        f"({total_hit:,}/{total_prompt:,} 输入 token 走了缓存)\n"
-        f"(缓存的是一段请求前缀 —— 对话越长、越少改前面的内容,命中率越高;"
-        f"刚改过系统提示词或工具、或隔久了缓存过期,都会让它掉下来)"
+        f"({total_hit:,}/{total_prompt:,} 输入 token 走了缓存)"
     )
 
 
-def _stream_model(messages: list[dict]) -> tuple[str, list[dict], str]:
+def stream_model(messages: list[dict]) -> tuple[str, list[dict], str]:
     """流式调用模型:实时显示思考(reasoning_content),返回 (正文, tool_calls, 思考文本)。
 
     - 模型有思考就逐字显示(暗色斜体),没有就自然跳过 —— 自适应,无需开关。

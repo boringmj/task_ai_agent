@@ -9,8 +9,8 @@ from .. import prompts
 
 @command(
     "/reset",
-    "丢弃当前会话的对话历史,重新开始。工作区文件和长期记忆都不受影响。"
-    "用户想彻底换个话题、不想被前面的对话干扰,或会话被搞乱时建议用它。",
+    "丢弃当前会话的对话历史,重新开始。工作区文件和长期记忆都不受影响。",
+    hint="用户想彻底换个话题、不想被前面的对话干扰,或会话被搞乱时。",
     aliases=("/new",),
 )
 def cmd_reset(ctx: Context) -> str:
@@ -32,8 +32,8 @@ def cmd_reset(ctx: Context) -> str:
 
 @command(
     "/sessions",
-    "列出这个工作区里用过的会话(每个会话有自己独立的对话历史与虚拟机),标明哪个是当前活跃的。"
-    "用户问「以前聊过哪些 / 有几段会话」时建议用它。",
+    "列出这个工作区里用过的会话(每个会话有自己独立的对话历史与虚拟机),标明哪个是当前活跃的。",
+    hint="用户问「以前聊过哪些 / 有几段会话」时。",
 )
 def cmd_sessions(ctx: Context) -> str:
     from ..session import current_session_id, list_sessions
@@ -60,9 +60,10 @@ def cmd_sessions(ctx: Context) -> str:
 
 @command(
     "/switch",
-    "切换活跃会话。`/switch <会话id>` 切到那个会话,`/switch new` 新开一个会话。"
-    "只能切到**没被别的 agent 占用**的会话上;切换会连带把虚拟机换成该会话自己的磁盘"
-    "(所以 VM 会重启用)。用户在几段不同主题的会话之间来回切时建议用它。",
+    "切换活跃会话。/switch <会话id> 切到那个会话,/switch new 新开一个会话。"
+    "只能切到没被别的 agent 占用的会话上;切换会连带把虚拟机换成该会话自己的磁盘"
+    "(所以 VM 会重启用)。",
+    hint="用户在几段不同主题的会话之间来回切时。",
 )
 def cmd_switch(ctx: Context) -> str:
     """切到指定会话或新建一个,并把历史与虚拟机一并换过去。"""
@@ -129,7 +130,8 @@ def cmd_switch(ctx: Context) -> str:
 @command(
     "/compact",
     "把已有的对话历史压缩成一份摘要,释放上下文(会保留用户的偏好、已做的决定、"
-    "文件改动和待办)。上下文占用偏高、对话很长,或用户问「怎么省 token / 怎么清一下上下文」时建议用它。",
+    "文件改动和待办)。",
+    hint="上下文占用偏高、对话很长,或用户问「怎么省 token / 怎么清一下上下文」时。",
 )
 def cmd_compact(ctx: Context) -> str:
     """压缩历史:摘要替换掉较早的对话,并同步把磁盘上的存档改成压缩后的样子。"""

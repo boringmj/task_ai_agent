@@ -145,7 +145,7 @@ def _owner_alive(sid: str) -> bool:
     try:
         info = json.loads(owner_file(sid).read_text(encoding=_ENCODING) or "{}")
         pid = int(info.get("pid") or 0)
-        return bool(pid) and pid != os.getpid() and _pid_alive(pid)
+        return bool(pid) and pid != os.getpid() and pid_alive(pid)
     except Exception:  # noqa: BLE001 - 读不出占用者信息就当没人占
         return False
 
@@ -167,15 +167,14 @@ def _resolve_session() -> None:
     if last and session_dir(last).exists() and try_claim(last):
         _current_session = _safe_name(last)
         register_session(_current_session)          # 顺手更新 last_used
-        _resolve_note = "接回上次的会话"
+        _resolve_note = "继续上次会话"
         return
 
     _current_session = new_session_id()
     register_session(_current_session)
     try_claim(_current_session)                     # 新会话也立刻占住
     if last and session_dir(last).exists():
-        _resolve_note = (f"上一个会话 {last} 正被另一个 agent 占用,"
-                         f"为免互相覆盖已另开新会话(用 /sessions 可看全部)")
+        _resolve_note = "上一个会话正被另一个 agent 占用,已另开新会话"
     else:
         _resolve_note = "新会话"
 
@@ -255,7 +254,7 @@ def load_session(sid: str) -> tuple[list[dict], str]:
     """
     path = session_file(sid)
     if not path.exists():
-        return [], "无历史会话(这是第一次)"
+        return [], "无历史会话"
 
     messages: list[dict] = []
     broken = 0
@@ -275,7 +274,7 @@ def load_session(sid: str) -> tuple[list[dict], str]:
                 if isinstance(obj, dict) and "role" in obj:
                     messages.append(obj)
     except OSError as exc:
-        return [], f"读取会话失败({exc}),按新会话开始"
+        return [], f"读取会话失败({exc}), 会话将重置"
 
     # 去掉开头连续的 system 消息(由调用方用最新的提示词重新注入)
     start = 0
@@ -338,7 +337,7 @@ def rewrite_session(all_messages: list[dict], sid: str) -> None:
 # ---------------- 占用者(现在只用于提醒,将来可升级成锁)----------------
 
 
-def _pid_alive(pid: int) -> bool:
+def pid_alive(pid: int) -> bool:
     """进程是否**还在运行**。Windows 上**不能**用 os.kill(pid, 0) —— 那会真的去杀进程。
 
     光看 OpenProcess 成不成功是不够的:进程被终止后,只要还有人握着它的句柄
@@ -422,7 +421,7 @@ def try_claim(sid: str) -> bool:
             pid = 0
         if pid == os.getpid():
             return True                     # 本来就是自己的
-        if pid and _pid_alive(pid):
+        if pid and pid_alive(pid):
             return False                    # 别人活着占着,让
         try:
             path.unlink()                   # 占用者已死 → 陈迹,清掉重试

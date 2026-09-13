@@ -36,7 +36,7 @@ CONTAINER_PIDS = int(os.environ.get("DOCKER_PIDS", "200"))
 # 无特权,cap-drop,资源封顶,超时强杀。网络默认开启(用户接受,便于装包干活)。
 
 
-def _docker_health() -> tuple[bool, str]:
+def docker_health() -> tuple[bool, str]:
     """检查 Docker 是否可用:CLI 在不在、守护进程通不通。返回 (可用, 说明)。"""
     if shutil.which("docker") is None:
         return False, "未找到 docker 命令(请确认 Docker 已安装并在 PATH 中)"
@@ -58,7 +58,7 @@ def _docker_health() -> tuple[bool, str]:
 CONTAINER_STALE_AFTER = CONTAINER_CMD_TIMEOUT * 2
 
 
-def _docker_cleanup_stale() -> int:
+def docker_cleanup_stale() -> int:
     """清理上次会话残留的 agent-exec-* 容器。
 
     agent 进程一旦崩溃,容器内的 timeout 仍会在 CONTAINER_CMD_TIMEOUT 后自我了断,
@@ -106,7 +106,7 @@ def _docker_image_present() -> bool:
 
 def _docker_run(inner: list[str]) -> str:
     """在容器里执行,安全项硬编码。inner 是镜像之后的命令(如 ['python','-c','...'])。"""
-    ok, err = _docker_health()
+    ok, err = docker_health()
     if not ok:
         return f"错误:Docker 不可用 —— {err}(启动 Docker Desktop 后重试)"
 

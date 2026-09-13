@@ -97,7 +97,7 @@ def _vm_state_set(status: str, step: str = "", port: int | None = None, error: s
         _vm_state.update({"status": status, "step": step, "port": port, "error": error})
 
 
-def _vm_state_get() -> dict:
+def vm_state_get() -> dict:
     with _vm_lock:
         return dict(_vm_state)
 
@@ -144,9 +144,9 @@ def _vm_kill_current(timeout: int = 5) -> None:
 
 
 def _vm_stop_thread(timeout: int = 10) -> None:
-    """等后台启动线程收工,并让 _vm_kickoff 可以重新拉起。
+    """等后台启动线程收工,并让 vm_kickoff 可以重新拉起。
 
-    不 join 的后果很实在:_vm_kickoff 的幂等判断是"线程还活着就别起新的",而
+    不 join 的后果很实在:vm_kickoff 的幂等判断是"线程还活着就别起新的",而
     vm_reset / vm_switch_session 会先把 _vm_thread 置 None 绕过它。旧线程还没结束
     (比如卡在串口登录的重试循环里)时新线程就起来了 —— **两个 worker 各起一台
     QEMU**,其中一台当场失去引用变成孤儿,占着磁盘和串口端口不放(实测:那种情况下
@@ -368,7 +368,7 @@ def _vm_worker(gen: int) -> None:
         _vm_state_set("error", "", error=str(exc))
 
 
-def _vm_kickoff() -> None:
+def vm_kickoff() -> None:
     """启动后台线程(幂等)。"""
     global _vm_thread, _vm_gen
     if _vm_thread is not None and _vm_thread.is_alive():
@@ -418,7 +418,7 @@ def session_reset_hint() -> str:
 )
 def vm_status() -> str:
     """查看沙箱虚拟机的当前状态(进行到哪一步、是否就绪)。"""
-    st = _vm_state_get()
+    st = vm_state_get()
     if st["status"] == "ready":
         return f"虚拟机就绪(实例 {VM_INSTANCE[:8]},串口 {st['port']})。"
     if st["status"] == "error":
@@ -448,7 +448,7 @@ def vm_run(command: str) -> str:
     vmserver 用无 TTY 的 subprocess 跑命令、自带超时(超时就 kill,返回 timed_out),
     所以交互程序(vim/top)会直接秒失败、不会卡死会话;命令输出是结构化 JSON,无壳提示符。
     """
-    st = _vm_state_get()
+    st = vm_state_get()
     if st["status"] != "ready":
         return f"虚拟机还没就绪,当前:{st['step'] or st['status']}。请用 vm_status 或稍后再试。"
     if not _vm_vmserver_host_port or not _vm_token:
@@ -485,7 +485,7 @@ def _vm_exec_raw(command: str, timeout: int = 60) -> dict:
     vm_run 面向模型、输出会截断后回显;文件传输(读回 base64)要的是完整字节,故走这里,
     这样文件内容只存在于工具函数内部,不会填进对话上下文。
     """
-    st = _vm_state_get()
+    st = vm_state_get()
     if st["status"] != "ready":
         return {"ok": False, "error": f"虚拟机还没就绪({st['step'] or st['status']})"}
     if not _vm_vmserver_host_port or not _vm_token:
@@ -614,7 +614,7 @@ def vm_fetch(guest_url: str) -> str:
 
     只支持 http(geth;HTTPS 透传要 TLS,不支持)。适合访问 agent 在 guest 里起的服务。
     """
-    st = _vm_state_get()
+    st = vm_state_get()
     if st["status"] != "ready":
         return f"虚拟机还没就绪,当前:{st['step'] or st['status']}。请用 vm_status 或稍后再试。"
     if not _vm_vmserver_host_port or not _vm_token:
@@ -682,7 +682,7 @@ def vm_tcp(host: str, port: int, data: str) -> str:
     通用 TCP(不仅 HTTP):适合请求/答一类协议(Redis、MySQL 查询、自定协议等)。
     注意是"发一次、收一次"的一问一答;持续会话类(SSH)不适合。
     """
-    st = _vm_state_get()
+    st = vm_state_get()
     if st["status"] != "ready":
         return f"虚拟机还没就绪,当前:{st['step'] or st['status']}。请用 vm_status 或稍后再试。"
     if not _vm_vmserver_host_port or not _vm_token:
@@ -780,7 +780,7 @@ def vm_tunnel(host_port: int, guest_port: int) -> str:
     每条进来的宿主连接,都会经 vmserver proxy(带本进程 token)转到 guest:guest_port。
     真正实现"把 VM 端口映射到宿主导、可浏览器访问"。
     """
-    st = _vm_state_get()
+    st = vm_state_get()
     if st["status"] != "ready":
         return f"虚拟机还没就绪,当前:{st['step'] or st['status']}。请用 vm_status 或稍后再试。"
     if not _vm_vmserver_host_port or not _vm_token:
@@ -880,7 +880,7 @@ def _vm_cleanup_stale() -> int:
       3. 该 pid 现在跑的确实是我们的 qemu 可执行文件 —— 防 pid 被回收后误杀。
     绝不按进程名批量杀:那会误伤别的 agent 实例、甚至用户自己的虚拟机。
     """
-    from ..session import SESSIONS_DIR, _pid_alive   # 延迟导入,避免与 session 成环
+    from ..session import SESSIONS_DIR, pid_alive   # 延迟导入,避免与 session 成环
     if not SESSIONS_DIR.exists():
         return 0
 
@@ -894,7 +894,7 @@ def _vm_cleanup_stale() -> int:
         except Exception:  # noqa: BLE001
             continue
 
-        if not _pid_alive(pid):
+        if not pid_alive(pid):
             pid_file.unlink(missing_ok=True)          # 进程早已不在,陈迹清掉
             continue
 
@@ -912,7 +912,7 @@ def _vm_cleanup_stale() -> int:
                 (sid_dir / "owner.json").read_text(encoding="utf-8") or "{}").get("pid") or 0)
         except Exception:  # noqa: BLE001
             owner_pid = 0
-        if owner_pid and owner_pid != os.getpid() and _pid_alive(owner_pid):
+        if owner_pid and owner_pid != os.getpid() and pid_alive(owner_pid):
             continue
 
         if not _pid_is_our_qemu(pid):
@@ -942,7 +942,7 @@ def vm_switch_session() -> None:
     _vm_cleanup()                      # 刷盘 + 停掉旧会话的 VM + 关转发
     _vm_stop_thread()                  # 还要等线程真的结束 —— 原来只是置 None,线程仍在跑
     _vm_state_set("idle", "会话已切换,虚拟机将重新启动")
-    _vm_kickoff()
+    vm_kickoff()
 
 
 def vm_reset() -> str:
@@ -965,7 +965,7 @@ def vm_reset() -> str:
                 f"确认没有其它 agent 实例在跑同一个会话后重试。")
 
     _vm_state_set("idle", "已重置,等待重新启动")
-    _vm_kickoff()
+    vm_kickoff()
     return "已重置虚拟机:磁盘已删除,正在用基础镜像重新启动(稍后用 vm_status 看进度)。"
 
 
@@ -987,7 +987,7 @@ def _vm_cleanup() -> None:
     # 是被 kill 的 —— guest 自己内存里还没落盘的写入会随它一起消失(实测:不 sync 时
     # 刚写的文件重启就没了,sync 之后能留下)。best-effort,连不上就算了。
     try:
-        if _vm_state_get().get("status") == "ready":
+        if vm_state_get().get("status") == "ready":
             _vm_exec_raw("sync", timeout=15)
     except Exception:
         pass
@@ -1025,5 +1025,5 @@ atexit.register(_vm_cleanup)
 )
 def vm_start() -> str:
     """确保沙箱虚拟机在后台启动(已在配就返回当前状态)。"""
-    _vm_kickoff()
+    vm_kickoff()
     return f"虚拟机正在后台启动({VM_INSTANCE[:8]}),可查 vm_status。"

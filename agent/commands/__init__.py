@@ -36,18 +36,24 @@ class Context:
     events: set[str] = field(default_factory=set)
 
 
-def command(name: str, description: str, aliases: tuple[str, ...] = ()):
+def command(name: str, description: str, hint: str = "",
+            aliases: tuple[str, ...] = ()):
     """把一个函数登记成终端指令。
 
-    name 要以 / 开头;description 会进系统提示词,写清"什么时候建议用户用它";
-    aliases 是等价的名字(如 /new 作为 /reset 的旧名保留)。
+    name        以 / 开头
+    description **给用户看的** —— `/help` 里逐条列出。一句话说清"这个指令做什么"就够,
+                别带 markdown 标记:终端是按纯文本打印的,星号反引号会原样露出来。
+    hint        **给模型看的** —— 进系统提示词。写"用户说什么时建议他用这个"这类话;
+                这种话对用户毫无意义(`/help` 里显示"建议用它"只会让人困惑),
+                所以两者必须分开。留空则退回用 description。
+    aliases     等价的名字(如 /new 作为 /reset 的旧名)
     """
     def decorate(fn):
         if not name.startswith("/"):
             raise ValueError(f"指令名要以 / 开头,收到 {name!r}")
         if name in _COMMANDS:
             raise RuntimeError(f"指令重复:{name}")
-        _COMMANDS[name] = (fn, description)
+        _COMMANDS[name] = (fn, description, hint)
         for alias in aliases:
             if alias in _ALIASES or alias in _COMMANDS:
                 raise RuntimeError(f"指令别名重复:{alias}")
@@ -65,12 +71,12 @@ def _discover() -> None:
         importlib.import_module(f"{pkg}.{path.stem}")
 
 
-def all_commands() -> list[tuple[str, str, str]]:
-    """(主名, 描述, 别名串) 列表,供 /help 与提示词生成使用。"""
+def all_commands() -> list[tuple[str, str, str, str]]:
+    """(主名, 给用户看的说明, 给模型看的时机, 别名串)。/help 与提示词各取所需。"""
     out = []
-    for name, (_, desc) in _COMMANDS.items():
+    for name, (_, desc, hint) in _COMMANDS.items():
         aliases = "、".join(a for a, target in _ALIASES.items() if target == name)
-        out.append((name, desc, aliases))
+        out.append((name, desc, hint, aliases))
     return out
 
 
@@ -91,7 +97,7 @@ def dispatch(text: str, ctx: Context) -> str | None:
             return None
         known = "、".join(n for n, _, _ in all_commands())
         return f"没有名为 {name} 的指令。可用:{known}"
-    fn, _ = entry
+    fn = entry[0]
     ctx.args = stripped[len(name):].strip()      # 指令名后面的部分,交给指令自己解析
     return fn(ctx)
 
@@ -105,9 +111,10 @@ def system_message() -> str:
     而是被当作一段待核实的参考信息(与对待网页内容的规矩一致)。
     """
     lines = []
-    for name, desc, aliases in all_commands():
+    for name, desc, hint, aliases in all_commands():
         suffix = f"(也可写成 {'、'.join(aliases.split('、'))})" if aliases else ""
-        lines.append(f"- `{name}`{suffix} —— {desc}")
+        # 用 hint(给模型看的时机);没写就退回 description
+        lines.append(f"- `{name}`{suffix} —— {hint or desc}")
     return prompts.load("commands_list", commands="\n".join(lines))
 
 
