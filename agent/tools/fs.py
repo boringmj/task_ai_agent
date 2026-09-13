@@ -25,6 +25,9 @@ FS_MAX_READ_CHARS = int(os.environ.get("MAX_READ_CHARS", str(3 * 1024 * 1024)))
 # 一次 read_file 最多读几个文件。允许多文件是为了省调用次数(每多一次调用,模型就要重读
 # 一遍整个历史),但一次塞太多同样撑上下文、模型也读不过来 —— 20 是够用又不失控的量级。
 FS_MAX_READ_FILES = int(os.environ.get("MAX_READ_FILES", "20"))
+# 一次 move_file 最多移几个。移动会改文件位置,比读危险 —— 上限和读一样,但返回里会逐条
+# 列出来,方便用户核对到底动了什么。
+FS_MAX_MOVE_FILES = int(os.environ.get("MAX_MOVE_FILES", "20"))
 # 即使在沙箱内,这些文件也禁止读取 —— 纵深防御,防止沙箱里混入密钥文件
 FS_DENY_READ = {".env"}
 # ---- 文件搜索(按名 / 按内容)护栏 ----
@@ -635,30 +638,8 @@ def insert_lines(path: str, after_line: int, content: str) -> str:
     return _save_lines(target, updated, summary, after_line + 1, enc)
 
 
-@tool(
-    description="移动或重命名工作区内的文件、目录。同一目录内换个名字就是重命名,换到别的目录就是移动。"
-                "目标的父目录不存在会自动创建;目标是一个已存在的目录时,会把源移动进去并沿用原名。"
-                "默认不允许覆盖已存在的目标文件,需要覆盖时先征求用户同意再带 overwrite=true 重试。",
-    parameters={
-                "type": "object",
-                "properties": {
-                    "source": {
-                        "type": "string",
-                        "description": "源文件或目录的路径(相对工作区)",
-                    },
-                    "destination": {
-                        "type": "string",
-                        "description": "目标路径(相对工作区);可以是新的文件名,也可以是已存在的目录",
-                    },
-                    "overwrite": {
-                        "type": "boolean",
-                        "description": "是否允许覆盖已存在的目标文件,默认 false。覆盖不可撤销,务必先得到用户确认",
-                    },
-                },
-                "required": ["source", "destination"],
-            },
-)
-def move_file(source: str, destination: str, overwrite: bool = False) -> str:
+def _move_one(source: str, destination: str, overwrite: bool) -> str:
+    """移动/重命名单个文件或目录。返回一句结果说明;出错就抛(由调用方决定怎么处理)。"""
     src = safe_path(source)
     if not src.exists():
         raise FileNotFoundError(f"{src} 不存在")
@@ -699,3 +680,65 @@ def move_file(source: str, destination: str, overwrite: bool = False) -> str:
     else:
         action = "移动"
     return f"已{action}{kind}:{src} -> {dest}"
+
+
+@tool(
+    description="移动或重命名工作区内的文件、目录。同一目录内换个名字就是重命名,换到别的目录就是移动。"
+                "**source 可以给数组,一次移多个**(上限 20 个)—— 这时候 destination 必须是"
+                "一个**已存在的目录**,它们各自沿用原名移进去。"
+                "目标的父目录不存在会自动创建;目标是一个已存在的目录时,会把源移动进去并沿用原名。"
+                "默认不允许覆盖已存在的目标文件,需要覆盖时先征求用户同意再带 overwrite=true 重试。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "源文件或目录的路径(相对工作区);可给数组一次移多个,"
+                                       "如 [\"a.py\", \"b.py\"];单个也可以直接给字符串",
+                    },
+                    "destination": {
+                        "type": "string",
+                        "description": "目标路径(相对工作区)。移多个时必须是已存在的目录;"
+                                       "移单个时可以是新文件名,也可以是已存在的目录",
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "是否允许覆盖已存在的目标文件,默认 false。覆盖不可撤销,务必先得到用户确认",
+                    },
+                },
+                "required": ["source", "destination"],
+            },
+)
+def move_file(source, destination: str, overwrite: bool = False) -> str:
+    """移动或重命名工作区里的文件/目录。source 可以给数组,一次移多个。
+
+    多个源的时候 destination 必须是**已存在的目录** —— 几个文件挤到同一个新名字上没有
+    意义,而"移进某个目录"能推出来。单个源时保持原行为(目标可以是新名字,也可以是目录)。
+    """
+    sources = [source] if isinstance(source, str) else list(source)
+    if not sources:
+        return "错误:没有给出要移动的源"
+    if len(sources) > FS_MAX_MOVE_FILES:
+        return (f"错误:一次最多移动 {FS_MAX_MOVE_FILES} 个(收到 {len(sources)} 个),分批来吧")
+
+    if len(sources) == 1:
+        return _move_one(sources[0], destination, overwrite)
+
+    dest = safe_path(destination)
+    if not dest.is_dir():
+        why = "不存在" if not dest.exists() else "不是目录"
+        return (f"错误:一次移多个时,destination 必须是**已存在的目录**(让它们各自沿用原名"
+                f"移进去);而 {dest} {why}")
+
+    ok, bad = [], []
+    for s in sources:
+        try:
+            ok.append(_move_one(s, destination, overwrite))
+        except Exception as exc:  # noqa: BLE001 - 一个移不动不该拖垮整批
+            bad.append(f"  {s}: {type(exc).__name__}: {exc}")
+    lines = [f"已处理 {len(ok)} 个:"]
+    lines += [f"  {x}" for x in ok]
+    if bad:
+        lines += [f"失败 {len(bad)} 个:"] + bad
+    return "\n".join(lines)

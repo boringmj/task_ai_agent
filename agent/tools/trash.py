@@ -3,6 +3,7 @@ from __future__ import annotations
 from .registry import tool
 
 import json
+import os
 import re
 import shutil
 from datetime import datetime
@@ -23,23 +24,12 @@ from ..core import (
 # 回收站:删除的文件移到这里,不做真删除,超过 MAX_AGE_DAYS 天后启动时自动清空
 TRASH_DIR.mkdir(exist_ok=True)  # 回收站目录由本模块自己保证存在
 TRASH_INDEX_FILE = TRASH_DIR / "index.json"  # 记录 回收站文件名 -> 原路径,支撑还原
+# 批量删的上限。删除是破坏性操作,一次几十个既难复核、也容易误伤 —— 20 个够用,超了就
+# 该让模型分批、把每一批都摆给用户看清楚。
+TRASH_MAX_BATCH = int(os.environ.get("TRASH_MAX_BATCH", "20"))
 
-@tool(
-    description="删除工作区内的一个文件。实际行为是移入 .trash/ 回收站而非物理删除,用户可以自行恢复。"
-                "删除是破坏性操作:调用之前必须先取得用户的明确同意,不要自作主张删文件。"
-                "本工具只能删单个文件,不能删目录。",
-    parameters={
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "要删除的文件路径(相对工作区)",
-                    }
-                },
-                "required": ["path"],
-            },
-)
-def delete_file(path: str) -> str:
+def _delete_one(path: str) -> str:
+    """把一个文件移进回收站,返回 "原名 → 回收站名"。出错就抛(由调用方决定怎么处理)。"""
     target = safe_path(path)
     if not target.exists():
         raise FileNotFoundError(f"{target} 不存在")
@@ -65,7 +55,54 @@ def delete_file(path: str) -> str:
 
     target.rename(dest)
     _trash_record(dest, target)  # 记下原路径,否则没法还原到原位置
-    return f"已把 {target.name} 移入回收站:{dest}(可用 restore_file 还原)"
+    return f"{target.name} → {dest.name}"
+
+
+@tool(
+    description="删除工作区内的文件 —— 实际是移入 .trash/ 回收站(可用 restore_file 还原),不是物理删除。"
+                "**path 可以给数组,一次删多个**(上限 20 个)。"
+                "删除是破坏性操作:调用前必须取得用户明确同意,不要自作主张;批量删更是如此 —— "
+                "把要删的列清楚给用户看过再动手。本工具不能删目录。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "要删除的文件路径(相对工作区),可给数组一次删多个,"
+                                       "如 [\"a.py\", \"b.py\"];单个也可以直接给字符串",
+                    }
+                },
+                "required": ["path"],
+            },
+)
+def delete_file(path) -> str:
+    """删除工作区内的一个或多个文件(都走回收站,可还原)。
+
+    path 接受数组,一次删一批。单个文件时行为与从前一致(出错直接抛,调用方拿得到
+    异常类型);多个文件时改成"逐条收集" —— 一个失败不该让后面的全不删。
+    """
+    paths = [path] if isinstance(path, str) else list(path)
+    if not paths:
+        return "错误:没有给出要删除的文件"
+    if len(paths) > TRASH_MAX_BATCH:
+        return (f"错误:一次最多删 {TRASH_MAX_BATCH} 个(收到 {len(paths)} 个),分批删吧")
+
+    if len(paths) == 1:
+        done = _delete_one(paths[0])
+        return f"已把 {done.split(' → ')[0]} 移入回收站(可用 restore_file 还原)"
+
+    ok, bad = [], []
+    for p in paths:
+        try:
+            ok.append(_delete_one(p))
+        except Exception as exc:  # noqa: BLE001 - 一个删不掉不该拖垮整批
+            bad.append(f"  {p}: {type(exc).__name__}: {exc}")
+    lines = [f"已移入回收站 {len(ok)} 个(可用 restore_file 还原):"]
+    lines += [f"  {x}" for x in ok]
+    if bad:
+        lines += [f"失败 {len(bad)} 个:"] + bad
+    return "\n".join(lines)
 
 
 def _trash_dest(name: str) -> Path:
@@ -194,15 +231,19 @@ def _trash_timestamp(trash_path: Path) -> datetime | None:
 
 
 @tool(
-    description="把回收站里的一个文件还原到它原来的路径。还原前会先检查原位置是否有同名文件:"
+    description="把回收站里的文件还原到它原来的路径。**trashed_name 可以给数组,一次还原多个**"
+                "(误删一批时就该一次全捞回来)。还原前会先检查原位置是否有同名文件:"
                 "如果原位置已被占用,调用会失败并告诉你,此时应当先征求用户同意再带 overwrite=true 重试。"
-                "先用 list_files(path=\".trash\", show_hidden=true) 找到回收站里的确切的文件名再还原。",
+                "先用 list_files(path=\".trash\", show_hidden=true) 找到回收站里的确切文件名再还原。",
     parameters={
                 "type": "object",
                 "properties": {
                     "trashed_name": {
-                        "type": "string",
-                        "description": "回收站里那个文件的名字(含时间戳后缀),不是原路径",
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "回收站里那个文件的名字(含时间戳后缀),**不是原路径**;"
+                                       "可给数组一次还原多个,如 [\"a.20260914-025003.txt\"];"
+                                       "单个也可以直接给字符串",
                     },
                     "overwrite": {
                         "type": "boolean",
@@ -212,11 +253,37 @@ def _trash_timestamp(trash_path: Path) -> datetime | None:
                 "required": ["trashed_name"],
             },
 )
-def restore_file(trashed_name: str, overwrite: bool = False) -> str:
-    """把回收站里的文件还原到它的原路径。
+def restore_file(trashed_name, overwrite: bool = False) -> str:
+    """把回收站里的文件还原到它的原路径。trashed_name 可以给数组,一次还原多个。
 
-    还原前必须检查原位置是否已有文件 —— 直接覆盖会丢掉用户当前的内容,
-    这是不可逆的,所以要像 write_file 覆盖那样要求显式声明意图。
+    还原是**补救**动作,批量做很自然 —— 误删了一批,本来就该一次全捞回来。单个时行为
+    与从前一致(出错直接抛);多个时逐条收集,一个失败不挡其余。
+    """
+    names = [trashed_name] if isinstance(trashed_name, str) else list(trashed_name)
+    if not names:
+        return "错误:没有给出要还原的项"
+    if len(names) > TRASH_MAX_BATCH:
+        return f"错误:一次最多还原 {TRASH_MAX_BATCH} 个(收到 {len(names)} 个),分批来吧"
+    if len(names) == 1:
+        return _restore_one(names[0], overwrite)
+
+    ok, bad = [], []
+    for n in names:
+        try:
+            ok.append(_restore_one(n, overwrite))
+        except Exception as exc:  # noqa: BLE001 - 一个还原不了不该拖垮整批
+            bad.append(f"  {n}: {type(exc).__name__}: {exc}")
+    lines = [f"已还原 {len(ok)} 个:"] + [f"  {x}" for x in ok]
+    if bad:
+        lines += [f"失败 {len(bad)} 个:"] + bad
+    return "\n".join(lines)
+
+
+def _restore_one(trashed_name: str, overwrite: bool) -> str:
+    """把一个回收站项还原回原路径(内核)。出错就抛,由调用方决定怎么处理。
+
+    还原前必须检查原位置是否已有文件 —— 直接覆盖会丢掉用户当前的内容,那是不可逆的,
+    所以要像 write_file 覆盖那样要求显式声明意图。
     """
     trash_path = safe_path(TRASH_DIR / trashed_name)
     if not trash_path.exists():  # 目录和文件都能还原,不能只看 is_file()

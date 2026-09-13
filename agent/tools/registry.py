@@ -48,6 +48,25 @@ def _discover() -> None:
         if path.stem.startswith("_") or path.stem == Path(__file__).stem:
             continue
         importlib.import_module(f"{pkg}.{path.stem}")
+    _check_no_private_tools()
+
+
+def _check_no_private_tools() -> None:
+    """注册表体检:工具名不该以下划线开头。
+
+    抓的是**装饰器错位** —— 往 `@tool` 和它的 `def` 之间插辅助函数时,装饰器会落到辅助
+    函数头上,原工具反过来变成裸函数。症状很隐蔽:某个天天在用的工具莫名从清单里消失,
+    多出一个没人认识的私有名,模型还会照着那个错名字去调。
+
+    这个坑踩过三次(vm_status、read_file、delete_file 各一次),每次都是靠人肉核对工具表
+    才发现。项目里所有工具都是公开名,私有名只可能是辅助函数 —— 所以一条断言就能兜住。
+    """
+    bad = sorted(n for n in _TOOL_FUNCS if n.startswith("_"))
+    if bad:
+        raise RuntimeError(
+            f"这些工具名以下划线开头:{bad} —— 几乎可以肯定是 @tool 装饰器落错了位置"
+            f"(插辅助函数时被夹在了 @tool 和原 def 之间,把装饰器抢走了)。"
+        )
 
 
 _discover()
