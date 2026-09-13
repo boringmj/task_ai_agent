@@ -1,0 +1,1104 @@
+# 危险 API 与漏洞模式规则(数据流分析用的 sink 清单)
+#
+# languages 字段:[python] / [javascript] / [java] / [go] / [php] 限定语言,
+#               ["*"] 表示对所有文本文件生效(通用 Web 规则走这条)。
+#
+# 牢记:一条命中只说明"这里有个危险的 sink",**不等于漏洞**。
+# 真漏洞需要同时满足:①参数可控 ②能到达这里 ③没有拦截。后两步要靠读代码判断。
+#
+# 正则写在单引号里;YAML 单引号串中的单引号要写成两个('')。
+
+rules:
+  # ========================================================================= #
+  # 通用 Web(不限语言 / 不限框架)
+  # ========================================================================= #
+
+  - id: WEB-CMD-INJECTION-SHELL
+    category: A03:2021-Injection
+    cwe: CWE-78
+    severity: high
+    confidence: medium
+    languages: ['*']
+    pattern: '(?i)(subprocess\.(run|call|Popen|check_output|check_call)[^\n]{0,120}shell\s*=\s*True|child_process\.exec\s*\(|Runtime\.getRuntime\(\)\s*\.\s*exec|\bos\.system\s*\(|\bassert\s*\(\s*\$|shell_exec|passthru|proc_open|exec\.Command\s*\(\s*["''](sh|bash|cmd|powershell)["''])'
+    message: "命令执行 sink,若参数含外部输入即为 RCE"
+    remediation: "用参数数组传参、不经过 shell;对可执行文件白名单,对参数做校验"
+
+  - id: WEB-SQL-STRING-BUILD
+    category: A03:2021-Injection
+    cwe: CWE-89
+    severity: high
+    confidence: medium
+    languages: ['*']
+    pattern: '(?i)(select|insert\s+into|update\s+\w+\s+set|delete\s+from)[^\n;]{0,160}(\.format\s*\(|%\s*[\w(]|\$\{|f["'']|fmt\.Sprintf|["'']\s*\+\s*[a-z_$]|\+\s*["'']|["'']\s*\.\s*\$[a-z_]|\$[a-z_]+\s*\.\s*["''])'
+    message: "SQL 语句用拼接 / 格式化构造(疑似注入)"
+    remediation: "一律用参数化查询(占位符);表名/列名用白名单映射"
+
+  - id: WEB-PATH-TRAVERSAL
+    category: A01:2021-Broken-Access-Control
+    cwe: CWE-22
+    severity: high
+    confidence: medium
+    languages: ['*']
+    pattern: '(?i)(open|readFile|readFileSync|createReadStream|sendFile|file_get_contents|fopen|readfile|new\s+File|Files\.(read|write|newInputStream)|os\.ReadFile|ioutil\.ReadFile|filepath\.Join|os\.path\.join|Path\.Combine)\s*\([^)]{0,80}(\$_(GET|POST|REQUEST|COOKIE)|request\.(args|form|params|query|body)|req\.(query|params|body)|\binput\(|params\[|getParameter|getHeader)'
+    message: "文件路径由外部输入拼接(目录穿越 / 任意文件读写)"
+    remediation: "规范化路径后校验是否仍在允许目录内;用 ID 映射而非用户给的文件名"
+
+  - id: WEB-UNRESTRICTED-FILE-UPLOAD
+    category: A04:2021-Insecure-Design
+    cwe: CWE-434
+    severity: high
+    confidence: medium
+    languages: ['*']
+    pattern: '(?i)(move_uploaded_file\s*\(|multipart\.FormFile|\.save\s*\(\s*(file|upload)|copy\s*\(\s*\$_FILES|Files\.copy[^\n]{0,60}(MultipartFile|getOriginalFilename))'
+    message: "文件上传落盘,确认是否校验扩展名 / MIME / 内容,以及落盘目录能否被执行"
+    remediation: "白名单扩展名 + 重命名 + 存到 Web 根之外 + 禁止执行权限"
+
+  - id: WEB-SSRF-REQUEST
+    category: A10:2021-Server-Side-Request-Forgery
+    cwe: CWE-918
+    severity: medium
+    confidence: low
+    languages: ['*']
+    pattern: '(?i)(requests\.(get|post|put|delete|request)|urlopen|http\.(Get|Post|PostForm)|axios\.(get|post|put|delete|request)|fetch\s*\(|got\(|superagent|curl_init|curl_setopt[^\n]{0,80}CURLOPT_URL|HttpURLConnection|new\s+URL\s*\(|WebClient\.(get|post))\s*\(?[^\n)]{0,80}(\$_(GET|POST|REQUEST)|request\.(args|form|params|query|body|getParameter)|req\.(query|params|body)|params\[|input\()'
+    message: "请求目标由外部输入决定(SSRF 信号),确认是否有协议 / 内网地址校验"
+    remediation: "目标用白名单;解析 DNS 后校验 IP 不在内网/回环/元数据段;禁用非常规 scheme"
+
+  - id: WEB-CLOUD-METADATA
+    category: A10:2021-Server-Side-Request-Forgery
+    cwe: CWE-918
+    severity: high
+    confidence: high
+    languages: ['*']
+    pattern: '(?i)(169\.254\.169\.254|metadata\.google\.internal|100\.100\.100\.200|metadata\.aliyun|/latest/meta-data)'
+    message: "出现云元数据地址(多半是已有 SSRF 的利用面,或代码里在直连)"
+    remediation: "给云主机启用 IMDSv2 / 限制元数据访问;应用层禁止访问该网段"
+
+  - id: WEB-DESERIALIZATION
+    category: A08:2021-Software-and-Data-Integrity-Failures
+    cwe: CWE-502
+    severity: high
+    confidence: medium
+    languages: ['*']
+    pattern: '(?i)(pickle\.loads?|cPickle\.loads?|dill\.loads|marshal\.loads|yaml\.load\s*\(|unserialize\s*\(|ObjectInputStream|readObject\s*\(\s*\)|XMLDecoder|BinaryFormatter|JsonConvert\.DeserializeObject[^\n]{0,60}TypeNameHandling)'
+    message: "反序列化 sink,输入可控时可直接达成 RCE"
+    remediation: "改安全格式(JSON + 显式校验);确需反序列化则做类型白名单"
+
+  - id: WEB-XXE
+    category: A05:2021-Security-Misconfiguration
+    cwe: CWE-611
+    severity: high
+    confidence: medium
+    languages: ['*']
+    pattern: '(?i)(xml\.etree\.ElementTree|etree\.(parse|fromstring|XML)|lxml\.etree[^\n]{0,80}XMLParser|simplexml_load_file|simplexml_load_string|DocumentBuilderFactory\.newInstance|SAXParserFactory\.newInstance|XmlReader\.Create|loadXML\s*\(|DOMDocument[^\n]{0,40}load)'
+    message: "XML 解析入口,确认是否禁用了外部实体与 DTD"
+    remediation: "关闭 DTD / 外部实体(resolve_entities=False、disallow-doctype-decl)"
+
+  - id: WEB-SSTI
+    category: A03:2021-Injection
+    cwe: CWE-1336
+    severity: high
+    confidence: medium
+    languages: ['*']
+    pattern: '(?i)(render_template_string|Environment\([^)]*\)\.from_string|Template\s*\(\s*[a-z_$]|Twig[^\n]{0,30}createTemplate|Freemarker[^\n]{0,30}process|Velocity\.evaluate)'
+    message: "模板由变量拼装(SSTI,常直接通向 RCE)"
+    remediation: "模板字符串必须是常量;用户数据只作为渲染变量传入"
+
+  - id: WEB-XSS-DOM
+    category: A03:2021-Injection
+    cwe: CWE-79
+    severity: medium
+    confidence: medium
+    languages: ['*']
+    pattern: '(?i)(\.innerHTML\s*=|\.outerHTML\s*=|document\.write(ln)?\s*\(|dangerouslySetInnerHTML|v-html\s*=|\[innerHTML\]\s*=|insertAdjacentHTML\s*\()'
+    message: "危险的 DOM 写入点,数据若来自输入未过滤即 XSS"
+    remediation: "用 textContent / 框架的安全插值;富文本走白名单净化(DOMPurify)"
+
+  - id: WEB-XSS-REFLECT
+    category: A03:2021-Injection
+    cwe: CWE-79
+    severity: medium
+    confidence: medium
+    languages: ['*']
+    pattern: '(?i)(echo|print|printf|die|exit|<%=\s*|response\.write\s*\()\s*\(?[^\n]{0,40}(\$_(GET|POST|REQUEST|COOKIE)|request\.(args|form|params|query|body)|req\.(query|params|body)|getParameter)'
+    message: "直接把请求参数回显到页面(反射型 XSS 信号)"
+    remediation: "输出统一做 HTML 实体编码;配 CSP"
+
+  - id: WEB-OPEN-REDIRECT
+    category: A01:2021-Broken-Access-Control
+    cwe: CWE-601
+    severity: medium
+    confidence: medium
+    languages: ['*']
+    pattern: '(?i)(res\.redirect\s*\(|Response\.Redirect\s*\(|sendRedirect\s*\(|header\s*\(\s*["'']Location:|Location\s*:\s*["'']?\s*\.?\s*\$|window\.location\s*=\s*[^;]{0,40}(params|input|\$_GET))'
+    message: "跳转目标可能来自参数(开放重定向,常用于钓鱼 / 绕过校验)"
+    remediation: "只允许相对路径或白名单域名"
+
+  - id: WEB-HOST-HEADER-TRUST
+    category: A05:2021-Security-Misconfiguration
+    cwe: CWE-346
+    severity: medium
+    confidence: low
+    languages: ['*']
+    pattern: '(?i)(request|req)\.[^\n]{0,20}(headers|getHeader)[^\n]{0,40}(["'']|\[)host|\$_SERVER\[["'']HTTP_HOST'
+    message: "使用 Host 头构造链接(密码重置投毒 / 缓存投毒)"
+    remediation: "用固定配置的站点域名,不要信 Host 头"
+
+  - id: WEB-MASS-ASSIGNMENT
+    category: A01:2021-Broken-Access-Control
+    cwe: CWE-915
+    severity: medium
+    confidence: low
+    languages: ['*']
+    pattern: '(?i)(Object\.assign\s*\(\s*[a-z_$][\w$]*\s*,\s*req\.(body|query)|\.update\s*\(\s*req\.body|\.create\s*\(\s*req\.body|update_attributes\s*\(\s*params|\.permit!\s*$|setattr\s*\([^\n]{0,40}(request|req)\.)'
+    message: "把整个请求体批量赋给模型(可越权改 is_admin 等敏感字段)"
+    remediation: "显式白名单字段;敏感字段禁由请求设置"
+
+  - id: WEB-IDOR-SIGNAL
+    category: A01:2021-Broken-Access-Control
+    cwe: CWE-639
+    severity: medium
+    confidence: low
+    languages: ['*']
+    pattern: '(?i)(findById|get_object_or_404|\.first\(|SELECT[^\n]{0,80}WHERE\s+id\s*=|\.find\([^\n]{0,40}id\s*:)[^\n]{0,120}(params|query|args|request\.|\$_GET|input\()'
+    message: "直接用请求里的 id 查数据,确认是否校验了归属(越权/IDOR 高发点)"
+    remediation: "查询条件里带上当前用户/租户 ID,或查后做归属校验"
+
+  - id: WEB-CSRF-SIGNAL
+    category: A01:2021-Broken-Access-Control
+    cwe: CWE-352
+    severity: low
+    confidence: low
+    languages: ['*']
+    pattern: '(?i)(@app\.(post|put|delete|patch)|@RequestMapping[^\n]{0,40}(POST|PUT|DELETE)|router\.(post|put|delete)|app\.(post|put|delete)\s*\([^\n]{0,60}(transfer|delete|update|admin|logout|pay|withdraw))'
+    message: "存在状态变更接口,确认是否有 CSRF 防护 / SameSite"
+    remediation: "校验 CSRF token 或改用 SameSite=Lax/Strict + Origin 校验"
+
+  - id: WEB-JWT-ALG-NONE
+    category: A07:2021-Identification-and-Authentication-Failures
+    cwe: CWE-347
+    severity: critical
+    confidence: medium
+    languages: ['*']
+    pattern: '(?i)(algorithms?\s*[:=]\s*\[?\s*["'']none["'']|verify_signature["'']?\s*[:=]\s*(False|false)|verify\s*[:=]\s*(False|false)[^\n]{0,60}jwt|jwt\.decode\s*\([^\n]{0,80}(verify\s*[:=]\s*(False|false)|options\s*=\s*\{[^}]*verify_signature))'
+    message: "JWT 校验被关闭或允许 alg=none(可伪造任意身份)"
+    remediation: "强制固定算法白名单并始终验签"
+
+  - id: WEB-WEAK-RANDOM-TOKEN
+    category: A02:2021-Cryptographic-Failures
+    cwe: CWE-338
+    severity: medium
+    confidence: medium
+    languages: ['*']
+    pattern: '(?i)(token|otp|reset[_\-]?code|session[_\-]?id|secret|salt|nonce|csrf|verify[_\-]?code)[A-Za-z0-9_]*\s*[:=][^\n]{0,40}(Math\.random|random\.(random|randint|choice|randrange)|\brand\s*\(|mt_rand|uniqid|microtime|time\s*\(\s*\)\s*\.\s*rand)'
+    message: "安全令牌用弱随机数生成(可预测 → 爆破 / 越权)"
+    remediation: "用 CSPRNG:secrets / crypto.randomBytes / SecureRandom / random_int / crypto/rand"
+
+  - id: WEB-TIMING-UNSAFE-COMPARE
+    category: A02:2021-Cryptographic-Failures
+    cwe: CWE-208
+    severity: low
+    confidence: low
+    languages: ['*']
+    pattern: '(?i)(hmac|signature|digest|token|secret|password_hash)[A-Za-z0-9_]*\s*(==|!=)\s*(?!None|nil|null)'
+    message: "敏感值用 == 直接比较(时序侧信道)"
+    remediation: "用 hmac.compare_digest / crypto.timingSafeEqual 等常量时间比较"
+
+  - id: WEB-SENSITIVE-LOG
+    category: A09:2021-Security-Logging-and-Monitoring-Failures
+    cwe: CWE-532
+    severity: low
+    confidence: medium
+    languages: ['*']
+    pattern: '(?i)(log(ger)?\.(debug|info|warning|error)|console\.(log|info|debug)|print|System\.out\.print)[^\n]{0,60}(password|passwd|pwd|secret|token|api[_-]?key|credit[_-]?card|cvv|id[_-]?card)'
+    message: "日志里可能打印了敏感信息"
+    remediation: "打码或干脆不打;日志系统加敏感字段过滤"
+
+  - id: WEB-RESET-TOKEN-IN-RESPONSE
+    category: A04:2021-Insecure-Design
+    cwe: CWE-640
+    severity: high
+    confidence: low
+    languages: ['*']
+    pattern: '(?i)(reset|forgot)[_\-]?(token|code|link)[^\n]{0,60}(return|response|render|jsonify|json\.dumps|send)\b'
+    message: "重置令牌 / 链接直接在响应里返回(任意人可重置他人密码)"
+    remediation: "只通过邮件 / 短信等带外渠道下发"
+
+  - id: WEB-RACE-CONDITION-PAYMENT
+    category: A04:2021-Insecure-Design
+    cwe: CWE-362
+    severity: medium
+    confidence: low
+    languages: ['*']
+    pattern: '(?i)(balance|stock|amount|quota|inventory)[^\n]{0,40}(-=\s*|\+\=\s*\w+(amount|qty))'
+    message: "余额 / 库存的直接增减,确认是否有并发控制(超卖 / 重复扣款)"
+    remediation: "数据库层面带条件更新(UPDATE ... WHERE balance >= x),或加锁 / 幂等键"
+
+  # ========================================================================= #
+  # Python
+  # ========================================================================= #
+
+  - id: PY-EVAL-EXEC
+    category: A03:2021-Injection
+    cwe: CWE-95
+    severity: high
+    confidence: medium
+    languages: [python]
+    pattern: '(?i)(?<![\w.])(eval|exec)\s*\('
+    message: "eval/exec 执行动态代码"
+    remediation: "用 ast.literal_eval 或显式解析;绝不执行拼接出来的代码"
+
+  - id: PY-OS-SYSTEM
+    category: A03:2021-Injection
+    cwe: CWE-78
+    severity: high
+    confidence: medium
+    languages: [python]
+    pattern: '(?i)\bos\.(system|popen|spawn[lv]?[pe]?)\s*\('
+    message: "os.system / popen 走 shell"
+    remediation: "改用 subprocess 的参数列表形式"
+
+  - id: PY-SQL-RAW
+    category: A03:2021-Injection
+    cwe: CWE-89
+    severity: high
+    confidence: medium
+    languages: [python]
+    pattern: '(?i)(\.raw\s*\(\s*f?["'']|cursor\.execute\s*\(|executemany\s*\(|\.execute\s*\(\s*f["'']|\.extra\s*\(|text\s*\(\s*f["''])'
+    message: "原始 SQL 执行入口,确认参数是否拼接"
+    remediation: "用占位符 %s / :name 传参"
+
+  - id: PY-PICKLE-LOAD
+    category: A08:2021-Software-and-Data-Integrity-Failures
+    cwe: CWE-502
+    severity: high
+    confidence: high
+    languages: [python]
+    pattern: '(?i)(pickle|cPickle|dill|shelve|marshal)\.loads?\s*\('
+    message: "不安全反序列化"
+    remediation: "换 JSON;必须用时加 HMAC 校验来源"
+
+  - id: PY-YAML-LOAD-UNSAFE
+    category: A08:2021-Software-and-Data-Integrity-Failures
+    cwe: CWE-502
+    severity: high
+    confidence: medium
+    languages: [python]
+    pattern: '(?i)yaml\.load\s*\((?!\s*[^)]{0,80}(Safe|safe)_?Loader)'
+    message: "yaml.load 未指定 SafeLoader"
+    remediation: "用 yaml.safe_load"
+
+  - id: PY-TEMPLATE-INJECTION
+    category: A03:2021-Injection
+    cwe: CWE-1336
+    severity: high
+    confidence: medium
+    languages: [python]
+    pattern: '(?i)(render_template_string|from_string|jinja2\.Template|Template\s*\()'
+    message: "动态模板渲染"
+    remediation: "模板固定,数据只作为变量"
+
+  - id: PY-REQUESTS-USER-URL
+    category: A10:2021-Server-Side-Request-Forgery
+    cwe: CWE-918
+    severity: medium
+    confidence: low
+    languages: [python]
+    pattern: '(?i)(requests\.(get|post|put|patch|delete|head|request)|urllib\.request\.urlopen|httpx\.(get|post|stream))\s*\(\s*(f["'']|["'']\s*\+|[a-z_][\w\.\[\]"'']*\s*[+%]|[a-z_][\w\.\[\]"'']*\s*\))'
+    message: "请求 URL 来自变量(SSRF 信号)"
+    remediation: "白名单目标域名;禁止访问内网与元数据地址"
+
+  - id: PY-OPEN-USER-INPUT
+    category: A01:2021-Broken-Access-Control
+    cwe: CWE-22
+    severity: medium
+    confidence: low
+    languages: [python]
+    pattern: '(?i)\b(open|Path|shutil\.copy\w*|shutil\.move)\s*\(\s*(?!["''])(?!f?["''])[a-z_][\w\.\[\]"'']*'
+    message: "文件操作参数是变量,确认是否来自用户输入"
+    remediation: "校验并规范化路径,限制在基目录内"
+
+  - id: PY-SUBPROCESS-SHELL
+    category: A03:2021-Injection
+    cwe: CWE-78
+    severity: high
+    confidence: high
+    languages: [python]
+    pattern: '(?i)subprocess\.[a-zA-Z_]+\([^)]*shell\s*=\s*True'
+    message: "subprocess 开了 shell"
+    remediation: "去掉 shell=True,用列表传参"
+
+  - id: PY-DEBUG-RUN
+    category: A05:2021-Security-Misconfiguration
+    cwe: CWE-489
+    severity: medium
+    confidence: medium
+    languages: [python]
+    pattern: '(?i)(app\.run\s*\([^)]*debug\s*=\s*True|DEBUG\s*=\s*True|run\s*\([^)]*debug\s*=\s*True)'
+    message: "Flask/Django 调试模式打开(Werkzeug 调试器可 RCE)"
+    remediation: "生产环境关闭"
+
+  - id: PY-TLS-VERIFY-OFF
+    category: A02:2021-Cryptographic-Failures
+    cwe: CWE-295
+    severity: medium
+    confidence: high
+    languages: [python]
+    pattern: '(?i)(verify\s*=\s*False|ssl\._create_unverified_context|ssl\.CERT_NONE|check_hostname\s*=\s*False)'
+    message: "关闭 TLS 校验"
+    remediation: "恢复校验"
+
+  - id: PY-MD5-PASSWORD
+    category: A02:2021-Cryptographic-Failures
+    cwe: CWE-916
+    severity: high
+    confidence: medium
+    languages: [python]
+    pattern: '(?i)(hashlib\.(md5|sha1)\s*\(|md5\s*\(\s*[^)]{0,40}(pass|pwd|secret))'
+    message: "弱哈希用于口令"
+    remediation: "改用 bcrypt / argon2(passlib)"
+
+  - id: PY-DJANGO-CSRF-EXEMPT
+    category: A01:2021-Broken-Access-Control
+    cwe: CWE-352
+    severity: medium
+    confidence: high
+    languages: [python]
+    pattern: '(?i)@csrf_exempt'
+    message: "该视图豁免了 CSRF 校验"
+    remediation: "去掉;确需豁免(如 webhook)要做签名校验"
+
+  - id: PY-JINJA-AUTOESCAPE-OFF
+    category: A03:2021-Injection
+    cwe: CWE-79
+    severity: medium
+    confidence: medium
+    languages: [python]
+    pattern: '(?i)(autoescape\s*=\s*False|\|\s*safe\b|mark_safe\s*\(|Markup\s*\(|format_html\s*\()'
+    message: "关闭了模板自动转义(XSS 风险)"
+    remediation: "保持自动转义;必须渲染 HTML 时先净化"
+
+  - id: PY-SQL-FSTRING
+    category: A03:2021-Injection
+    cwe: CWE-89
+    severity: high
+    confidence: medium
+    languages: [python]
+    pattern: '(?i)(execute|executemany|raw)\s*\(\s*f["'']'
+    message: "f-string 直接拼进 SQL"
+    remediation: "参数化查询"
+
+  - id: PY-TAR-EXTRACT
+    category: A08:2021-Software-and-Data-Integrity-Failures
+    cwe: CWE-22
+    severity: medium
+    confidence: medium
+    languages: [python]
+    pattern: '(?i)(tarfile\.\w+\.?\w*\.?(extractall|extract)\s*\(|zipfile\.\w+\.extractall\s*\()'
+    message: "解压不可信压缩包(路径穿越 / Zip Slip)"
+    remediation: "解压前逐条校验成员路径,过滤 .. 与绝对路径"
+
+  - id: PY-SECRETS-VIA-ARGS
+    category: A07:2021-Identification-and-Authentication-Failures
+    cwe: CWE-214
+    severity: low
+    confidence: low
+    languages: [python]
+    pattern: '(?i)add_argument\s*\(\s*["''][-_]{0,2}(password|secret|token|api[_-]?key)["'']'
+    message: "命令行参数传密钥(会进进程列表 / shell history)"
+    remediation: "改用环境变量 / 交互输入 / 文件描述符"
+
+  # ========================================================================= #
+  # JavaScript / TypeScript
+  # ========================================================================= #
+
+  - id: JS-EVAL
+    category: A03:2021-Injection
+    cwe: CWE-95
+    severity: high
+    confidence: medium
+    languages: [javascript]
+    pattern: '(?i)(?<![\w.$])(eval|Function)\s*\('
+    message: "eval / new Function 执行动态代码"
+    remediation: "去掉;必须解析表达式时用受限的解析器"
+
+  - id: JS-CHILD-PROCESS
+    category: A03:2021-Injection
+    cwe: CWE-78
+    severity: high
+    confidence: medium
+    languages: [javascript]
+    pattern: '(?i)(child_process\.(exec|execSync|spawn|spawnSync|fork)\s*\(|require\(["'']child_process["'']\)|\.exec\s*\(\s*[`"''][^`"'']*\$\{)'
+    message: "子进程执行,确认命令是否含外部输入"
+    remediation: "用 execFile + 参数数组;严格校验入参"
+
+  - id: JS-VM-ESCAPE
+    category: A03:2021-Injection
+    cwe: CWE-95
+    severity: high
+    confidence: medium
+    languages: [javascript]
+    pattern: '(?i)vm\.(runInNewContext|runInThisContext|runInContext|createContext|Script)\s*\('
+    message: "Node vm 不是安全沙箱,逃逸手法公开"
+    remediation: "用 isolated-vm / 独立进程 + 权限隔离"
+
+  - id: JS-SQL-CONCAT
+    category: A03:2021-Injection
+    cwe: CWE-89
+    severity: high
+    confidence: medium
+    languages: [javascript]
+    pattern: '(?i)(sequelize\.query\s*\(|knex\.raw\s*\(|connection\.query\s*\(|pool\.query\s*\(|db\.query\s*\()[^\n]{0,80}(`[^`]*\$\{|["'']\s*\+|\+[^\n]{0,20}(req\.|params|query|body))'
+    message: "SQL 拼接"
+    remediation: "参数化 / 绑定变量"
+
+  - id: JS-NOSQL-INJECTION
+    category: A03:2021-Injection
+    cwe: CWE-943
+    severity: high
+    confidence: low
+    languages: [javascript]
+    pattern: '(?i)(\$where|\$ne\s*:|\$gt\s*:|\$regex\s*:)[^\n]{0,60}(req\.|params|query|body)|\.find\s*\(\s*req\.(body|query)\b'
+    message: "NoSQL 查询直接吃请求对象($ne 绕过登录等)"
+    remediation: "强制类型校验,拒绝对象型输入"
+
+  - id: JS-PATH-READ
+    category: A01:2021-Broken-Access-Control
+    cwe: CWE-22
+    severity: high
+    confidence: medium
+    languages: [javascript]
+    pattern: '(?i)(fs\.(readFile|readFileSync|writeFile|writeFileSync|createReadStream|createWriteStream|unlink|readdir|stat)\w*|res\.(sendFile|download)|path\.join)\s*\([^)]{0,80}(req\.(query|params|body)|params\.|decodeURIComponent)'
+    message: "文件路径来自请求参数"
+    remediation: "校验路径归属,限制在固定目录"
+
+  - id: JS-PROTOTYPE-POLLUTION
+    category: A08:2021-Software-and-Data-Integrity-Failures
+    cwe: CWE-1321
+    severity: high
+    confidence: medium
+    languages: [javascript]
+    pattern: '(?i)(Object\.assign|_\.merge|_\.defaultsDeep|lodash\.merge|\.extend\s*\()\s*\(\s*[a-zA-Z_$][\w$.]*\s*,\s*[a-zA-Z_$.]*req\.(body|query|params)'
+    message: "用请求对象做深合并(原型污染)"
+    remediation: "过滤 __proto__ / constructor / prototype 键;升级到已修版本"
+
+  - id: JS-OPEN-REDIRECT
+    category: A01:2021-Broken-Access-Control
+    cwe: CWE-601
+    severity: medium
+    confidence: medium
+    languages: [javascript]
+    pattern: '(?i)res\.(redirect|location)\s*\(\s*(?!["''`]\/)(?!["''`]https?:\/\/[a-z0-9.\-]*your)[^)]{0,60}(req\.|params|query|body)'
+    message: "跳转目标来自请求"
+    remediation: "白名单域名或强制相对路径"
+
+  - id: JS-CORS-REFLECT
+    category: A05:2021-Security-Misconfiguration
+    cwe: CWE-942
+    severity: high
+    confidence: medium
+    languages: [javascript]
+    pattern: '(?i)(Access-Control-Allow-Origin["'']?\s*[,:]\s*["'']?\*|origin\s*:\s*(req\.headers\.origin|true|["'']\*["''])|cors\s*\(\s*\{\s*origin\s*:\s*true)'
+    message: "CORS 放开通配 / 反射任意 Origin"
+    remediation: "精确白名单;注意不能与 credentials 同用通配"
+
+  - id: JS-JWT-WEAK
+    category: A07:2021-Identification-and-Authentication-Failures
+    cwe: CWE-347
+    severity: high
+    confidence: medium
+    languages: [javascript]
+    pattern: '(?i)(jwt\.(verify|decode)[^\n]{0,100}(algorithms\s*:\s*\[?\s*["'']none|ignoreExpiration\s*:\s*true|complete\s*:\s*true)|secret\s*:\s*["''][^"'']{1,12}["''])'
+    message: "JWT 校验过弱(允许 none / 不校验过期 / 密钥过短)"
+    remediation: "固定算法白名单、校验 exp、用足够长的随机密钥"
+
+  - id: JS-INSECURE-RANDOM
+    category: A02:2021-Cryptographic-Failures
+    cwe: CWE-338
+    severity: medium
+    confidence: medium
+    languages: [javascript]
+    pattern: '(?i)(Math\.random\s*\(\s*\)[^\n]{0,40}(toString\(36\)|slice|substr|token|key|secret)|uuid\s*\(\s*\)[^\n]{0,20}(token|secret|session))'
+    message: "用 Math.random 生成安全相关值"
+    remediation: "用 crypto.randomBytes / crypto.randomUUID"
+
+  - id: JS-TLS-INSECURE
+    category: A02:2021-Cryptographic-Failures
+    cwe: CWE-295
+    severity: medium
+    confidence: high
+    languages: [javascript]
+    pattern: '(?i)(rejectUnauthorized\s*:\s*false|NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*["'']?0|secureProtocol\s*:\s*["''](SSLv3|TLSv1_method)|minVersion\s*:\s*["'']TLSv1["''])'
+    message: "关闭 / 降级 TLS 校验"
+    remediation: "恢复校验并禁用老旧协议"
+
+  - id: JS-EXPRESS-NO-HELMET
+    category: A05:2021-Security-Misconfiguration
+    cwe: CWE-693
+    severity: info
+    confidence: low
+    languages: [javascript]
+    pattern: '(?i)(express\s*\(\s*\)|const\s+app\s*=\s*express)'
+    message: "创建 Express 应用,确认是否用了 helmet 与安全响应头"
+    remediation: "引入 helmet,配 CSP/HSTS/X-Frame-Options"
+
+  - id: JS-ELECTRON-NODE-INTEGRATION
+    category: A05:2021-Security-Misconfiguration
+    cwe: CWE-749
+    severity: high
+    confidence: medium
+    languages: [javascript]
+    pattern: '(?i)(nodeIntegration\s*:\s*true|contextIsolation\s*:\s*false|webSecurity\s*:\s*false|enableRemoteModule\s*:\s*true|allowRunningInsecureContent\s*:\s*true)'
+    message: "Electron 安全开关被关(渲染进程可直达 Node → RCE)"
+    remediation: "contextIsolation: true + nodeIntegration: false + preload 白名单"
+
+  - id: JS-POSTMESSAGE-ORIGIN
+    category: A03:2021-Injection
+    cwe: CWE-346
+    severity: medium
+    confidence: medium
+    languages: [javascript]
+    pattern: '(?i)addEventListener\s*\(\s*["'']message["''][^\n]{0,200}(postMessage|innerHTML|eval|location\s*=)|onmessage\s*=[^\n]{0,120}(eval|innerHTML)'
+    message: "postMessage 处理未校验 origin / 直接执行"
+    remediation: "校验 event.origin,不信任消息内容"
+
+  - id: JS-REGEX-DOS
+    category: A05:2021-Security-Misconfiguration
+    cwe: CWE-1333
+    severity: low
+    confidence: low
+    languages: [javascript]
+    pattern: '(?i)new\s+RegExp\s*\(\s*(req\.|params|query|body|user|input)'
+    message: "用输入构造正则(ReDoS / 注入)"
+    remediation: "正则固定化或严格转义输入"
+
+  # ========================================================================= #
+  # Java
+  # ========================================================================= #
+
+  - id: JAVA-RUNTIME-EXEC
+    category: A03:2021-Injection
+    cwe: CWE-78
+    severity: high
+    confidence: medium
+    languages: [java]
+    pattern: '(?i)Runtime\.getRuntime\(\)\s*\.\s*exec\s*\('
+    message: "Runtime.exec 执行命令"
+    remediation: "用 ProcessBuilder + 参数列表,校验入参"
+
+  - id: JAVA-PROCESSBUILDER-SH
+    category: A03:2021-Injection
+    cwe: CWE-78
+    severity: high
+    confidence: medium
+    languages: [java]
+    pattern: '(?i)new\s+ProcessBuilder\s*\([^)]{0,60}["''](-c|/c|sh|bash|cmd)["'']'
+    message: "ProcessBuilder 走 shell 解释器"
+    remediation: "直接调用目标程序,不经 shell"
+
+  - id: JAVA-SQL-CONCAT
+    category: A03:2021-Injection
+    cwe: CWE-89
+    severity: high
+    confidence: medium
+    languages: [java]
+    pattern: '(?i)(createStatement|createQuery|createNativeQuery|executeQuery|executeUpdate)\s*\([^)]{0,80}(["''][^"'']*["'']\s*\+|\+\s*[a-zA-Z_])'
+    message: "JDBC/JPA SQL 拼接"
+    remediation: "PreparedStatement / 命名参数"
+
+  - id: JAVA-DESERIALIZE
+    category: A08:2021-Software-and-Data-Integrity-Failures
+    cwe: CWE-502
+    severity: critical
+    confidence: medium
+    languages: [java]
+    pattern: '(?i)(new\s+ObjectInputStream\s*\(|XMLDecoder|new\s+Yaml\s*\(|SnakeYaml|readObject\s*\(\s*\)|SerializationUtils\.deserialize)'
+    message: "Java 反序列化入口(gadget 链成熟,常直接 RCE)"
+    remediation: "换安全格式;确需时用 ObjectInputFilter 做类白名单"
+
+  - id: JAVA-XXE-FACTORY
+    category: A05:2021-Security-Misconfiguration
+    cwe: CWE-611
+    severity: high
+    confidence: medium
+    languages: [java]
+    pattern: '(?i)(DocumentBuilderFactory\.newInstance|SAXParserFactory\.newInstance|XMLInputFactory\.newInstance|TransformerFactory\.newInstance)\s*\('
+    message: "XML 解析器创建点,确认是否禁用 DTD / 外部实体"
+    remediation: "setFeature(\"http://apache.org/xml/features/disallow-doctype-decl\", true)"
+
+  - id: JAVA-SPEL-INJECTION
+    category: A03:2021-Injection
+    cwe: CWE-917
+    severity: critical
+    confidence: medium
+    languages: [java]
+    pattern: '(?i)(SpelExpressionParser|ExpressionParser|ScriptEngineManager|getEngineByName|OgnlUtil|MVEL\.eval|GroovyShell)'
+    message: "表达式 / 脚本引擎求值,输入可控即 RCE"
+    remediation: "不要对用户输入求值;用 SimpleEvaluationContext 限制能力"
+
+  - id: JAVA-PATH-TRAVERSAL
+    category: A01:2021-Broken-Access-Control
+    cwe: CWE-22
+    severity: high
+    confidence: medium
+    languages: [java]
+    pattern: '(?i)(new\s+File\s*\(|Paths\.get\s*\(|ResourceUtils\.getFile\s*\()[^)]{0,80}(getParameter|getHeader|request\.get|\.\.\/)'
+    message: "文件路径来自请求"
+    remediation: "规范化后校验前缀,限制在基目录"
+
+  - id: JAVA-SSRF-URL
+    category: A10:2021-Server-Side-Request-Forgery
+    cwe: CWE-918
+    severity: medium
+    confidence: low
+    languages: [java]
+    pattern: '(?i)(new\s+URL\s*\(|HttpURLConnection|RestTemplate|WebClient|HttpClient\.newHttpClient|okhttp)\b[^\n]{0,80}(getParameter|getHeader|request\.|params)'
+    message: "出站请求目标来自请求参数(SSRF)"
+    remediation: "白名单目标;校验解析后的 IP"
+
+  - id: JAVA-OPEN-REDIRECT
+    category: A01:2021-Broken-Access-Control
+    cwe: CWE-601
+    severity: medium
+    confidence: medium
+    languages: [java]
+    pattern: '(?i)(sendRedirect|setHeader\s*\(\s*["'']Location)'
+    message: "重定向,确认目标是否来自参数"
+    remediation: "白名单或强制站内相对路径"
+
+  - id: JAVA-WEAK-CRYPTO
+    category: A02:2021-Cryptographic-Failures
+    cwe: CWE-327
+    severity: high
+    confidence: medium
+    languages: [java]
+    pattern: '(?i)MessageDigest\.getInstance\s*\(\s*["''](MD5|SHA-?1|DES|RC4|RC2)["'']'
+    message: "使用弱算法"
+    remediation: "口令用 bcrypt/argon2;摘要用 SHA-256 以上"
+  - id: JAVA-DB-CREDENTIAL
+    category: A07:2021-Identification-and-Authentication-Failures
+    cwe: CWE-798
+    severity: high
+    confidence: medium
+    languages: [java]
+    pattern: '(?i)getConnection\s*\(\s*["''][^"'']+["'']\s*,\s*["''][^"'']+["'']\s*,\s*["''][^"'']{4,}["'']'
+    message: "数据库连接使用硬编码账号口令"
+    remediation: "从环境变量 / 密钥服务读取,并按环境区分账号"
+
+
+  - id: JAVA-INSECURE-RANDOM
+    category: A02:2021-Cryptographic-Failures
+    cwe: CWE-338
+    severity: medium
+    confidence: medium
+    languages: [java]
+    pattern: '(?i)(new\s+Random\s*\(|Math\.random\s*\(\))[^\n]{0,40}(token|secret|key|otp|salt|session|password)'
+    message: "安全值用 java.util.Random"
+    remediation: "改用 SecureRandom"
+
+  - id: JAVA-CLASSFORNAME-INPUT
+    category: A03:2021-Injection
+    cwe: CWE-470
+    severity: high
+    confidence: low
+    languages: [java]
+    pattern: '(?i)Class\.forName\s*\([^)]{0,60}(getParameter|request\.|params)'
+    message: "用外部输入决定加载的类"
+    remediation: "用白名单映射到固定类"
+
+  - id: JAVA-JSP-SCRIPTLET
+    category: A03:2021-Injection
+    cwe: CWE-79
+    severity: medium
+    confidence: medium
+    languages: [java]
+    pattern: '(?i)<%=\s*(request\.getParameter|request\.getAttribute|\$\{param|\$\{requestScope)'
+    message: "JSP 直接输出请求数据(XSS)"
+    remediation: "用 c:out 或 fn:escapeXml,开启 EL 转义"
+
+  - id: JAVA-PRINT-STACKTRACE
+    category: A09:2021-Security-Logging-and-Monitoring-Failures
+    cwe: CWE-209
+    severity: info
+    confidence: medium
+    languages: [java]
+    pattern: '(?i)\.printStackTrace\s*\('
+    message: "打印堆栈,可能把敏感信息写进响应日志"
+    remediation: "用日志框架并控制输出级别"
+
+  # ========================================================================= #
+  # Go
+  # ========================================================================= #
+
+  - id: GO-EXEC-COMMAND
+    category: A03:2021-Injection
+    cwe: CWE-78
+    severity: high
+    confidence: medium
+    languages: [go]
+    pattern: '(?i)exec\.Command\s*\('
+    message: "执行外部命令,确认参数是否含输入"
+    remediation: "参数与命令分离,白名单可执行文件"
+
+  - id: GO-SQL-SPRINTF
+    category: A03:2021-Injection
+    cwe: CWE-89
+    severity: high
+    confidence: high
+    languages: [go]
+    pattern: '(?i)(db\.)?(Query|QueryRow|Exec|QueryContext|ExecContext)\w*\s*\(\s*(fmt\.Sprintf|["''][^"'']*["'']\s*\+)'
+    message: "Go SQL 用 Sprintf / 拼接"
+    remediation: "用 $1 / ? 占位符传参"
+
+  - id: GO-TEMPLATE-HTML
+    category: A03:2021-Injection
+    cwe: CWE-79
+    severity: high
+    confidence: high
+    languages: [go]
+    pattern: '(?i)template\.HTML\s*\('
+    message: "把未转义字符串塞进模板(Go 里等于显式声明安全)"
+    remediation: "让模板自动转义;必须注入 HTML 时先净化"
+
+  - id: GO-PATH-FROM-INPUT
+    category: A01:2021-Broken-Access-Control
+    cwe: CWE-22
+    severity: high
+    confidence: medium
+    languages: [go]
+    pattern: '(?i)(filepath\.Join|os\.Open|os\.ReadFile|http\.ServeFile|ioutil\.ReadFile)\s*\([^)]{0,80}(r\.URL|r\.FormValue|r\.PathValue|c\.Param|input|userPath)'
+    message: "文件路径来自请求"
+    remediation: "filepath.Clean 后校验是否在基目录下"
+
+  - id: GO-TLS-INSECURE
+    category: A02:2021-Cryptographic-Failures
+    cwe: CWE-295
+    severity: high
+    confidence: high
+    languages: [go]
+    pattern: '(?i)InsecureSkipVerify\s*:\s*true'
+    message: "关闭 TLS 证书校验"
+    remediation: "去掉,或显式配置受信 CA"
+
+  - id: GO-WEAK-RANDOM
+    category: A02:2021-Cryptographic-Failures
+    cwe: CWE-338
+    severity: medium
+    confidence: medium
+    languages: [go]
+    pattern: '(?i)(math/rand|rand\.(Intn|Int31|Int63|Read)\s*\()'
+    message: "用了 math/rand(可预测);安全场景须用 crypto/rand"
+    remediation: "令牌 / 密钥改用 crypto/rand"
+
+  - id: GO-SSRF-HTTP
+    category: A10:2021-Server-Side-Request-Forgery
+    cwe: CWE-918
+    severity: medium
+    confidence: low
+    languages: [go]
+    pattern: '(?i)http\.(Get|Post|PostForm|NewRequest)\s*\([^)]{0,80}(r\.URL|r\.FormValue|c\.Param|c\.Query|input)'
+    message: "出站请求目标来自请求参数"
+    remediation: "白名单目标域名与端口"
+
+  - id: GO-TEXT-TEMPLATE
+    category: A03:2021-Injection
+    cwe: CWE-79
+    severity: medium
+    confidence: low
+    languages: [go]
+    pattern: '(?i)text/template'
+    message: "用 text/template 渲染 HTML 不会转义"
+    remediation: "Web 输出改用 html/template"
+
+  # ========================================================================= #
+  # PHP
+  # ========================================================================= #
+
+  - id: PHP-EVAL
+    category: A03:2021-Injection
+    cwe: CWE-95
+    severity: critical
+    confidence: high
+    languages: [php]
+    pattern: '(?i)(?<![\w>$])(eval|assert|create_function)\s*\('
+    message: "eval / assert 执行字符串代码"
+    remediation: "彻底去掉;用数组映射替代动态调用"
+
+  - id: PHP-COMMAND-EXEC
+    category: A03:2021-Injection
+    cwe: CWE-78
+    severity: critical
+    confidence: high
+    languages: [php]
+    pattern: '(?i)(?<![\w>])(system|exec|shell_exec|passthru|popen|proc_open|pcntl_exec|pfsockopen)\s*\('
+    message: "命令执行函数"
+    remediation: "用 escapeshellarg/escapeshellcmd,并对命令白名单"
+
+  - id: PHP-BACKTICK-EXEC
+    category: A03:2021-Injection
+    cwe: CWE-78
+    severity: high
+    confidence: medium
+    languages: [php]
+    pattern: '`[^`\n]{0,80}\$[^`\n]{0,80}`'
+    message: "反引号执行 shell 命令"
+    remediation: "去掉;必须执行时严格过滤"
+
+  - id: PHP-INCLUDE-USERINPUT
+    category: A03:2021-Injection
+    cwe: CWE-98
+    severity: critical
+    confidence: high
+    languages: [php]
+    pattern: '(?i)(include|include_once|require|require_once)\s*\(?\s*\$'
+    message: "动态包含(本地/远程文件包含,LFI/RFI → RCE)"
+    remediation: "用白名单常量映射,禁止拼接用户输入;关闭 allow_url_include"
+
+  - id: PHP-FILE-READ-INPUT
+    category: A01:2021-Broken-Access-Control
+    cwe: CWE-22
+    severity: high
+    confidence: medium
+    languages: [php]
+    pattern: '(?i)(file_get_contents|file_put_contents|fopen|fread|readfile|file|unlink|rename|copy|move_uploaded_file|scandir|glob|opendir|parse_ini_file|simplexml_load_file)\s*\(\s*\$'
+    message: "文件操作参数是变量,确认是否来自用户输入"
+    remediation: "basename + realpath 校验,限制在允许目录"
+
+  - id: PHP-SQL-USERINPUT
+    category: A03:2021-Injection
+    cwe: CWE-89
+    severity: high
+    confidence: high
+    languages: [php]
+    pattern: '(?i)(mysql_query|mysqli_query|mysqli_multi_query|mysql_db_query|->query|->exec|->multi_query)\s*\([^;]{0,120}(\$_|\$\w+\s*\.|["''][^"'']*["'']\s*\.)'
+    message: "SQL 语句拼接了变量 / 请求参数"
+    remediation: "PDO / mysqli 预处理语句,参数绑定"
+
+  - id: PHP-SQL-CONCAT
+    category: A03:2021-Injection
+    cwe: CWE-89
+    severity: high
+    confidence: medium
+    languages: [php]
+    pattern: '(?i)(select|insert\s+into|update\s+\w+\s+set|delete\s+from)[^;\n]{0,200}\.\s*\$(?!_(SERVER|ENV))'
+    message: "SQL 字符串用 . 拼接变量(疑似注入)"
+    remediation: "改用 PDO / mysqli 预处理并绑定参数"
+
+  - id: PHP-SQL-SUPERGLOBAL
+    category: A03:2021-Injection
+    cwe: CWE-89
+    severity: critical
+    confidence: high
+    languages: [php]
+    pattern: '(?i)(select|insert|update|delete)[^;"'']{0,160}\$_(GET|POST|REQUEST|COOKIE|SERVER)'
+    message: "SQL 里直接出现 $_GET/$_POST 等超全局变量"
+    remediation: "预处理 + 参数绑定"
+
+  - id: PHP-UNSERIALIZE-INPUT
+    category: A08:2021-Software-and-Data-Integrity-Failures
+    cwe: CWE-502
+    severity: critical
+    confidence: high
+    languages: [php]
+    pattern: '(?i)unserialize\s*\(\s*\$'
+    message: "对用户输入反序列化(POP 链 → RCE)"
+    remediation: "用 json_decode;必须反序列化时加 HMAC 校验并限制 allowed_classes"
+
+  - id: PHP-XSS-ECHO
+    category: A03:2021-Injection
+    cwe: CWE-79
+    severity: high
+    confidence: high
+    languages: [php]
+    pattern: '(?i)(echo|print|printf|die|exit|vprintf)\s*\(?\s*\$_(GET|POST|REQUEST|COOKIE|SERVER)'
+    message: "直接输出请求参数(反射型 XSS)"
+    remediation: "htmlspecialchars($x, ENT_QUOTES, 'UTF-8')"
+
+  - id: PHP-XSS-SHORT-ECHO
+    category: A03:2021-Injection
+    cwe: CWE-79
+    severity: high
+    confidence: high
+    languages: [php]
+    pattern: '(?i)<\?=\s*\$_(GET|POST|REQUEST|COOKIE)'
+    message: "短标签直接输出请求参数"
+    remediation: "htmlspecialchars 后再输出"
+
+  - id: PHP-EXTRACT
+    category: A03:2021-Injection
+    cwe: CWE-621
+    severity: high
+    confidence: high
+    languages: [php]
+    pattern: '(?i)\bextract\s*\(\s*\$'
+    message: "extract 把请求变量导入作用域(可覆盖任意变量)"
+    remediation: "去掉;显式逐个取值"
+
+  - id: PHP-VARIABLE-VARIABLE
+    category: A03:2021-Injection
+    cwe: CWE-621
+    severity: medium
+    confidence: medium
+    languages: [php]
+    pattern: '\$\$[a-zA-Z_]\w*|\$\{\s*\$(?:GET|POST|REQUEST|COOKIE)'
+    message: "变量变量(动态变量名,易被覆盖 / 注入)"
+    remediation: "改用数组 + 显式键"
+
+  - id: PHP-REGEX-E-MODIFIER
+    category: A03:2021-Injection
+    cwe: CWE-95
+    severity: critical
+    confidence: high
+    languages: [php]
+    pattern: '(?i)preg_replace\s*\(\s*["''][^"'']*/[a-z]*e[a-z]*["'']'
+    message: "preg_replace 的 /e 修饰符会执行替换结果(RCE)"
+    remediation: "改用 preg_replace_callback"
+
+  - id: PHP-PREG-UNSAFE-PATTERN
+    category: A03:2021-Injection
+    cwe: CWE-95
+    severity: high
+    confidence: medium
+    languages: [php]
+    pattern: '(?i)preg_(match|match_all|replace|split)\s*\(\s*\$'
+    message: "正则模式来自变量(可被注入 / 构造 ReDoS)"
+    remediation: "模式固定化;必要时 preg_quote"
+
+  - id: PHP-FILE-UPLOAD
+    category: A04:2021-Insecure-Design
+    cwe: CWE-434
+    severity: high
+    confidence: medium
+    languages: [php]
+    pattern: '(?i)(move_uploaded_file|is_uploaded_file|copy\s*\(\s*\$_FILES|\$_FILES\s*\[)'
+    message: "文件上传处理点,确认校验了类型 / 名称且落盘不可执行"
+    remediation: "白名单扩展名 + 重命名 + 存储目录禁用 PHP 解析"
+
+  - id: PHP-PHAR-DESERIALIZE
+    category: A08:2021-Software-and-Data-Integrity-Failures
+    cwe: CWE-502
+    severity: critical
+    confidence: medium
+    languages: [php]
+    pattern: '(?i)(file_exists|filesize|md5_file|sha1_file|getimagesize|include|require)\s*\([^)]{0,60}phar://'
+    message: "phar:// 触发反序列化"
+    remediation: "禁止用户控制的 phar 路径"
+
+  - id: PHP-XXE
+    category: A05:2021-Security-Misconfiguration
+    cwe: CWE-611
+    severity: high
+    confidence: medium
+    languages: [php]
+    pattern: '(?i)(simplexml_load_string|simplexml_load_file|->loadXML|->load\s*\(|DOMDocument|libxml_disable_entity_loader\s*\(\s*(false|0))'
+    message: "XML 解析点,确认禁用了外部实体"
+    remediation: "libxml_disable_entity_loader(true);PHP 8 默认安全但显式声明更稳"
+
+  - id: PHP-SSRF-CURL
+    category: A10:2021-Server-Side-Request-Forgery
+    cwe: CWE-918
+    severity: high
+    confidence: medium
+    languages: [php]
+    pattern: '(?i)(curl_setopt\s*\(\s*[^,]+,\s*CURLOPT_URL\s*,\s*\$|file_get_contents\s*\(\s*\$|fsockopen\s*\(|get_headers\s*\()'
+    message: "出站请求目标来自变量(SSRF)"
+    remediation: "白名单域名;禁止内网 / 元数据地址;禁用 file:// 等封装器"
+
+  - id: PHP-WRAPPER-INPUT
+    category: A03:2021-Injection
+    cwe: CWE-98
+    severity: high
+    confidence: high
+    languages: [php]
+    pattern: '(?i)(php://(input|filter)|data://|expect://|zip://|phar://|glob://)'
+    message: "PHP 流封装器,常与 LFI / RCE 利用链配合"
+    remediation: "校验并规范化路径;关闭 allow_url_fopen / allow_url_include"
+
+  - id: PHP-WEAK-HASH
+    category: A02:2021-Cryptographic-Failures
+    cwe: CWE-916
+    severity: high
+    confidence: medium
+    languages: [php]
+    pattern: '(?i)(md5|sha1)\s*\(\s*\$'
+    message: "弱哈希(口令与签名都不该用)"
+    remediation: "password_hash / hash_hmac('sha256'...)"
+
+  - id: PHP-MAGIC-HASH-COMPARE
+    category: A07:2021-Identification-and-Authentication-Failures
+    cwe: CWE-697
+    severity: high
+    confidence: medium
+    languages: [php]
+    pattern: '(?i)(md5|sha1|hash)\s*\([^)]{0,80}\)\s*(==|!=)\s*["'']'
+    message: "哈希结果用 == 比较(0e 魔法哈希 / 类型混淆可绕过)"
+    remediation: "用 hash_equals() 且 === 比较"
+
+  - id: PHP-WEAK-RANDOM
+    category: A02:2021-Cryptographic-Failures
+    cwe: CWE-338
+    severity: medium
+    confidence: medium
+    languages: [php]
+    pattern: '(?i)(token|otp|code|key|salt|password|session)[\w]*\s*=\s*(mt_rand|rand|uniqid|array_rand)\s*\('
+    message: "安全值用弱随机源"
+    remediation: "改用 random_bytes / random_int"
+
+  - id: PHP-MAIL-INJECTION
+    category: A03:2021-Injection
+    cwe: CWE-93
+    severity: medium
+    confidence: medium
+    languages: [php]
+    pattern: '(?i)\bmail\s*\([^)]{0,120}\$_'
+    message: "mail() 参数含请求数据(邮件头注入)"
+    remediation: "过滤换行与头字段,或用成熟邮件库"
+
+  - id: PHP-HEADER-INJECTION
+    category: A03:2021-Injection
+    cwe: CWE-113
+    severity: medium
+    confidence: medium
+    languages: [php]
+    pattern: '(?i)header\s*\(\s*["''][^"'']*\$'
+    message: "header() 拼接变量(头注入 / 开放重定向)"
+    remediation: "白名单取值,过滤 \\r\\n"
+
+  - id: PHP-OPEN-REDIRECT
+    category: A01:2021-Broken-Access-Control
+    cwe: CWE-601
+    severity: medium
+    confidence: medium
+    languages: [php]
+    pattern: '(?i)header\s*\(\s*["'']\s*Location\s*:[^"'']*\$'
+    message: "重定向目标含变量"
+    remediation: "只允许站内相对路径"
+
+  - id: PHP-SESSION-COOKIE-FLAGS
+    category: A07:2021-Identification-and-Authentication-Failures
+    cwe: CWE-1004
+    severity: medium
+    confidence: medium
+    languages: [php]
+    pattern: '(?i)(session_set_cookie_params\s*\(|setcookie\s*\()[^;]{0,200}'
+    message: "设置 Cookie,确认带上 HttpOnly / Secure / SameSite"
+    remediation: "session_set_cookie_params(['httponly'=>true,'secure'=>true,'samesite'=>'Lax'])"
+
+  - id: PHP-ALLOW-URL-INCLUDE
+    category: A05:2021-Security-Misconfiguration
+    cwe: CWE-98
+    severity: high
+    confidence: medium
+    languages: [php]
+    pattern: '(?i)allow_url_(include|fopen)\s*=\s*(On|1|true)'
+    message: "允许包含 / 打开远程 URL(RFI 直通 RCE)"
+    remediation: "设为 Off"
+
+  - id: PHP-CURL-TLS-OFF
+    category: A02:2021-Cryptographic-Failures
+    cwe: CWE-295
+    severity: medium
+    confidence: high
+    languages: [php]
+    pattern: '(?i)curl_setopt\s*\([^;]{0,120}CURLOPT_SSL_VERIFY(PEER|HOST)\s*,\s*(false|0)'
+    message: "关闭 cURL 证书校验"
+    remediation: "恢复校验"

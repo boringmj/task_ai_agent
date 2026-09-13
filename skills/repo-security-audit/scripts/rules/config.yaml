@@ -1,0 +1,362 @@
+# 部署与工程配置风险(Docker / Compose / K8s / CI / nginx / IDE / 云配置)
+#
+# 字段说明:
+#   id            唯一编号
+#   file_globs    规则只对这些文件生效(对完整相对路径或文件名做 fnmatch)
+#   pattern       Python 正则;(?m) 表示按行匹配,(?s) 表示 . 匹配换行
+#   multiline     true 时先对全文匹配再换算行号,适合跨行结构
+#   其余字段同 secrets.yaml
+
+rules:
+  # ---------------- Dockerfile ----------------
+  - id: CFG-DOCKER-USER-ROOT
+    file_globs: ['Dockerfile', 'Dockerfile.*', '*.dockerfile', '*.Dockerfile']
+    pattern: '(?i)^\s*USER\s+(root|0)\s*$'
+    severity: medium
+    confidence: high
+    category: A05:2021-Security-Misconfiguration
+    cwe: CWE-250
+    message: "容器以 root 运行"
+    remediation: "建非特权用户并 USER 切换,或运行时指定 --user"
+
+  - id: CFG-DOCKER-ADD-URL
+    file_globs: ['Dockerfile', 'Dockerfile.*', '*.dockerfile']
+    pattern: '(?i)^\s*ADD\s+https?://'
+    severity: medium
+    confidence: high
+    cwe: CWE-829
+    message: "ADD 直接拉取远程文件,内容不可校验(且不会解压缓存)"
+    remediation: "改用 COPY,或下载后校验哈希"
+
+  - id: CFG-DOCKER-SECRET-IN-ENV
+    file_globs: ['Dockerfile', 'Dockerfile.*', '*.dockerfile']
+    pattern: '(?i)^\s*ENV\s+.*(PASSWORD|SECRET|TOKEN|API[_-]?KEY|PRIVATE[_-]?KEY)\s*[= ]'
+    severity: high
+    confidence: medium
+    cwe: CWE-798
+    message: "凭据被写进镜像环境变量(镜像层里可提取)"
+    remediation: "构建期用 BuildKit secret,运行期用 orchestrator 的 secret"
+
+  - id: CFG-DOCKER-LATEST-TAG
+    file_globs: ['Dockerfile', 'Dockerfile.*', '*.dockerfile']
+    pattern: '(?i)^\s*FROM\s+[a-z0-9._\-/:]+\s*$'
+    severity: low
+    confidence: low
+    cwe: CWE-1104
+    message: "基础镜像未固定版本 / 摘要,构建结果不可复现"
+    remediation: "固定到具体 tag 或 @sha256: 摘要"
+
+  - id: CFG-DOCKER-SSH-PORT
+    file_globs: ['Dockerfile', 'Dockerfile.*', '*.dockerfile']
+    pattern: '(?i)^\s*EXPOSE\s+.*\b22\b'
+    severity: low
+    confidence: medium
+    message: "镜像暴露了 SSH 端口"
+    remediation: "容器里应避免跑 sshd;调试改用 exec"
+
+  # ---------------- docker-compose ----------------
+  - id: CFG-COMPOSE-PRIVILEGED
+    file_globs: ['docker-compose*.yml', 'docker-compose*.yaml', 'compose*.yml', 'compose*.yaml']
+    pattern: '(?i)^\s*privileged\s*:\s*true'
+    severity: high
+    confidence: high
+    cwe: CWE-250
+    message: "容器以特权模式运行,近似获得宿主机 root"
+    remediation: "去掉 privileged,按需给单个 capability"
+
+  - id: CFG-COMPOSE-DOCKER-SOCK
+    file_globs: ['docker-compose*.yml', 'docker-compose*.yaml', 'compose*.yml', 'compose*.yaml']
+    pattern: '(?s)(/var/run/docker\.sock|//var/run/docker\.sock)'
+    severity: high
+    confidence: medium
+    cwe: CWE-269
+    message: "挂载了 docker.sock,容器可控制宿主机 Docker(≈逃逸)"
+    remediation: "改用受限的 API 代理或 rootless 方案"
+
+  - id: CFG-COMPOSE-NET-HOST
+    file_globs: ['docker-compose*.yml', 'docker-compose*.yaml', 'compose*.yml', 'compose*.yaml']
+    pattern: '(?i)^\s*network_mode\s*:\s*["'']?host'
+    severity: medium
+    confidence: high
+    cwe: CWE-1327
+    message: "使用 host 网络,容器网络与宿主机不分隔"
+    remediation: "用 bridge 网络 + 显式端口映射"
+
+  - id: CFG-COMPOSE-CAPS
+    file_globs: ['docker-compose*.yml', 'docker-compose*.yaml', 'compose*.yml', 'compose*.yaml']
+    pattern: '(?i)^\s*-?\s*(cap_add|SYS_ADMIN|NET_ADMIN|SYS_PTRACE)'
+    severity: medium
+    confidence: medium
+    cwe: CWE-250
+    message: "容器被授予额外 capability"
+    remediation: "按最小权限裁剪能力集"
+
+  # ---------------- Kubernetes ----------------
+  - id: CFG-K8S-PRIVILEGED
+    file_globs: ['*.yaml', '*.yml']
+    pattern: '(?m)^\s*privileged\s*:\s*true'
+    severity: high
+    confidence: high
+    cwe: CWE-250
+    message: "Pod / 容器以特权模式运行"
+    remediation: "关闭 privileged,配 allowPrivilegeEscalation: false"
+
+  - id: CFG-K8S-HOSTPATH-ROOT
+    file_globs: ['*.yaml', '*.yml']
+    pattern: '(?m)^\s*hostPath\s*:\s*\n\s*path\s*:\s*["'']?/(\s|$)'
+    multiline: true
+    severity: high
+    confidence: medium
+    cwe: CWE-668
+    message: "挂载宿主机根目录到 Pod"
+    remediation: "改用最小必要路径,或换用 PVC / CSI"
+
+  - id: CFG-K8S-RUN-AS-ROOT
+    file_globs: ['*.yaml', '*.yml']
+    pattern: '(?m)^\s*runAsUser\s*:\s*0\s*$'
+    severity: medium
+    confidence: high
+    cwe: CWE-250
+    message: "显式以 UID 0 运行"
+    remediation: "指定非零 UID 并配 runAsNonRoot: true"
+
+  - id: CFG-K8S-HOST-NETWORK
+    file_globs: ['*.yaml', '*.yml']
+    pattern: '(?m)^\s*hostNetwork\s*:\s*true'
+    severity: medium
+    confidence: high
+    cwe: CWE-1327
+    message: "Pod 使用宿主机网络"
+    remediation: "关闭 hostNetwork"
+
+  - id: CFG-K8S-AUTOMOUNT-SA
+    file_globs: ['*.yaml', '*.yml']
+    pattern: '(?m)^\s*automountServiceAccountToken\s*:\s*true'
+    severity: low
+    confidence: medium
+    message: "自动挂载 ServiceAccount token,被拿下即可调用 API Server"
+    remediation: "不需要的 Pod 设为 false"
+
+  - id: CFG-K8S-CLUSTER-ADMIN-BINDING
+    file_globs: ['*.yaml', '*.yml']
+    pattern: '(?s)kind:\s*ClusterRoleBinding'
+    multiline: true
+    severity: medium
+    confidence: low
+    cwe: CWE-269
+    message: "存在 ClusterRoleBinding,需确认绑定的角色是否过高"
+    remediation: "优先用 Role/RoleBinding 限定命名空间"
+
+  # ---------------- CI / CD ----------------
+  - id: CFG-CI-PULL-REQUEST-TARGET
+    file_globs: ['.github/workflows/*.yml', '.github/workflows/*.yaml']
+    pattern: '(?m)^\s*pull_request_target\s*:'
+    severity: high
+    confidence: medium
+    cwe: CWE-94
+    message: "使用 pull_request_target,若 checkout 了 PR 头再执行即等于 RCE"
+    remediation: "不要 checkout PR 代码后执行;或改用 pull_request + 受限权限"
+
+  - id: CFG-CI-EVENT-INTERPOLATION
+    file_globs: ['.github/workflows/*.yml', '.github/workflows/*.yaml']
+    pattern: '\$\{\{\s*github\.event\.(issue|pull_request|comment|review|discussion)\.(title|body|head\.ref)'
+    severity: high
+    confidence: medium
+    cwe: CWE-94
+    message: "直接把不可信的 PR/issue 文本插进 run 脚本,构成脚本注入"
+    remediation: "先落到 env 再引用,或用中间 action 处理"
+
+  - id: CFG-CI-WRITE-ALL
+    file_globs: ['.github/workflows/*.yml', '.github/workflows/*.yaml']
+    pattern: '(?m)^\s*permissions\s*:\s*write-all\s*$'
+    severity: medium
+    confidence: high
+    cwe: CWE-732
+    message: "workflow 拿到 write-all 权限"
+    remediation: "按步骤声明最小 permissions"
+
+  - id: CFG-CI-SECRET-ECHO
+    file_globs: ['.github/workflows/*.yml', '.github/workflows/*.yaml', '.gitlab-ci.yml', '*.gitlab-ci.yml']
+    pattern: '(?i)(echo|printf|print).{0,40}(\$\{\{\s*secrets\.|\$CI_[A-Z_]*TOKEN|\$[A-Z_]*SECRET)'
+    severity: medium
+    confidence: medium
+    cwe: CWE-532
+    message: "可能把密钥打印到日志(CI 日志常被多人可见)"
+    remediation: "去掉打印,必要时用 ::add-mask::"
+
+  - id: CFG-CI-UNPINNED-ACTION
+    file_globs: ['.github/workflows/*.yml', '.github/workflows/*.yaml']
+    pattern: '(?m)^\s*uses\s*:\s*[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+@(v?\d|main|master|latest)'
+    severity: medium
+    confidence: low
+    cwe: CWE-1357
+    message: "第三方 action 未固定到 commit SHA,上游被投毒即受影响"
+    remediation: "固定到 40 位 commit SHA"
+
+  - id: CFG-CI-CURL-PIPE-SHELL
+    file_globs: ['*.yml', '*.yaml', '*.sh', 'Makefile']
+    pattern: '(?i)(curl|wget)\s+[^\n|]{0,120}\|\s*(sudo\s+)?(ba)?sh'
+    severity: high
+    confidence: medium
+    cwe: CWE-494
+    message: "直接执行下载来的脚本,内容不可校验"
+    remediation: "下载 → 校验哈希/签名 → 再执行"
+
+  # ---------------- Web 服务器 / 反向代理 ----------------
+  - id: CFG-NGINX-AUTOINDEX
+    file_globs: ['*.conf', 'nginx.conf', '*.nginx']
+    pattern: '(?i)^\s*autoindex\s+on\s*;'
+    severity: medium
+    confidence: high
+    cwe: CWE-548
+    message: "开启目录浏览,可能直接暴露文件列表"
+    remediation: "关闭 autoindex"
+
+  - id: CFG-NGINX-CORS-STAR
+    file_globs: ['*.conf', 'nginx.conf', '*.nginx', '*.php', '*.js', '*.ts', '*.py', '*.java', '*.go']
+    pattern: '(?i)add_header\s+["'']?Access-Control-Allow-Origin["'']?\s+["'']?\*'
+    severity: medium
+    confidence: high
+    cwe: CWE-942
+    message: "通配 CORS 源"
+    remediation: "改为白名单,校验 Origin 后回显"
+
+  - id: CFG-NGINX-PROXY-VAR
+    file_globs: ['*.conf', 'nginx.conf', '*.nginx']
+    pattern: '(?i)^\s*proxy_pass\s+https?://\$'
+    severity: medium
+    confidence: medium
+    cwe: CWE-918
+    message: "proxy_pass 目标来自变量,若源头可控则构成 SSRF / 转发劫持"
+    remediation: "固定上游地址,或在 map 里做白名单"
+
+  - id: CFG-SERVER-TOKENS
+    file_globs: ['*.conf', 'nginx.conf', '*.nginx']
+    pattern: '(?i)^\s*server_tokens\s+on\s*;'
+    severity: info
+    confidence: high
+    message: "响应头暴露 nginx 版本"
+    remediation: "关闭 server_tokens"
+
+  # ---------------- 应用 / 框架配置 ----------------
+  - id: CFG-DEBUG-ENABLED
+    file_globs: ['*.py', '*.js', '*.ts', '*.php', '*.yaml', '*.yml', '*.ini', '*.conf', '*.env', '.env', '.env.*']
+    pattern: '(?i)(debug|app_debug|enable_debug|DEBUG)\s*[:=]\s*(true|True|1|on|On|ON)\b'
+    severity: medium
+    confidence: medium
+    category: A05:2021-Security-Misconfiguration
+    cwe: CWE-489
+    message: "调试开关打开(生产环境会泄露堆栈 / 配置,甚至提供调试器 RCE)"
+    remediation: "生产环境务必关闭;用环境变量按环境区分"
+
+  - id: CFG-DJANGO-SECRET-KEY
+    file_globs: ['*.py']
+    pattern: '(?i)^\s*SECRET_KEY\s*=\s*["''][^"'']{16,}["'']'
+    severity: high
+    confidence: high
+    category: A02:2021-Cryptographic-Failures
+    cwe: CWE-798
+    message: "Django SECRET_KEY 硬编码(可用于伪造 session / 签名)"
+    remediation: "从环境变量读取并轮换"
+
+  - id: CFG-ALLOWED-HOSTS-STAR
+    file_globs: ['*.py']
+    pattern: '(?i)ALLOWED_HOSTS\s*=\s*\[\s*["'']\*["'']'
+    severity: medium
+    confidence: high
+    cwe: CWE-346
+    message: "ALLOWED_HOSTS 设为通配,易受 Host 头攻击(密码重置投毒等)"
+    remediation: "显式列出域名"
+
+  - id: CFG-CORS-CREDENTIALS-STAR
+    file_globs: ['*.py', '*.js', '*.ts', '*.java', '*.php']
+    pattern: '(?is)(allow_credentials\s*[:=]\s*(True|true)|credentials\s*:\s*true)[^\n]{0,200}(allow_origins?\s*[:=]\s*\[?\s*["''][\*]|origin\s*:\s*["'']\*)'
+    multiline: true
+    severity: high
+    confidence: medium
+    cwe: CWE-942
+    message: "允许携带凭据的同时放开通配源,任意站点可读取带 Cookie 的响应"
+    remediation: "通配与 credentials 不可同时使用;改成精确白名单"
+
+  - id: CFG-TLS-VERIFY-OFF
+    file_globs: ['*.py', '*.js', '*.ts', '*.php', '*.java', '*.go', '*.rb', '*.env']
+    pattern: '(?i)(verify\s*=\s*False|rejectUnauthorized\s*:\s*false|InsecureSkipVerify\s*:\s*true|NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*["'']?0|curl_setopt[^;]{0,80}CURLOPT_SSL_VERIFYPEER\s*,\s*(false|0))'
+    severity: medium
+    confidence: high
+    category: A02:2021-Cryptographic-Failures
+    cwe: CWE-295
+    message: "关闭了 TLS 证书校验,易被中间人"
+    remediation: "恢复校验;自签场景显式配置受信 CA"
+
+  - id: CFG-SPRING-ACTUATOR-ALL
+    file_globs: ['*.properties', '*.yml', '*.yaml']
+    pattern: '(?i)management\.endpoints\.web\.exposure\.include\s*[:=]\s*["'']?\*'
+    severity: high
+    confidence: medium
+    cwe: CWE-200
+    message: "Spring Actuator 全量暴露(/env、/heapdump 等常泄露凭据)"
+    remediation: "只暴露必要端点,并加认证 / 仅内网可达"
+
+  - id: CFG-ACTUATOR-ENABLED
+    file_globs: ['*.properties', '*.yml', '*.yaml']
+    pattern: '(?i)(management\.endpoints\.\w+\.enabled|management\.endpoint\.\w+\.enabled)\s*[:=]\s*(true|True)'
+    severity: low
+    confidence: medium
+    cwe: CWE-200
+    message: "启用了 Actuator 端点,确认是否对外可达"
+    remediation: "加 Spring Security 保护或限制网络"
+
+  - id: CFG-PHP-DISPLAY-ERRORS
+    file_globs: ['*.php', 'php.ini', '*.ini']
+    pattern: '(?i)(display_errors\s*[:=,]\s*(On|1|true)|display_errors\s*,\s*(On|1))'
+    severity: low
+    confidence: medium
+    cwe: CWE-209
+    message: "PHP 打开错误显示,泄露路径 / SQL / 配置"
+    remediation: "生产环境 display_errors=Off,错误写日志"
+
+  - id: CFG-WEAK-HASH-CONFIG
+    file_globs: ['*.py', '*.java', '*.php', '*.js', '*.ts', '*.go', '*.rb']
+    pattern: '(?i)(md5|sha1)\s*\(\s*[^)]{0,80}(pass|pwd|password|secret)'
+    severity: high
+    confidence: medium
+    category: A02:2021-Cryptographic-Failures
+    cwe: CWE-916
+    message: "用 MD5/SHA1 处理口令(可秒破,且易哈希碰撞)"
+    remediation: "改用 bcrypt / argon2 / scrypt,并加盐"
+
+  - id: CFG-HARDCODED-IP-ALLOWLIST
+    file_globs: ['*.py', '*.js', '*.ts', '*.php', '*.java', '*.go', '*.conf', '*.yml']
+    pattern: '(?i)(trusted_?proxy|allowed_?hosts?|whitelist|allow_?ips?)[^\n]{0,60}(127\.0\.0\.1|0\.0\.0\.0/0|10\.0\.0\.0)'
+    severity: low
+    confidence: low
+    cwe: CWE-284
+    message: "存在来源白名单配置,确认口径是否包含通配 / 内网大段"
+    remediation: "收窄范围并按环境区分"
+
+  # ---------------- 工程与仓库卫生 ----------------
+  - id: CFG-GITIGNORE-NO-ENV
+    file_globs: ['.gitignore']
+    pattern: '(?i)^\s*(!?\s*)\*\.?(key|pem|p12)$'
+    severity: low
+    confidence: low
+    message: "仅按扩展名忽略密钥,容易漏掉 .env、config.json 等"
+    remediation: "显式忽略 .env*、*.key、*.pem、secrets/* 等"
+
+  - id: CFG-IDE-REMOTE-DEBUG
+    file_globs: ['.vscode/launch.json', '*.code-workspace', 'runconfig*.xml', '.idea/*']
+    pattern: '(?i)("justMyCode"|--listen|debugpy|JDWP|0\.0\.0\.0)\s*'
+    severity: low
+    confidence: low
+    cwe: CWE-489
+    message: "调试配置里可能监听全网卡,本地调试端口若暴露等于 RCE"
+    remediation: "调试端口绑 127.0.0.1,不要进仓库"
+
+  - id: CFG-TERRAFORM-PUBLIC-ALL
+    file_globs: ['*.tf']
+    pattern: '(?i)(cidr_blocks|source_ranges|ip_ranges)\s*=\s*\[\s*["'']0\.0\.0\.0/0["'']'
+    severity: high
+    confidence: medium
+    cwe: CWE-284
+    message: "安全组 / 防火墙对全网开放"
+    remediation: "收窄到必要网段;高危端口绝不可对公网开放"
