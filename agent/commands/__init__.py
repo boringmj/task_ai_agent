@@ -95,7 +95,7 @@ def dispatch(text: str, ctx: Context) -> str | None:
     if entry is None:
         if " " in stripped:             # 带空格的多半是消息(如以 / 开头的路径),放行
             return None
-        known = "、".join(n for n, _, _ in all_commands())
+        known = "、".join(n for n, *_ in all_commands())
         return f"没有名为 {name} 的指令。可用:{known}"
     fn = entry[0]
     ctx.args = stripped[len(name):].strip()      # 指令名后面的部分,交给指令自己解析

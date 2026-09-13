@@ -249,7 +249,7 @@ def main() -> None:
     console.print("Agent 已启动。", style="bold")
     console.print("输入多行:连续输入,最后一个空行提交(支持粘贴)。", style="dim")
     console.print("执行中 Ctrl+C=取消本轮;空闲时 Ctrl+C=退出;exit 退出。", style="dim")
-    console.print("指令:" + "、".join(n for n, _, _ in all_commands())
+    console.print("指令:" + "、".join(n for n, *_ in all_commands())
                   + f"(敲 /help 看说明);上下文占用达 {AUTO_COMPACT_RATIO:.0%} 会自动压缩。",
                   style="dim")
     console.print(f"工作区:{ROOT}", style="dim")
