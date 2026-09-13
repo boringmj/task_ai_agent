@@ -278,7 +278,10 @@ def main() -> None:
                 if "session_reset" in cmd_ctx.events:
                     cmd_result += session_reset_hint()
                 if cmd_result:
-                    console.print(cmd_result, style="dim")
+                    # 用终端默认亮度,别加 dim —— dim 是留给背景信息的(Docker/VM 状态、
+                    # 工作区路径那些)。命令结果是用户主动敲的、正要读的内容,/help 一次
+                    # 列八条指令,暗色下几乎看不清。
+                    console.print(cmd_result)
                 if "session_switched" in cmd_ctx.events:
                     # 切完会话,把新会话的历史按原样重放一遍 —— 只说一句"已切到 X",
                     # 用户看不到里面聊过什么。和启动时的重放共用同一套渲染,长得一样。
