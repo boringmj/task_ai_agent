@@ -96,6 +96,13 @@ def _replay_history(history: list[dict], source: str = "上次会话") -> None:
             # 藏了就说清楚藏了多少,别让思考"戛然而止"
             console.print(f"    (完整思考还有 {hidden} 字未显示)" if hidden else "",
                           style="dim", markup=False)
+        # **话要说在工具调用前面** —— 同一次响应里 content 和 tool_calls 是一起回来的,
+        # 语义上就是"先说一句、再去调"。反过来渲染的话,满屏 • 里夹着几行 AI >,读起来
+        # 像是"这轮只有工具调用",而那几句话恰恰是实时界面里看不到的(见下方说明)。
+        if text:
+            console.print("AI >", style="bold green")
+            # 与实时一致:拿到完整文本后交由 Markdown 渲染
+            console.print(Markdown(text))
         for call in (m.get("tool_calls") or []):
             fn = call.get("function", {})
             shown, hidden = _clip(fn.get("arguments") or "", SESSION_RESUME_CHARS)
@@ -103,10 +110,6 @@ def _replay_history(history: list[dict], source: str = "上次会话") -> None:
             tail = f"    (参数还有 {hidden} 字未显示)" if hidden else ""
             console.print(f"• {fn.get('name', '?')}({shown}){tail}",
                           style="dim", markup=False, highlight=False)
-        if text:
-            console.print("AI >", style="bold green")
-            # 与实时一致:拿到完整文本后交由 Markdown 渲染
-            console.print(Markdown(text))
     console.print("─" * 46, style="dim")
 
 
