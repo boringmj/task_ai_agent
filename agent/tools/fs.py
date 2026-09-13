@@ -437,7 +437,11 @@ def write_file(path: str, content: str, overwrite: bool = False) -> str:
         )
 
     target.parent.mkdir(parents=True, exist_ok=True)  # 子目录不存在就顺手建出来
-    target.write_text(content, encoding="utf-8")
+    # newline="\n" 不能省:默认(None)在 Windows 上会把 \n 翻成 \r\n,于是 agent 写出来的
+    # shell 脚本传进 VM 就以 CRLF 结尾,sh 会报 "illegal option -"(实测踩过 —— 当时还
+    # 误以为是 vm_push 转换的,其实 vm_push 走 read_bytes+base64,字节透明)。
+    # 三个写入点(这里、append_file、_save_lines)必须保持一致。
+    target.write_text(content, encoding="utf-8", newline="\n")
     return f"已{'覆盖' if existed else '创建'} {target}({size} 字节)" + _markdown_note(target)
 
 
@@ -467,7 +471,7 @@ def append_file(path: str, content: str) -> str:
     target.parent.mkdir(parents=True, exist_ok=True)
     # 追加要沿用原文件编码:否则会给 GBK 文件塞进 UTF-8 字节,把文件编码搞坏
     enc = _sniff_encoding(target) if target.is_file() else "utf-8"
-    with target.open("a", encoding=enc) as fp:
+    with target.open("a", encoding=enc, newline="\n") as fp:
         fp.write(content)
     return f"已向 {target} 追加 {size} 字节(当前共 {target.stat().st_size} 字节)" + _markdown_note(target)
 
@@ -491,7 +495,7 @@ def _save_lines(target: Path, lines: list[str], summary: str, center: int,
     """
     text = "".join(lines)
     _check_writable(target, text)
-    target.write_text(text, encoding=encoding)
+    target.write_text(text, encoding=encoding, newline="\n")
 
     lo, hi = max(1, center - 3), min(len(lines), center + 3)
     preview = "\n".join(f"{i:>4} | {lines[i - 1].rstrip(chr(10))}" for i in range(lo, hi + 1))
