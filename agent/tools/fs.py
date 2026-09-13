@@ -28,6 +28,9 @@ FS_MAX_READ_FILES = int(os.environ.get("MAX_READ_FILES", "20"))
 # 一次 move_file 最多移几个。移动会改文件位置,比读危险 —— 上限和读一样,但返回里会逐条
 # 列出来,方便用户核对到底动了什么。
 FS_MAX_MOVE_FILES = int(os.environ.get("MAX_MOVE_FILES", "20"))
+# 一次 list_files / find_files / grep_files 最多接受几个路径。和读文件同理:合并成一次
+# 调用能省下好几轮"重发整个历史",但一次铺太开也没意义。
+FS_MAX_LIST_DIRS = int(os.environ.get("MAX_LIST_DIRS", "20"))
 # 即使在沙箱内,这些文件也禁止读取 —— 纵深防御,防止沙箱里混入密钥文件
 FS_DENY_READ = {".env"}
 # ---- 文件搜索(按名 / 按内容)护栏 ----
@@ -192,8 +195,10 @@ def get_current_directory() -> str:
                 "type": "object",
                 "properties": {
                     "path": {
-                        "type": "string",
-                        "description": "要列出的目录路径(相对工作区),省略则为工作区根目录",
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "要列出的目录路径(相对工作区),省略则为工作区根目录;"
+                                       "可给数组一次列多个,如 [\"src\", \"tests\"]",
                     },
                     "show_hidden": {
                         "type": "boolean",
@@ -202,7 +207,31 @@ def get_current_directory() -> str:
                 },
             },
 )
-def list_files(path: str = ".", show_hidden: bool = False) -> str:
+def list_files(path=".", show_hidden: bool = False) -> str:
+    """列出目录内容。path 可以给数组,一次列多个目录。
+
+    单个时保持原样(只有一行标题);多个时每块带 `===== 路径 =====`,一个目录出错不影响
+    其余几个 —— 列目录本来就常是"顺便看看这几个地方"。
+    """
+    paths = [path] if isinstance(path, str) else list(path)
+    if not paths:
+        return "错误:没有给出要列出的目录"
+    if len(paths) > FS_MAX_LIST_DIRS:
+        return f"错误:一次最多列 {FS_MAX_LIST_DIRS} 个目录(收到 {len(paths)} 个),分批来吧"
+    if len(paths) == 1:
+        return _list_one(paths[0], show_hidden)
+
+    parts = []
+    for p in paths:
+        try:
+            parts.append(f"===== {p} =====\n{_list_one(p, show_hidden)}")
+        except Exception as exc:  # noqa: BLE001 - 一个列不了不该拖垮整批
+            parts.append(f"===== {p} =====\n错误:{type(exc).__name__}: {exc}")
+    return "\n\n".join(parts)
+
+
+def _list_one(path: str, show_hidden: bool) -> str:
+    """列一个目录(内核)。"""
     target = safe_path(path)
     if not target.is_dir():
         return f"错误:{target} 不是一个目录"
@@ -252,8 +281,10 @@ def _iter_search_paths(root: Path):
                         "description": "文件名模式,如 *.py、test*、config.json;不含通配符时按子串匹配",
                     },
                     "path": {
-                        "type": "string",
-                        "description": "在哪个目录下搜(相对工作区),省略则为工作区根目录",
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "在哪个目录下搜(相对工作区),省略则为工作区根目录;"
+                                       "可给数组一次搜几处,如 [\"src\", \"tests\"],结果会合并去重",
                     },
                     "include_dirs": {
                         "type": "boolean",
@@ -263,16 +294,52 @@ def _iter_search_paths(root: Path):
                 "required": ["name"],
             },
 )
-def find_files(name: str, path: str = ".", include_dirs: bool = False) -> str:
-    """按文件名查找工作区里的文件(递归)。
+def find_files(name: str, path=".", include_dirs: bool = False) -> str:
+    """按文件名查找工作区里的文件(递归)。path 可以给数组,一次在几棵树里找。
 
     支持 * ? [ ] 通配符(不区分大小写);不含通配符时按子串匹配文件名。
     include_dirs=true 时把目录名也纳入匹配。只搜工作区,自动跳过隐藏目录与依赖目录。
+    多个 path 的结果会**合并去重** —— 范围重叠时同一个文件只列一次。
     """
+    paths = [path] if isinstance(path, str) else list(path)
+    if not paths:
+        return "错误:没有给出搜索路径"
+    if len(paths) > FS_MAX_LIST_DIRS:
+        return f"错误:一次最多搜 {FS_MAX_LIST_DIRS} 个路径(收到 {len(paths)} 个),分批来吧"
+
+    hits: list[Path] = []
+    missing: list[str] = []
+    for one in paths:
+        root = safe_path(one)
+        if not root.exists():
+            missing.append(str(root))       # 写错一个不该让其余几个白搜
+            continue
+        hits += _find_in(name, root, include_dirs)
+
+    if missing and not hits:
+        return f"错误:这些路径不存在:{'、'.join(missing)}"
+    if not hits:
+        what = "文件或目录" if include_dirs else "文件"
+        return f"没有匹配「{name}」的{what}(搜索范围:{'、'.join(_rel(safe_path(p)) for p in paths)})"
+
+    # 多个 path 范围可能重叠,同一个文件只列一次(保留首次出现的次序)
+    uniq, seen = [], set()
+    for h in hits:
+        if h not in seen:
+            seen.add(h)
+            uniq.append(h)
+    hits = uniq
+    hits.sort(key=lambda p: _rel(p).lower())
+    shown = hits[:FS_MAX_FIND_RESULTS]
+    lines = [f"{_rel(p)}{'/' if p.is_dir() else ''}" for p in shown]
+    tail = f"\n…(共 {len(hits)} 条,只显示前 {FS_MAX_FIND_RESULTS} 条)" if len(hits) > FS_MAX_FIND_RESULTS else ""
+    skipped = f"(这些路径不存在,已跳过:{'、'.join(missing)})\n" if missing else ""
+    return skipped + "\n".join([f"匹配「{name}」共 {len(hits)} 条:", *lines]) + tail
+
+
+def _find_in(name: str, root: Path, include_dirs: bool) -> list[Path]:
+    """在一个 root 下搜匹配项(内核,不做任何格式化)。"""
     import fnmatch
-    root = safe_path(path)
-    if not root.exists():
-        return f"错误:{root} 不存在"
     pat = name.lower()
     has_glob = any(ch in name for ch in "*?[")
     hits: list[Path] = []
@@ -282,14 +349,7 @@ def find_files(name: str, path: str = ".", include_dirs: bool = False) -> str:
         low = p.name.lower()
         if fnmatch.fnmatch(low, pat) if has_glob else (pat in low):
             hits.append(p)
-    if not hits:
-        what = "文件或目录" if include_dirs else "文件"
-        return f"没有匹配「{name}」的{what}(搜索范围:{_rel(root)})"
-    hits.sort(key=lambda p: _rel(p).lower())
-    shown = hits[:FS_MAX_FIND_RESULTS]
-    lines = [f"{_rel(p)}{'/' if p.is_dir() else ''}" for p in shown]
-    tail = f"\n…(共 {len(hits)} 条,只显示前 {FS_MAX_FIND_RESULTS} 条)" if len(hits) > FS_MAX_FIND_RESULTS else ""
-    return "\n".join([f"匹配「{name}」共 {len(hits)} 条:", *lines]) + tail
+    return hits
 
 
 def _detect_text_encoding(sample: bytes) -> str:
@@ -350,16 +410,36 @@ def grep_files(pattern: str, path: str = ".", ignore_case: bool = False,
         rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
     except re.error as exc:
         return f"错误:正则表达式无效:{exc}"
-    root = safe_path(path)
-    if not root.exists():
-        return f"错误:{root} 不存在"
-    targets = [root] if root.is_file() else [p for p in _iter_search_paths(root) if p.is_file()]
+    paths = [path] if isinstance(path, str) else list(path)
+    if not paths:
+        return "错误:没有给出搜索路径"
+    if len(paths) > FS_MAX_LIST_DIRS:
+        return f"错误:一次最多搜 {FS_MAX_LIST_DIRS} 个路径(收到 {len(paths)} 个),分批来吧"
+    roots: list[Path] = []
+    missing: list[str] = []
+    for one in paths:
+        r = safe_path(one)
+        if r.exists():
+            roots.append(r)
+        else:
+            missing.append(str(r))       # 写错一个不该让其余几个白搜
+    if not roots:
+        return f"错误:这些路径都不存在:{'、'.join(missing)}"
+
+    # 多个路径合并成同一份 targets,并按路径去重 —— 范围重叠时同一个文件只搜一次
+    targets: list[Path] = []
+    seen_t: set[Path] = set()
+    for r in roots:
+        for p in ([r] if r.is_file() else _iter_search_paths(r)):
+            if p.is_file() and p not in seen_t:
+                seen_t.add(p)
+                targets.append(p)
 
     if include.strip():
         pats = [s.strip().lower() for s in include.split(",") if s.strip()]
         targets = [p for p in targets if any(fnmatch.fnmatch(p.name.lower(), pat) for pat in pats)]
         if not targets:
-            return f"没有文件名匹配「{include}」的文件(搜索范围:{_rel(root)})"
+            return f"没有文件名匹配「{include}」的文件(搜索范围:{'、'.join(_rel(r) for r in roots)})"
 
     results: list[tuple[Path, int, str]] = []
     files_hit: set[Path] = set()
@@ -401,8 +481,10 @@ def grep_files(pattern: str, path: str = ".", ignore_case: bool = False,
     skip_note = ""
     if too_big:
         skip_note = f";另有 {too_big} 个文件超过 {FS_MAX_GREP_FILE_BYTES // (1024 * 1024)}MB 未搜"
+    if missing:
+        skip_note += f";另有 {len(missing)} 个路径不存在,已跳过"
     if not results:
-        return f"没有匹配「{pattern}」的内容(搜索范围:{_rel(root)})" + skip_note
+        return f"没有匹配「{pattern}」的内容(搜索范围:{'、'.join(_rel(r) for r in roots)})" + skip_note
     out: list[str] = []
     last: Path | None = None
     for fp, ln, txt in results:
