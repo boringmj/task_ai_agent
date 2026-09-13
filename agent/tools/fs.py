@@ -22,6 +22,9 @@ from ..core import (
 FS_MAX_ENTRIES = int(os.environ.get("MAX_ENTRIES", "200"))
 # 护栏:read_file 单次返回的字符上限。超出会明确提示(不再静默截断),让模型改用行区间读
 FS_MAX_READ_CHARS = int(os.environ.get("MAX_READ_CHARS", str(3 * 1024 * 1024)))
+# 一次 read_file 最多读几个文件。允许多文件是为了省调用次数(每多一次调用,模型就要重读
+# 一遍整个历史),但一次塞太多同样撑上下文、模型也读不过来 —— 20 是够用又不失控的量级。
+FS_MAX_READ_FILES = int(os.environ.get("MAX_READ_FILES", "20"))
 # 即使在沙箱内,这些文件也禁止读取 —— 纵深防御,防止沙箱里混入密钥文件
 FS_DENY_READ = {".env"}
 # ---- 文件搜索(按名 / 按内容)护栏 ----
@@ -63,41 +66,12 @@ def _read_text_with_encoding(target: Path) -> tuple[str, str]:
     return target.read_text(encoding=enc, errors="replace"), enc
 
 
-@tool(
-    description="读取一个文本文件的内容(单次最多返回 3145728 个字符,超出会明确提示截断)。"
-                "会自动识别编码,GBK 等中文编码的文件也能读。只能读取工作区内的文件。"
-                "用 start_line/end_line 可只读某个行区间 —— grep_files 命中某行后想看附近上下文,就用它读那几行,"
-                "不必把整个大文件读进来。准备用 edit_lines 或 insert_lines 按行修改文件前,"
-                "先带 with_line_numbers=true 读一遍(或读目标区间)确认行号。",
-    parameters={
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "文件路径,可以是相对路径或绝对路径",
-                    },
-                    "with_line_numbers": {
-                        "type": "boolean",
-                        "description": "是否在每行前面加上行号,默认 false。按行编辑前应设为 true",
-                    },
-                    "start_line": {
-                        "type": "integer",
-                        "description": "起始行号(1 起始,含该行)。配合 end_line 只看某段;不填则从头",
-                    },
-                    "end_line": {
-                        "type": "integer",
-                        "description": "结束行号(含该行)。不填则读到末尾。带行号读区间时,行号仍是文件真实行号",
-                    },
-                },
-                "required": ["path"],
-            },
-)
-def read_file(path: str, with_line_numbers: bool = False,
-              start_line: int | None = None, end_line: int | None = None) -> str:
-    """读取工作区里的文本文件。可只读某个行区间(1 起始,含两端)。
+def _read_one(path: str, with_line_numbers: bool, start_line: int | None,
+              end_line: int | None) -> str:
+    """读单个文件,可选行区间。返回正文(或一句说明/错误)。
 
-    给 start_line/end_line 就只返回那几行 —— grep_files 命中某行后想看附近上下文时用它,
-    不必整份读进来。带行号时,行号始终是**文件里的真实行号**,可直接喂给 edit_lines。
+    这是 read_file 的内核 —— 多个文件时逐个调它,每个文件的上限、敏感文件拦截、
+    行号规则都在这一个地方,不必在循环里重复。
     """
     target = safe_path(path)
     if target.name in FS_DENY_READ:
@@ -130,6 +104,74 @@ def read_file(path: str, with_line_numbers: bool = False,
     if (lo, hi) != (1, total):
         body += f"\n\n…(本次为第 {lo}-{hi} 行,文件共 {total} 行)"
     return body
+
+
+@tool(
+    description="读取文本文件的内容,**一次可以读多个**(单次最多返回 3145728 个字符,超出会明确提示截断)。"
+                "会自动识别编码,GBK 等中文编码的文件也能读。只能读取工作区内的文件。"
+                "**path 可以给数组**,一次读几个相关文件 —— 每多一次工具调用,模型就要重读一遍"
+                "整个历史,省一次调用就是省一份上下文。一次最多 20 个文件。"
+                "用 start_line/end_line 可只读某个行区间(对数组里的**每个**文件都生效)—— "
+                "grep_files 命中某行后想看附近上下文,就用它读那几行,不必把整个大文件读进来。"
+                "准备用 edit_lines 或 insert_lines 按行修改文件前,先带 with_line_numbers=true 读一遍"
+                "(或读目标区间)确认行号。",
+    parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "文件路径(相对或绝对),可给数组一次读多个,如 [\"a.py\", \"b.py\"];"
+                                       "只看一个文件时直接给字符串也行",
+                    },
+                    "with_line_numbers": {
+                        "type": "boolean",
+                        "description": "是否在每行前面加上行号,默认 false。按行编辑前应设为 true",
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "起始行号(1 起始,含该行)。配合 end_line 只看某段;不填则从头",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "结束行号(含该行)。不填则读到末尾。带行号读区间时,行号仍是文件真实行号",
+                    },
+                },
+                "required": ["path"],
+            },
+)
+def read_file(path, with_line_numbers: bool = False,
+              start_line: int | None = None, end_line: int | None = None) -> str:
+    """读取工作区里的一个或多个文本文件。可只读某个行区间(1 起始,含两端)。
+
+    **一次可以读多个**:path 传数组即可,看几个相关文件时不必来回调 —— 每次工具调用都会
+    让模型重新读一遍整个历史,省一次调用就是省一份上下文。行区间对所有文件生效。
+    带行号时,行号始终是**文件里的真实行号**,可直接喂给 edit_lines。
+    """
+    paths = [path] if isinstance(path, str) else list(path)
+    if not paths:
+        return "错误:没有给出要读的文件"
+    if len(paths) > FS_MAX_READ_FILES:
+        return (f"错误:一次最多读 {FS_MAX_READ_FILES} 个文件(收到 {len(paths)} 个)—— "
+                f"分批读,或者先用 grep_files / find_files 缩小范围")
+
+    single = len(paths) == 1
+    parts = []
+    for p in paths:
+        try:
+            body = _read_one(p, with_line_numbers, start_line, end_line)
+        except Exception as exc:  # noqa: BLE001 - 一个文件读不了不该拖垮整批
+            body = f"错误:{type(exc).__name__}: {exc}"
+        # 多个文件必须各自带标题,否则读回来分不清哪段是谁的
+        parts.append(body if single else f"===== {p} =====\n{body}")
+
+    out = parts[0] if single else "\n\n".join(parts)
+    if len(out) > FS_MAX_READ_CHARS:
+        out = out[:FS_MAX_READ_CHARS] + (
+            f"\n\n…(内容过长,只返回前 {FS_MAX_READ_CHARS} 个字符;"
+            f"请减少文件数,或用 start_line/end_line 分段读)"
+        )
+    return out
 
 
 @tool(
