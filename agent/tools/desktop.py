@@ -16,7 +16,7 @@ DESKTOP_MAX_CLIPBOARD_CHARS = int(os.environ.get("MAX_CLIPBOARD_CHARS", "10000")
 
 # ---------------- 模拟输入(键盘/鼠标) ----------------
 # 这些工具直接作用于宿主机的真实桌面(非容器),全权限、针对当前焦点窗口。
-# 走 pyautogui;FAILSAFE 默认开启 —— 鼠标移到屏幕左上角可立即中止。
+# 走 pyautogui;FAILSAFE 默认开启 —— 鼠标移到屏幕任意一角可立即中止(四个角都算)。
 # 注意:这一步是"直接的手",操作宿主 GUI,影响的窗口取决于焦点。
 
 
@@ -27,7 +27,7 @@ def _pyautogui():
     except ImportError:
         raise RuntimeError("模拟输入需要 pyautogui,请先执行:pip install pyautogui") from None
     pyautogui.PAUSE = 0.05  # 每一步间隔,避免动作过快
-    pyautogui.FAILSAFE = True  # 鼠标甩到左上角 = 紧急中止
+    pyautogui.FAILSAFE = True  # 鼠标甩到屏幕任意一角 = 紧急中止
     return pyautogui
 
 
