@@ -53,6 +53,13 @@ BOUNDARY_HINTS = (
 # 依赖项的规矩 —— 和 agent/skills.py 的 parse_deps 是**同一套**。
 DEP_KINDS = ("skill", "package")
 DEP_FIELDS = set(DEP_KINDS) | {"reason", "fallback"}
+# 依赖项要能**单独拎出来读懂**,不能靠"上文" —— 哪几项会出现是加载时才定的(缺席的
+# 可选依赖根本不显示),所以「同上」很可能是一句没有上文的孤零零的话。
+#
+# **这条只在自检里卡,运行时(agent/skills.py 的 parse_deps)不管。** 是故意的:
+# 这是行文质量,不是结构错误 —— 别人的技能写了「同上」,该照常能加载,不该整个报废。
+# 自检是交出去之前的把关,可以严;运行时是"再差也得能跑"。
+DEP_BACKREF = re.compile(r"^(同上|见上|如上|同前|同上所述|同\s*上|ditto|same as above)")
 # 举例用的占位名,不当成真实引用 —— 按**主名**判,不看扩展名(foo.py / foo.md 都算)
 PLACEHOLDERS = {"foo", "bar", "baz", "qux", "xxx", "yyy", "name"}
 # 单字母文件名(x.py / y.md)也是写说明时常用的举例写法
@@ -188,6 +195,15 @@ def check_deps(meta: dict, known: set[str], field: str) -> list[str]:
                 f"{field} 里的 `{kind}: {name}` 没写 fallback —— "
                 f"**可选依赖的缺失代价必须写出来**,写不出一个能接受的下场,它就该是 requires"
             )
+        for key in ("reason", "fallback"):
+            val = str(item.get(key) or "").strip()
+            if DEP_BACKREF.match(val):
+                problems.append(
+                    f"{field} 里的 `{kind}: {name}` 的 {key} 写成了「{val[:12]}」—— "
+                    f"依赖是**可插拔、无序**的,而且哪些项会出现要到加载时才定(缺席的"
+                    f"可选依赖不显示),所以「同上」很可能是指向一句根本不在场的话。"
+                    f"每条都要能单独拎出来读懂"
+                )
         if kind == "skill" and name not in known:
             problems.append(f"{field} 里的 `skill: {name}` 没有这个技能(名字写错了?改名了?)")
     return problems
