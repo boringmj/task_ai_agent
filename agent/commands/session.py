@@ -16,6 +16,8 @@ from ..tools.vm import VM_AUTOSTART
 /new             同上(旧名,等价)。
                 只清对话:工作区文件、长期记忆、虚拟机磁盘都不动。
                 虚拟机里跑着的东西不会被停掉。
+                子 agent 会一并停掉(作废,不再通报)—— 但它的对话和产出不删,
+                在 sessions/<会话>/tasks/ 下,想翻还翻得到。
 """,
     hint="用户想彻底换个话题、不想被前面的对话干扰,或会话被搞乱时。",
     aliases=("/new",),
@@ -23,6 +25,7 @@ from ..tools.vm import VM_AUTOSTART
 def cmd_reset(ctx: Context) -> str:
     """清空会话:只留下开头的 system 消息(提示词与长期记忆),并删掉磁盘上的存档。"""
     # 延迟导入,避免 commands ↔ session / loop 之间成环
+    from .. import tasks
     from ..session import clear_session, current_session_id
 
     kept = 0
@@ -30,11 +33,14 @@ def cmd_reset(ctx: Context) -> str:
         kept += 1
     del ctx.messages[kept:]
     clear_session(current_session_id())
+    # **子 agent 要一起收掉。** 否则它们还挂着:跑着的继续烧 token(花在一段已经不要了
+    # 的对话上),干完的继续按「待办」通报进刚清空的新对话 —— 实测就是这个现象。
+    note = tasks.clear_for_reset()
 
     # 只声明"会话被重置了"这个事实。虚拟机没跟着重置、要不要提醒用户 —— 那是 VM 那边
     # 的事,由 cli 接上(见 commands/__init__.py 里 events 的说明)。
     ctx.events.add("session_reset")
-    return "会话已重置(文件与长期记忆未动)。"
+    return "会话已重置(文件与长期记忆未动)。" + (f" {note}" if note else "")
 
 
 @command(

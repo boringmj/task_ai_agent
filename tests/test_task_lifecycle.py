@@ -245,6 +245,47 @@ def test_switching_a_session_pauses_them_instead_of_discarding(model, slow):
     assert "resume_task" in msg and "中断" in msg
 
 
+def test_reset_clears_the_subagents_too(model, slow):
+    """**`/new`(=/reset)之后子 agent 还留着** —— 用户报的 bug。
+
+    对话被丢掉了,挂在它下面的活却还在:跑着的继续烧 token,干完的继续按「待办」
+    通报进一段**全新的**对话(用户刚说了这段不要了)。实测下一次请求立刻被它打扰。
+    """
+    from agent.ctx import AgentCtx
+
+    slow["delay"] = 0.8
+    model.set(*[("干着。", [model.call("get_current_time")], "")] * 6)
+    running = tasks.dispatch("跑着的活", fs=helpers.grant(), wait=False)["task_id"]
+    slow["entered"].wait(10)
+    # 再摆一个"已经干完、还没验收"的(直接造出来,免得和上面那个抢同一份假模型脚本)
+    tasks._TASKS["t9"] = tasks.Task(id="t9", prompt="干完的活", session=tasks._sid(),
+                                    status="done", result="结论",
+                                    ctx=AgentCtx(role="sub", task_id="t9"))
+    assert "干完的活" in tasks.listing()
+    tasks.attach(running)                 # 正接管着其中一个
+
+    out = cmd("/reset", _ctx())
+
+    slow["delay"] = 0.0
+    assert "会话已重置" in out
+    assert "干完的活" not in tasks.listing(), "干完的那个还挂在清单上"
+    assert not tasks.needs_attention(), "它的结果会被通报进刚清空的对话"
+    assert tasks.attached() is None, "接管着的那一个被收掉了,接管也得退出"
+    t = helpers.wait_status(running, ("closed", "done", "failed", "interrupted"))
+    assert t.status == "closed", f"跑着的那个没停(实际 {t.status})"
+    assert t.messages, "只是作废,不是把它的对话删掉 —— 盘上那份该还在"
+
+
+def test_reset_leaves_other_sessions_alone(model):
+    """只清当前会话的子 agent —— 别的会话的活不该被连累。"""
+    tasks._TASKS["t8"] = tasks.Task(id="t8", prompt="别的会话的活", session="别的会话",
+                                    status="done")
+
+    cmd("/reset", _ctx())
+
+    assert tasks.get("t8").status == "done"
+
+
 # ============================== 重启之后 ==============================
 
 

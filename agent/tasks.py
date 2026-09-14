@@ -906,24 +906,80 @@ def finish(tid: str, verdict: str = "accept", note: str = "") -> str:
     return f"不认识的 verdict {verdict!r} —— 只认 accept / rework / stop。"
 
 
-def stop_for_switch(sid: str) -> int:
-    """把一个会话里所有还在跑的子 agent 叫停,返回叫停了几个。
+def _cancel_session(sid: str, status: str) -> list[Task]:
+    """把一个会话里所有还在跑的**叫停**,返回被叫停的那几个。
 
-    用在 `/switch` 上。叫停是**商量式的**(和 kill 一样:线程没法从外面强杀,只能设个
-    旗子让它每步之间自己停)—— 所以返回的是"已经叫停",不是"已经停了";它们会在当前
-    那一步做完之后落到 interrupted。
+    叫停是**商量式的**(和 kill 一样:线程没法从外面强杀,只能设个旗子让它每步之间自己
+    停)—— 所以这里只是"通知到了",它们会在当前那一步做完之后才落到 `status`。
 
-    标 interrupted 而不是 closed:这些活没做完、也不该被丢掉,只是**不该在一个你已经
-    离开的会话里继续烧 token**。切回去时主 agent 会被问到,可以 resume。
+    **落到哪种结局由调用方给**:同样是叫停,「换会话」(暂停)和「重置会话」(作废)的
+    意思完全不同,见下面两个函数。
     """
     with _LOCK:
         live = [t for t in _TASKS.values()
                 if t.status == "running" and t.session == sid]
     for t in live:
-        t.cancel_status = "interrupted"
+        t.cancel_status = status
         if t.ctx is not None:
             t.ctx.cancelled = True
-    return len(live)
+    return live
+
+
+def stop_for_switch(sid: str) -> int:
+    """换会话时把一个会话里所有还在跑的叫停,返回叫停了几个。
+
+    标 interrupted 而不是 closed:这些活没做完、也不该被丢掉,只是**不该在一个你已经
+    离开的会话里继续烧 token**。切回去时主 agent 会被问到,可以 resume。
+    """
+    return len(_cancel_session(sid, "interrupted"))
+
+
+def clear_for_reset(sid: str | None = None) -> str:
+    """会话重置时把子 agent 一并收掉,返回给用户看的一句说明(没有就返回空串)。
+
+    **为什么必须收**:对话被丢掉了,挂在它下面的活还留着的话 —— 跑着的继续烧 token
+    (花在一段已经不要了的对话上),干完的继续按「待办」通报进一段**全新的**对话。
+    实测就是这个现象:`/new` 之后 `/subtasks` 里还是 `t1 [running]`、`t9 [done]`,
+    而下一步请求立刻被那条通报打扰。
+
+    **和 `/switch` 的区别**:那边是**暂停**(切回去还能接着做),这里是**作废** ——
+    对话都不要了,没什么可回去的。所以标 closed 而不是 interrupted,否则刚清空的对话
+    马上会收到一条"某个子 agent 被中断了,可以 resume"。标成 closed 之后,它也就不再
+    出现在 `/subtasks` 的清单里、不再进 needs_attention。
+
+    它的对话和产出**不删**(在 sessions/<会话>/tasks/<id>/ 下)—— 这一条和 /reset 的
+    其余部分一致:只清对话,不动文件。
+    """
+    sid = sid or _sid()
+    with _LOCK:
+        # 没记会话的那些(老数据)算当前会话的,和 needs_attention 同一个口径
+        mine = [t for t in _TASKS.values()
+                if (not t.session or t.session == sid) and t.status != "closed"]
+    stopping = [t for t in mine if t.status == "running"]
+    for t in stopping:
+        t.cancel_status = "closed"
+        if t.ctx is not None:
+            t.ctx.cancelled = True
+    closing = [t for t in mine if t.status != "running"]
+    for t in closing:
+        t.status = "closed"
+        t.updated = _now()
+        t.ctx = None
+        _save(t)
+
+    if _ATTACHED and any(t.id == _ATTACHED for t in mine):
+        detach()          # 正接管着其中一个 —— 它没了,接管也得退出来
+
+    parts = []
+    if stopping:
+        parts.append(f"{len(stopping)} 个还在跑的已通知它们停"
+                     f"(做完当前这一步就停:{'、'.join(t.id for t in stopping)})")
+    if closing:
+        parts.append(f"{len(closing)} 个已经收场的关掉了"
+                     f"({'、'.join(t.id for t in closing)})")
+    if not parts:
+        return ""
+    return "子 agent 一并收掉了:" + ";".join(parts) + "。它的对话和产出还在盘上,没有删。"
 
 
 def kill(tid: str) -> str:
