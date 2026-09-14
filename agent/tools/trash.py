@@ -30,7 +30,7 @@ TRASH_MAX_BATCH = int(os.environ.get("TRASH_MAX_BATCH", "20"))
 
 def _delete_one(path: str) -> str:
     """把一个文件移进回收站,返回 "原名 → 回收站名"。出错就抛(由调用方决定怎么处理)。"""
-    target = safe_path(path)
+    target = safe_path(path, "delete")
     if not target.exists():
         raise FileNotFoundError(f"{target} 不存在")
     if target.is_dir():
@@ -142,7 +142,7 @@ def delete_dir(path: str, recursive: bool = False) -> str:
     目录必须为空,才能直接删;非空目录需要 recursive=true 显式确认。
     工作区本身、agent 的系统目录(.trash/.git/.agent)一律拒绝,防止自毁。
     """
-    target = safe_path(path)
+    target = safe_path(path, "delete")
     if not target.exists():
         raise FileNotFoundError(f"{target} 不存在")
     if not target.is_dir():
@@ -285,7 +285,7 @@ def _restore_one(trashed_name: str, overwrite: bool) -> str:
     还原前必须检查原位置是否已有文件 —— 直接覆盖会丢掉用户当前的内容,那是不可逆的,
     所以要像 write_file 覆盖那样要求显式声明意图。
     """
-    trash_path = safe_path(TRASH_DIR / trashed_name)
+    trash_path = safe_path(TRASH_DIR / trashed_name, "read")
     if not trash_path.exists():  # 目录和文件都能还原,不能只看 is_file()
         raise FileNotFoundError(f"回收站里没有 {trashed_name},可先 list_files(.trash, show_hidden=true) 看看")
 
@@ -302,6 +302,16 @@ def _restore_one(trashed_name: str, overwrite: bool) -> str:
                 f"确认要覆盖,就带 overwrite=true 重新调用。"
             )
 
+    # **还原也是往工作区里写东西**,得照样过一遍授权。这条路径是从回收站索引里读回来的
+    # (`_trash_original_of`),没经过 safe_path,所以要单独补一次 —— 不补的话"还原"就是
+    # 绕开写权限的后门:不能写?删掉再还原,一样能落地。
+    try:
+        rel = original.relative_to(ROOT).as_posix()
+    except ValueError:
+        raise PermissionError(
+            f"回收站里记的原位置不在工作区内:{original} —— 拒绝还原。"
+        ) from None
+    safe_path(rel, "write")
     # 先移出来再删索引:如果这一步异常了,索引还在,还能再试一次
     original.parent.mkdir(parents=True, exist_ok=True)
     trash_path.replace(original)
@@ -339,7 +349,7 @@ def purge_trash(max_age_days: int | None = None, name: str | None = None) -> str
     """
     # 只删指定的一项
     if name:
-        target = safe_path(TRASH_DIR / name)
+        target = safe_path(TRASH_DIR / name, "delete")
         if target == TRASH_DIR or not target.is_relative_to(TRASH_DIR):
             return f"错误:{name} 不在回收站里。"
         if target == TRASH_INDEX_FILE:

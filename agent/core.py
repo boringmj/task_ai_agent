@@ -128,15 +128,39 @@ def _enable_dpi_awareness() -> None:
 _enable_dpi_awareness()
 
 
-def safe_path(path: str) -> Path:
-    """把模型给的路径解析为绝对路径,并确保它没有逃出 ROOT。
+def safe_path(path: str, mode: str) -> Path:
+    """把模型给的路径解析为绝对路径,校验它没逃出 ROOT,**并且当前 agent 有权这么用**。
 
     相对路径基于 ROOT 解析;绝对路径经 resolve() 后一并校验。
     resolve() 会展开 .. 和符号链接,所以 "../../etc" 和指向外部的软链都会被挡下。
+
+    **`mode` 是必填的,没有默认值 —— 这是故意的。** 它是"这次打算拿这个路径干什么"
+    (`read` / `write` / `delete`)。给个默认值的话,漏写的那一处会静默按默认值放行,
+    而漏写恰恰最容易发生在**新加的写工具**上 —— 那正是最需要拦的地方。不给默认值,
+    漏写就是当场报错,跑一次就发现。
     """
     resolved = (ROOT / path).resolve()
     if not resolved.is_relative_to(ROOT):
         raise PermissionError(f"拒绝访问工作区 {ROOT} 之外的路径:{resolved}")
+
+    from . import ctx
+    me = ctx.current()
+    rel = resolved.relative_to(ROOT).as_posix()
+    if not me.fs.allows(rel, mode):
+        raise PermissionError(me.fs.explain(rel, mode))
+
+    # 主 agent 去改一块**正在被某个子 agent 写**的地方 —— 拦下来。这是"授权划范围"
+    # 的另一半:不拦的话,范围只约束了子 agent 之间,主 agent 照样能把它们脚下的
+    # 地板掀了,而且掀完谁也不知道。
+    if mode in ("write", "delete"):
+        from . import tasks
+        holder = tasks.conflict_for(rel, exclude=me.task_id)
+        if holder:
+            raise PermissionError(
+                f"`{rel}` 现在归子 agent {holder} 管(它正在写这块)。"
+                f"要么等它回来,要么让它停下来 —— 你直接改会和它撞车,而且撞了不报错,"
+                f"只是结果对不上。"
+            )
     return resolved
 
 

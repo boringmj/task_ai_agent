@@ -177,7 +177,7 @@ def download(url: str, dest: str = "", overwrite: bool = False) -> str:
     写进工作区某个文件,只返回确认信息。复用同一套 SSRF 防护和逐跳校验。
     """
     # 给了 dest 就先定死目标;没给则等拿到**最终 URL** 后再取名(重定向后才是真文件名)
-    target = safe_path(dest) if dest else None
+    target = safe_path(dest, "write") if dest else None
     if target is not None and target.exists() and not overwrite:
         return (
             f"{target.name} 已存在({target.stat().st_size} 字节)。"
@@ -215,7 +215,7 @@ def download(url: str, dest: str = "", overwrite: bool = False) -> str:
 
                     if target is None:  # 按最终 URL 取名,去掉 query/fragment
                         name = os.path.basename(urlparse(final_url).path.rstrip("/")) or "download.bin"
-                        target = safe_path(name)
+                        target = safe_path(name, "write")
                         if target.exists() and not overwrite:
                             return (
                                 f"{target.name} 已存在({target.stat().st_size} 字节)。"

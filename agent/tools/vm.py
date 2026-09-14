@@ -568,7 +568,7 @@ def vm_push(local_path: str, guest_path: str) -> str:
     local_path 必须是工作区内路径(相对或绝对);guest_path 是 guest 里的绝对路径(如 /root/a.txt)。
     """
     import base64
-    local = safe_path(local_path)
+    local = safe_path(local_path, "read")
     if not local.is_file():
         return f"错误:工作区里没有 {local_path}(解析为 {local})"
     gp = _shq(guest_path)
@@ -611,7 +611,7 @@ def vm_pull(guest_path: str, local_path: str) -> str:
     local_path 是工作区路径;guest_path 是 guest 里的绝对路径(如 /root/out.txt)。
     """
     import base64
-    local = safe_path(local_path)
+    local = safe_path(local_path, "write")
     gp = _shq(guest_path)
     size_resp = _vm_exec_raw(f"if [ -f {gp} ]; then stat -c %s {gp}; else echo MISSING; fi", 30)
     size_raw = (size_resp.get("output") or "").strip()

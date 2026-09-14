@@ -29,6 +29,64 @@ def _empty_usage() -> dict:
     return {"requests": 0, "completion": 0, "prompt": 0, "cache_hit": 0}
 
 
+FS_ANY = "*"        # 通配:整个工作区
+
+
+@dataclass
+class FsGrant:
+    """这个 agent 能读写**哪儿**。路径相对工作区,`*` 表示整个工作区。
+
+    **为什么要有范围,而不是简单的"能写/不能写"**:几个子 agent 并排跑的时候,
+    它们改的是同一批文件。给整片工作区的写权限,等于让它们互相踩 —— 而且踩了**不报错**,
+    只是结果对不上,事后根本查不出是谁改的。把范围划开,冲突就变成**当场可判**的事。
+    """
+
+    read: tuple = (FS_ANY,)
+    write: tuple = ()
+    # 删除/移动要**单独**开:写坏一个文件还能改回来,删掉就没了。
+    # 这两件事不该共用一个"写"权限。
+    delete: bool = False
+
+    @classmethod
+    def full(cls) -> "FsGrant":
+        """不限制。主 agent 和"没人在场的独立调用"用这个。"""
+        return cls(read=(FS_ANY,), write=(FS_ANY,), delete=True)
+
+    @staticmethod
+    def _within(rel: str, scopes: tuple) -> bool:
+        for s in scopes:
+            if s == FS_ANY:
+                return True
+            s = s.rstrip("/")
+            if rel == s or rel.startswith(s + "/"):
+                return True
+        return False
+
+    def allows(self, rel: str, mode: str) -> bool:
+        if mode == "read":
+            return self._within(rel, self.read)
+        if mode == "write":
+            return self._within(rel, self.write)
+        if mode == "delete":
+            # 删/移既要有 delete 开关,也得落在写范围里 —— 开关是"允许这类操作",
+            # 范围是"允许在哪",两件事都成立才行。
+            return self.delete and self._within(rel, self.write)
+        return False
+
+    def explain(self, rel: str, mode: str) -> str:
+        what = {"read": "读", "write": "写", "delete": "删除或移动"}.get(mode, mode)
+        if mode == "delete" and not self.delete:
+            why = "这次的活没有给你删除/移动的权限(它和写权限是分开的)"
+        elif not self.write and not self.read:
+            why = f"这次的活没有给你{what}任何文件"
+        else:
+            scope = "、".join(self.write or self.read) or "(空)"
+            why = f"你被允许的范围是:{scope},`{rel}` 不在里面"
+        return f"拒绝{what} `{rel}`:{why}。" + (
+            "如果确实需要,**用 suspend 向主 agent 申请**,别绕。"
+            if self.write != (FS_ANY,) else "")
+
+
 @dataclass
 class AgentCtx:
     """一个 agent 的运行时状态。
@@ -45,6 +103,9 @@ class AgentCtx:
     # VM 是**一份**、主和子共享,子 agent 没有自己的机器 —— 所以由主 agent 在派活时
     # 决定这次给不给。默认**不给**:要用的任务才给,不是默认人人有份。
     vm_grant: bool = False
+    # 能读写哪儿。默认**不限制** —— 这一条是给"主 agent 和独立调用"用的兼容默认值。
+    # 子 agent **必须**由 tasks.py 显式给一份受限的,那里是唯一的入口。
+    fs: FsGrant = field(default_factory=FsGrant.full)
 
     # ---- 轮次级状态(原来散在各模块的全局变量里)----
     # 待注入的图片 data URL,img 工具跑过就填,下一轮请求前注入进对话

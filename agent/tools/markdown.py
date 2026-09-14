@@ -33,7 +33,7 @@ _SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", "site-pack
 )
 def check_markdown(path: str) -> str:
     """检查一个 .md 文件或目录下所有 .md 的格式。"""
-    target = safe_path(path)
+    target = safe_path(path, "read")
     if not target.exists():
         return f"错误:{target} 不存在"
 

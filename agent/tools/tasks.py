@@ -37,13 +37,38 @@ from .registry import tool
                                "false = 派完就撒手,你继续干别的,它干完会通知你。"
                                "要并排铺开好几件事时用 false,一次派完再等。",
             },
+            "write": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "允许它**写**哪些路径(相对工作区),可以是文件也可以是目录,"
+                               "如 [\"reports\"、\"notes/a.md\"]。**不填就等于不许写任何文件**。"
+                               "写范围必须给窄:并排派好几个时,两个范围撞上会被直接拒掉 ——"
+                               "同时改一处,改完不报错、只是结果对不上,事后查不出是谁改的。",
+            },
+            "read": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "允许它**读**哪些路径。不填 = 整个工作区都能读(读基本无害)。",
+            },
+            "allow_delete": {
+                "type": "boolean",
+                "description": "允许它删/移文件。**默认 false,而且和写权限是分开的** ——"
+                               "写坏一个文件还能改回来,删掉就没了。要删也只能删在 write "
+                               "范围里的东西。",
+            },
         },
         "required": ["task"],
     },
 )
-def dispatch_task(task: str, vm: bool = False, wait: bool = True) -> str:
+def dispatch_task(task: str, vm: bool = False, wait: bool = True,
+                  write: list | None = None, read: list | None = None,
+                  allow_delete: bool = False) -> str:
     from .. import tasks
-    r = tasks.dispatch(task, vm=vm, wait=wait)
+    from ..ctx import FS_ANY, FsGrant
+    fs = FsGrant(read=tuple(read) if read else (FS_ANY,),
+                 write=tuple(write or ()),
+                 delete=bool(allow_delete))
+    r = tasks.dispatch(task, vm=vm, wait=wait, fs=fs)
     return r.get("message") or (f"已派给 {r['task_id']},它在后台跑。"
                                 f"用 task_status 看进展;干完我会告诉你。")
 

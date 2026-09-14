@@ -80,7 +80,7 @@ def _read_one(path: str, with_line_numbers: bool, start_line: int | None,
     这是 read_file 的内核 —— 多个文件时逐个调它,每个文件的上限、敏感文件拦截、
     行号规则都在这一个地方,不必在循环里重复。
     """
-    target = safe_path(path)
+    target = safe_path(path, "read")
     if target.name in FS_DENY_READ:
         raise PermissionError(f"{target.name} 属于敏感文件(如 .env),禁止读取")
     text, _enc = _read_text_with_encoding(target)
@@ -236,7 +236,7 @@ def list_files(path=".", show_hidden: bool = False) -> str:
 
 def _list_one(path: str, show_hidden: bool) -> str:
     """列一个目录(内核)。"""
-    target = safe_path(path)
+    target = safe_path(path, "read")
     if not target.is_dir():
         return f"错误:{target} 不是一个目录"
 
@@ -315,7 +315,7 @@ def find_files(name: str, path=".", include_dirs: bool = False) -> str:
     hits: list[Path] = []
     missing: list[str] = []
     for one in paths:
-        root = safe_path(one)
+        root = safe_path(one, "read")
         if not root.exists():
             missing.append(str(root))       # 写错一个不该让其余几个白搜
             continue
@@ -325,7 +325,8 @@ def find_files(name: str, path=".", include_dirs: bool = False) -> str:
         return f"错误:这些路径不存在:{'、'.join(missing)}"
     if not hits:
         what = "文件或目录" if include_dirs else "文件"
-        return f"没有匹配「{name}」的{what}(搜索范围:{'、'.join(_rel(safe_path(p)) for p in paths)})"
+        scope = "、".join(_rel(safe_path(p, "read")) for p in paths)
+        return f"没有匹配「{name}」的{what}(搜索范围:{scope})"
 
     # 多个 path 范围可能重叠,同一个文件只列一次(保留首次出现的次序)
     uniq, seen = [], set()
@@ -424,7 +425,7 @@ def grep_files(pattern: str, path: str = ".", ignore_case: bool = False,
     roots: list[Path] = []
     missing: list[str] = []
     for one in paths:
-        r = safe_path(one)
+        r = safe_path(one, "read")
         if r.exists():
             roots.append(r)
         else:
@@ -559,7 +560,7 @@ def _check_writable(target: Path, content: str) -> int:
             },
 )
 def write_file(path: str, content: str, overwrite: bool = False) -> str:
-    target = safe_path(path)
+    target = safe_path(path, "write")
     size = _check_writable(target, content)
 
     # 覆盖是不可逆的,必须由模型显式声明意图,不能靠默认行为悄悄发生
@@ -600,7 +601,7 @@ def write_file(path: str, content: str, overwrite: bool = False) -> str:
             },
 )
 def append_file(path: str, content: str) -> str:
-    target = safe_path(path)
+    target = safe_path(path, "write")
     size = _check_writable(target, content)
 
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -613,7 +614,7 @@ def append_file(path: str, content: str) -> str:
 
 def _load_lines(path: str) -> tuple[Path, list[str], str]:
     """按行读出文件,保留行尾换行符,供按行编辑的工具复用。返回 (路径, 行, 原编码)。"""
-    target = safe_path(path)
+    target = safe_path(path, "write")
     if target.name in FS_DENY_READ:
         raise PermissionError(f"{target.name} 属于敏感文件,禁止编辑")
     if not target.is_file():
@@ -732,11 +733,11 @@ def insert_lines(path: str, after_line: int, content: str) -> str:
 
 def _move_one(source: str, destination: str, overwrite: bool) -> str:
     """移动/重命名单个文件或目录。返回一句结果说明;出错就抛(由调用方决定怎么处理)。"""
-    src = safe_path(source)
+    src = safe_path(source, "delete")
     if not src.exists():
         raise FileNotFoundError(f"{src} 不存在")
 
-    dest = safe_path(destination)
+    dest = safe_path(destination, "write")
     # 目标是已存在的目录 -> 移动进去并沿用原名,与 shell 里 mv a.txt dir/ 的习惯一致
     if dest.is_dir() and dest != src:
         dest = dest / src.name
@@ -818,7 +819,7 @@ def move_file(source, destination: str, overwrite: bool = False) -> str:
     if len(sources) == 1:
         return _move_one(sources[0], destination, overwrite)
 
-    dest = safe_path(destination)
+    dest = safe_path(destination, "write")
     created = ""
     if not dest.is_dir():
         if dest.exists():

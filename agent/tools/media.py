@@ -60,7 +60,7 @@ def img(path: str) -> str:
     工具返回值只能存文本,塞不进 image_url;所以这里不返回 base64 字符串,
     只登记数据,由 run() 在下次调用模型前把它作为 content 里的 image_url 段注入。
     """
-    target = safe_path(path)
+    target = safe_path(path, "read")
     if not target.is_file():
         raise FileNotFoundError(f"{target} 不存在或不是文件")
     ext = target.suffix.lower()

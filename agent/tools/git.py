@@ -149,7 +149,7 @@ def _git_clone(repo: Path, *args: str) -> str:
     dest_arg = parts[given_dest + 1] if given_dest is not None and given_dest + 1 < len(parts) else ""
 
     if dest_arg:
-        dest = safe_path(dest_arg)
+        dest = safe_path(dest_arg, "write")
         if dest == CLONES_DIR or not dest.is_relative_to(CLONES_DIR):
             raise PermissionError(f"克隆目标必须位于 clones/ 目录内(不能是工作区根),收到:{dest}")
     else:

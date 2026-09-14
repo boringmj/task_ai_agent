@@ -29,6 +29,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import ctx, prompts
+from .ctx import FS_ANY, FsGrant
 from .core import MAX_STEPS
 from . import session as _session
 
@@ -85,6 +86,7 @@ class Task:
     prompt: str
     status: str = "queued"       # queued / running / waiting_input / done / failed / interrupted
     vm: bool = False             # 主 agent 有没有把 VM 开给它
+    fs: FsGrant = field(default_factory=FsGrant)   # 它能读写哪儿
     created: str = field(default_factory=_now)
     updated: str = field(default_factory=_now)
     result: str = ""             # 最终报告(交回主 agent 的那段)
@@ -106,6 +108,8 @@ class Task:
         """落盘的元信息(不含 messages —— 那个单独一行行追加)。"""
         return {"id": self.id, "prompt": self.prompt, "status": self.status,
                 "vm": self.vm, "created": self.created, "updated": self.updated,
+                "fs": {"read": list(self.fs.read), "write": list(self.fs.write),
+                       "delete": self.fs.delete},
                 "result": self.result, "error": self.error, "ask": self.ask,
                 "usage": self.usage}
 
@@ -179,6 +183,49 @@ def _running_count() -> int:
     return sum(1 for t in _TASKS.values() if t.status == "running")
 
 
+def _overlap(a: tuple, b: tuple) -> bool:
+    """两片写范围有没有交集。
+
+    两个路径只要一个是另一个的前缀就算重叠(`reports` 和 `reports/x.md`)—— 粗一点没关系,
+    **宁可误拦也不要放过**:误拦的代价是"换个范围重派",放过的代价是两个 agent 同时改
+    同一批文件,而且改完谁也不知道(不报错,只是结果对不上)。
+    """
+    for x in a:
+        for y in b:
+            if x == FS_ANY or y == FS_ANY:
+                return True
+            x, y = x.rstrip("/"), y.rstrip("/")
+            if x == y or x.startswith(y + "/") or y.startswith(x + "/"):
+                return True
+    return False
+
+
+def conflict_for(rel: str, exclude: str = "") -> str:
+    """`rel` 这块现在归哪个子 agent 管?(没人管就返回空串)
+
+    给 `safe_path` 用:主 agent 要写一块正在被某个子 agent 写的地方时拦下来。
+    这是授权划范围的另一半 —— 只约束子 agent 之间的话,主 agent 照样能把它们脚下的
+    地板掀了,而且掀完谁也不知道。
+    """
+    with _LOCK:
+        for t in _TASKS.values():
+            if t.status != "running" or t.id == exclude:
+                continue
+            if _within(rel, t.fs.write):
+                return t.id
+    return ""
+
+
+def _within(rel: str, scopes: tuple) -> bool:
+    for s in scopes:
+        if s == FS_ANY:
+            return True
+        s = s.rstrip("/")
+        if rel == s or rel.startswith(s + "/"):
+            return True
+    return False
+
+
 def _build_messages(t: Task) -> list[dict]:
     """子 agent 的对话开头:它自己的系统提示词(含任务描述和它的技能清单)。"""
     from . import skills
@@ -191,7 +238,7 @@ def _build_messages(t: Task) -> list[dict]:
 
 
 def dispatch(prompt: str, vm: bool = False, wait: bool = True,
-             timeout: float | None = None) -> dict:
+             timeout: float | None = None, fs: FsGrant | None = None) -> dict:
     """派一件活给子 agent。返回一个结果字典(不是字符串 —— 调用方要按状态分支)。"""
     prompt = (prompt or "").strip()
     if not prompt:
@@ -203,7 +250,18 @@ def dispatch(prompt: str, vm: bool = False, wait: bool = True,
                     "message": f"同时在跑的子 agent 已经到上限({MAX_CONCURRENT} 个:{busy})。"
                                f"先等它们回来,或者用 task_status 看看进展。"}
 
-    t = Task(id=_new_id(), prompt=prompt, vm=bool(vm), awaited=bool(wait))
+    if fs is None:
+        # 默认:能读整个工作区,**不能写**。写必须由主 agent 显式划范围 ——
+        # 不划就等于让几个并排的子 agent 随便改同一批文件。
+        fs = FsGrant(read=(FS_ANY,), write=(), delete=False)
+    if fs.write:
+        for other in list(_TASKS.values()):
+            if other.status == "running" and _overlap(fs.write, other.fs.write):
+                return {"status": "error", "message": (
+                    f"写范围和工作中的 {other.id} 撞上了(它管 {'、'.join(other.fs.write)},"
+                    f"你要 {'、'.join(fs.write)})。两个 agent 同时改一处,撞了不报错、"
+                    f"只是结果对不上,事后查不出是谁改的。换个不重叠的范围,或者等它回来。")}
+    t = Task(id=_new_id(), prompt=prompt, vm=bool(vm), awaited=bool(wait), fs=fs)
     t.notifier = threading.Event()
     with _LOCK:
         _TASKS[t.id] = t
@@ -231,7 +289,7 @@ def _run(t: Task) -> None:
     忘了这一步,它的图片、搜索配额、用量会落到那个兜底上下文上,等于全部丢失。
     """
     c = ctx.AgentCtx(role="sub", task_id=t.id, label=t.id, vm_grant=t.vm,
-                     console=_buffer_console())
+                     fs=t.fs, console=_buffer_console())
     t.ctx = c                                     # 保留引用,供 /subtasks 查状态
     outcome = "done"
     try:
@@ -378,7 +436,15 @@ def _load(tid: str) -> Task | None:
         meta = json.loads((task_dir(tid) / "meta.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    t = Task(**{k: v for k, v in meta.items() if k in Task.__dataclass_fields__})
+    fields = {k: v for k, v in meta.items() if k in Task.__dataclass_fields__}
+    fs = fields.pop("fs", None)
+    t = Task(**fields)
+    if isinstance(fs, dict):
+        # 落盘的是纯字典,读回来要还原成 FsGrant —— 否则它会在 safe_path 里
+        # 被当成对象用,属性全不存在,而报错会出现在很远的地方。
+        t.fs = FsGrant(read=tuple(fs.get("read") or ()),
+                       write=tuple(fs.get("write") or ()),
+                       delete=bool(fs.get("delete")))
     t.messages = _repair(_load_messages(tid))
     return t
 
