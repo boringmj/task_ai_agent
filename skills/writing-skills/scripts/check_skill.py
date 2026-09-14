@@ -12,6 +12,11 @@ grep 一定漏**,尤其是"技能引用自己"那种(改自己的名字时,眼�
     python3 /skills/writing-skills/scripts/check_skill.py              # 查全部技能
     python3 /skills/writing-skills/scripts/check_skill.py <技能目录>   # 查一个
     python3 /skills/writing-skills/scripts/check_skill.py <SKILL.md>   # 查单个文件
+    python3 /skills/writing-skills/scripts/check_skill.py --graph      # 列技能间的引用关系
+
+--graph 不给"图"、给**清单**:谁引用了谁(分"资源依赖"与"仅提及"两档,强度差很多)、
+改某个技能要同步哪些地方,以及三类值得看一眼的情况 —— 互相引用(可能是在推诿)、
+被很多技能引用的枢纽、与谁都不往来的孤岛。写新技能前看一眼,能少造一个重复的。
 """
 from __future__ import annotations
 
@@ -310,10 +315,109 @@ def check_skill(skill_dir: pathlib.Path, known: set[str]) -> list[str]:
     return [f"{skill_dir.name}: {p}" if not p.startswith(skill_dir.name) else p for p in problems]
 
 
+def _refs_to_others(skill_dir: pathlib.Path, known: set[str]) -> dict[str, set[str]]:
+    """这个技能引用了谁。分两档,因为强度差得远:
+
+    - **资源引用**:`/skills/<名>/<路径>` 或"复用 X 的 `scripts/y.py`" —— 对方的文件被
+      真的用着,它一改/一挪就坏。这是**依赖**。
+    - **文字提及**:正文里出现 `某技能名` —— 只是"细节见那边"的指路,对方改名会失效,
+      但内容上并不耦合。
+    """
+    out: dict[str, set[str]] = {"资源": set(), "提及": set()}
+    md_files = [skill_dir / "SKILL.md"] if (skill_dir / "SKILL.md").exists() else []
+    md_files += list(skill_dir.rglob("references/*.md"))
+    for f in md_files:
+        try:
+            text = f.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for line in _strip_fences(text):
+            _, content = line
+            for m in CONTAINER_REF.finditer(content):
+                if m.group(1) in known and m.group(1) != skill_dir.name:
+                    out["资源"].add(m.group(1))
+            # "复用 X 的 `scripts/y.py`" 这种:同一行的资源引用算在 X 头上
+            words = [w for w in BACKTICK_WORD.findall(content) if w in known and w != skill_dir.name]
+            if words and RES_REF.search(content):
+                out["资源"].update(words)
+            else:
+                out["提及"].update(words)
+    return out
+
+
+def print_graph(root: pathlib.Path, known: set[str]) -> None:
+    """列"谁引用谁"。不画图 —— 给 agent 读的东西,清单比图有用。
+
+    重点标三种情况:
+    - **双向往来**:两个技能互相引用 —— 要么是真配合,要么是互相推诿(都说是对方的事),
+      后者会让模型两边都不管,值得人看一眼
+    - **枢纽**:被很多技能引用的 —— 改它影响面大
+    - **孤岛**:没被任何技能提到的 —— 要么独立,要么该被别处引用却漏了
+    """
+    graph = {d.name: _refs_to_others(d, known) for d in sorted(root.iterdir())
+             if d.is_dir() and (d / "SKILL.md").exists()}
+    incoming: dict[str, set[str]] = {k: set() for k in graph}
+    for src, refs in graph.items():
+        for dst in refs["资源"] | refs["提及"]:
+            incoming.setdefault(dst, set()).add(src)
+
+    print("=== 引用关系(改了对方要改这里的,是「引用方」) ===")
+    for name in sorted(graph):
+        refs = graph[name]
+        if not (refs["资源"] or refs["提及"]):
+            print(f"  {name}: (不引用任何技能)")
+            continue
+        parts = []
+        if refs["资源"]:
+            parts.append("资源依赖 → " + ", ".join(sorted(refs["资源"])))
+        if refs["提及"]:
+            parts.append("仅提及 → " + ", ".join(sorted(refs["提及"])))
+        print(f"  {name}: " + " ; ".join(parts))
+
+    print()
+    print("=== 被引用(改这个技能时要同步这些地方) ===")
+    for name in sorted(graph):
+        back = incoming.get(name, set())
+        if not back:
+            continue
+        by_res = sorted(b for b in back if name in graph[b]["资源"])
+        by_men = sorted(b for b in back if name in graph[b]["提及"] and name not in graph[b]["资源"])
+        parts = []
+        if by_res:
+            parts.append("资源依赖 ← " + ", ".join(by_res))
+        if by_men:
+            parts.append("仅提及 ← " + ", ".join(by_men))
+        print(f"  {name}: " + " ; ".join(parts))
+
+    print()
+    print("=== 值得看一眼的 ===")
+    flagged = False
+    for a in sorted(graph):
+        for b in sorted(graph[a]["资源"] | graph[a]["提及"]):
+            if a < b and a in (graph.get(b, {}).get("资源", set()) | graph.get(b, {}).get("提及", set())):
+                print(f"  ! {a} 与 {b} 互相引用 —— 检查是不是在互相推诿(都说是对方的事)")
+                flagged = True
+    for name in sorted(graph):
+        back = incoming.get(name, set())
+        if len(back) >= 3:
+            print(f"  ! {name} 被 {len(back)} 个技能引用(枢纽)—— 改它影响面大,先看上面那份清单")
+            flagged = True
+    for name in sorted(graph):
+        if not incoming.get(name) and not (graph[name]["资源"] or graph[name]["提及"]):
+            print(f"  . {name} 与其它技能没有往来(孤岛)—— 独立也正常,确认一下不是漏了引用")
+            flagged = True
+    if not flagged:
+        print("  (没有需要特别留意的)")
+
+
 def main() -> int:
     args = sys.argv[1:]
     root = _default_skills_dir()
     known = {p.name for p in root.iterdir() if p.is_dir()} if root.is_dir() else set()
+
+    if args and args[0] == "--graph":
+        print_graph(root, known)
+        return 0
 
     if not args:
         targets = sorted(p for p in root.iterdir() if p.is_dir() and (p / "SKILL.md").exists())
