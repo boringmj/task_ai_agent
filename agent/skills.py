@@ -28,13 +28,16 @@ frontmatter 用**标准 YAML**(`yaml.safe_load`),不是自己糊的简版解析�
     requires     可选。**硬依赖**:缺一个这个技能就干不了活
     optional     可选。**可选依赖**:缺了只是降级,代价可接受
 
-依赖项里 `skill` / `package` **二选一**,加上 `reason`(为什么需要它);可选依赖还要
+依赖项里 `skill` / `pip` **二选一**,加上 `reason`(为什么需要它);可选依赖还要
 `fallback`(缺了怎么办)。**这两样怎么用、写不写得出 `fallback` 意味着什么,
 见 `skills/writing-skills/SKILL.md`** —— 那是给人看的规矩,这里只负责机械地执行。
 
 **为什么只有这两种依赖**:因为只有它们能被**确切**回答"装没装" —— `skill` 看技能目录
-在不在,`package` 看容器包仓库里有没有。像「VM 里得有 node」「系统里得有 ffmpeg」这类
-外部命令,宿主查不到;与其猜一个"应该有吧",不如不设这个字段,让它写在正文里。
+在不在,`pip` 看容器包仓库里有没有。
+
+`pip` 的**范围要说死**:它查的是「有没有用 `pip --target` 装进 `/workspace/.pylibs`」,
+仅此而已。标准库、基础镜像自带的包(pip / setuptools)、npm / composer 那些、VM 里的东西,
+**一概看不见** —— 声明了它们会永远报缺,硬依赖因此假警报。所以那些写进正文,别设成字段。
 **给不出确定答案的检查,比没有检查更危险。**
 """
 from __future__ import annotations
@@ -66,7 +69,7 @@ PYLIBS = ROOT / ".pylibs"
 
 # 一个依赖项能声明的东西。二选一 —— 一个 dep 只说一件事,别混着写。
 # 只有"宿主能确切回答"的两种才配进来,理由见模块开头。
-DEP_KINDS = ("skill", "package")
+DEP_KINDS = ("skill", "pip")
 _DEP_FIELDS = set(DEP_KINDS) | {"reason", "fallback"}
 
 
@@ -123,12 +126,12 @@ def parse_deps(meta: dict, field: str) -> list[dict]:
     if raw is None or raw == []:
         return []
     if not isinstance(raw, list):
-        raise SkillError(f"{field} 要是一个列表,每项写成 `- package: 包名` 这样")
+        raise SkillError(f"{field} 要是一个列表,每项写成 `- pip: 包名` 这样")
 
     out: list[dict] = []
     for item in raw:
         if not isinstance(item, dict):
-            raise SkillError(f"{field} 里的每一项都要写成 `- package: 包名` 这样的键值对")
+            raise SkillError(f"{field} 里的每一项都要写成 `- pip: 包名` 这样的键值对")
         unknown = set(item) - _DEP_FIELDS
         if unknown:
             raise SkillError(
@@ -138,7 +141,7 @@ def parse_deps(meta: dict, field: str) -> list[dict]:
         kinds = [k for k in DEP_KINDS if item.get(k)]
         if len(kinds) != 1:
             raise SkillError(
-                f"{field} 里每一项要**恰好**声明 skill / package 中的一个,"
+                f"{field} 里每一项要**恰好**声明 skill / pip 中的一个,"
                 f"现在有 {len(kinds)} 个:{item}"
             )
         kind = kinds[0]
@@ -272,6 +275,12 @@ def _dep_lines(deps: list[dict], field: str) -> list[str]:
         head = f"- {_MARK[state]} {d['kind']} `{d['name']}` —— {d['reason']}"
         if state == "have" and d["kind"] == "skill":
             head += f"(在容器里是 {CONTAINER_SKILLS_DIR}/{d['name']}/,可以用它的资源)"
+        elif state == "missing" and d["kind"] == "pip":
+            # 说清**查的是什么**,而不是断言"没装"。宿主只能看见 .pylibs,像基础镜像自带的
+            # 包它就看不见 —— 写成"没有"是把话说过了头,而模型据此去告诉用户"做不了"。
+            head += "(容器包仓库里没找到;若是镜像本来就带的,它可能其实在)"
+            if field == "optional":
+                head += f"。缺了怎么办:{d['fallback']}"
         elif state == "missing" and field == "optional":
             head += f";缺了怎么办:{d['fallback']}"
         out.append(head)
@@ -302,7 +311,7 @@ def _dependency_note(meta: dict) -> str:
     if requires:
         lines = _dep_lines(requires, "requires")
         if any(resolve_dep(d) != "have" for d in requires):
-            parts.append("这个技能声明了**硬依赖**,下面标 `[!]` 的还没有:")
+            parts.append("这个技能声明了**硬依赖**,下面标 `[!]` 的在容器里没找到:")
             parts.append("\n".join(lines))
             parts.append(
                 "**缺硬依赖时不要换别的方法硬做,也不要用别的工具凑一个结果出来** —— "

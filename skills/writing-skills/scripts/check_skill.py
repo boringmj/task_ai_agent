@@ -51,7 +51,7 @@ BOUNDARY_HINTS = (
     "只管", "只做", "只覆盖", "仅覆盖", "限于", "限定", "覆盖",
 )
 # 依赖项的规矩 —— 和 agent/skills.py 的 parse_deps 是**同一套**。
-DEP_KINDS = ("skill", "package")
+DEP_KINDS = ("skill", "pip")
 DEP_FIELDS = set(DEP_KINDS) | {"reason", "fallback"}
 # 依赖项要能**单独拎出来读懂**,不能靠"上文" —— 哪几项会出现是加载时才定的(缺席的
 # 可选依赖根本不显示),所以「同上」很可能是一句没有上文的孤零零的话。
@@ -60,6 +60,9 @@ DEP_FIELDS = set(DEP_KINDS) | {"reason", "fallback"}
 # 这是行文质量,不是结构错误 —— 别人的技能写了「同上」,该照常能加载,不该整个报废。
 # 自检是交出去之前的把关,可以严;运行时是"再差也得能跑"。
 DEP_BACKREF = re.compile(r"^(同上|见上|如上|同前|同上所述|同\s*上|ditto|same as above)")
+# 标准库模块名(3.10+ 才有),用来拦 `pip: json` 这种 —— 它永远报缺,却看着人畜无害。
+# 基础镜像自带的包(pip / setuptools)这里查不到,只能靠 bodies 里那张表提醒。
+_STDLIB = getattr(sys, "stdlib_module_names", None)
 # 举例用的占位名,不当成真实引用 —— 按**主名**判,不看扩展名(foo.py / foo.md 都算)
 PLACEHOLDERS = {"foo", "bar", "baz", "qux", "xxx", "yyy", "name"}
 # 单字母文件名(x.py / y.md)也是写说明时常用的举例写法
@@ -164,12 +167,12 @@ def check_deps(meta: dict, known: set[str], field: str) -> list[str]:
     if raw is None or raw == []:
         return []
     if not isinstance(raw, list):
-        return [f"{field} 要是一个列表,每项写成 `- package: 包名` 这样"]
+        return [f"{field} 要是一个列表,每项写成 `- pip: 包名` 这样"]
 
     problems: list[str] = []
     for item in raw:
         if not isinstance(item, dict):
-            problems.append(f"{field} 里的每一项都要写成 `- package: 包名` 这样的键值对")
+            problems.append(f"{field} 里的每一项都要写成 `- pip: 包名` 这样的键值对")
             continue
         unknown = set(item) - DEP_FIELDS
         if unknown:
@@ -181,7 +184,7 @@ def check_deps(meta: dict, known: set[str], field: str) -> list[str]:
         kinds = [k for k in DEP_KINDS if item.get(k)]
         if len(kinds) != 1:
             problems.append(
-                f"{field} 里每一项要**恰好**声明 skill / package 中的一个,现在有 {len(kinds)} 个:{item}"
+                f"{field} 里每一项要**恰好**声明 skill / pip 中的一个,现在有 {len(kinds)} 个:{item}"
             )
             continue
         kind, name = kinds[0], str(item[kinds[0]]).strip()
@@ -204,6 +207,11 @@ def check_deps(meta: dict, known: set[str], field: str) -> list[str]:
                     f"可选依赖不显示),所以「同上」很可能是指向一句根本不在场的话。"
                     f"每条都要能单独拎出来读懂"
                 )
+        if kind == "pip" and _STDLIB is not None and name.replace("-", "_") in _STDLIB:
+            problems.append(
+                f"{field} 里的 `pip: {name}` 是**标准库**,不用装、也不该声明 —— "
+                f"宿主查的是 .pylibs 里有没有,标准库不在那儿,所以它会永远报缺"
+            )
         if kind == "skill" and name not in known:
             problems.append(f"{field} 里的 `skill: {name}` 没有这个技能(名字写错了?改名了?)")
     return problems

@@ -7,14 +7,14 @@
 | `requires` | 硬依赖 | 这个技能干不了活 |
 | `optional` | 可选依赖 | 只是降级,代价可接受 |
 
-每项写成一个键值对,`skill` / `package` 二选一,外加 `reason`;`optional` 还要 `fallback`:
+每项写成一个键值对,`skill` / `pip` 二选一,外加 `reason`;`optional` 还要 `fallback`:
 
 ```yaml
 requires:
-  - package: pyyaml
+  - pip: pyyaml
     reason: 全部规则都写在 rules/*.yaml 里,读不出来就一条都用不上
 optional:
-  - package: dulwich
+  - pip: dulwich
     reason: git 历史扫描那一步要用
     fallback: 跳过那一步,在报告「未覆盖范围」里写明 git 历史未扫
   - skill: repo-structure-analysis
@@ -29,10 +29,10 @@ optional:
 
 ```yaml
 optional:
-  - package: tree_sitter
+  - pip: tree_sitter
     reason: 用它把 PHP 解析成 AST
     fallback: 退回通用扫描器,报告里写明覆盖缺口
-  - package: tree_sitter_php
+  - pip: tree_sitter_php
     reason: 同上            # ← 只有 tree_sitter_php 装了的时候,这行就是孤零零一句
     fallback: 同上
 ```
@@ -42,17 +42,33 @@ optional:
 
 自检会拦这类值(`同上` / `见上` / `如上` / `同前` / 同上所述之类)。
 
-## 为什么只有 `package` 和 `skill` 两种
+## 为什么只有 `pip` 和 `skill` 两种
 
 因为它们能被**确切**回答"装没装":
 
-- `package` —— 看容器的包仓库(`/workspace/.pylibs`)里有没有它。技能脚本跑在容器里,
+- `pip` —— 看容器的包仓库(`/workspace/.pylibs`)里有没有它。技能脚本跑在容器里,
   所以看的是那一份,不是宿主的 Python。
 - `skill` —— 看技能目录在不在。
 
-像「VM 里得有 node」「系统里得有 ffmpeg」这类**外部命令**,宿主查不到装了没有。写进正文里
-说明,别设成字段 —— **一个给不出确定答案的检查,比没有检查更危险**:它会说"应该装了吧",
-然后你在用到它的那一刻才发现没有。
+### `pip` 管到哪儿为止
+
+它查的是**「有没有用 `pip --target` 装进 `/workspace/.pylibs`」**这一件事,仅此而已。
+范围外的**一律不要声明**:
+
+| 什么 | 查得到吗 | 怎么办 |
+| --- | --- | --- |
+| `pip install --target /workspace/.pylibs X` 装的包 | 查得到 | 用 `pip:` 声明 |
+| 标准库(`json`、`os`…) | 查不到,永远报缺 | **不用声明** —— 本来就不必装 |
+| 基础镜像自带的(`pip`、`setuptools`…) | 查不到,永远报缺 | **不用声明** —— 本来就在 |
+| npm / composer / gem / apk | 查不到,永远报缺 | 写进**正文**,别设成字段 |
+| VM 里(guest)的运行时与包 | 查不到 | 写进**正文** |
+
+后三行要留神:声明了它们**语法上完全合法、自检也放行,但会永远报缺** —— 于是硬依赖
+会假警报,让模型停下来告诉你"做不了",而其实跑得起来。
+
+像「VM 里得有 node」「系统里得有 ffmpeg」这类**外部命令**,同理:写进正文里说明,别设成
+字段 —— **一个给不出确定答案的检查,比没有检查更危险**:它会说"应该装了吧",然后你在
+用到它的那一刻才发现没有。
 
 ## 硬还是可选:分界线是「缺失的代价」
 
@@ -100,7 +116,7 @@ optional:
 
 一个"扫描报表"的技能靠 `pandas` 读 `.xlsx`:
 
-- 声明 `requires: package: pandas` —— 没有它一个报表都读不了。
+- 声明 `requires: pip: pandas` —— 没有它一个报表都读不了。
 - 要是少了它还能读 `.csv`,那就降为 `optional`,并在 `fallback` 里写明"`.xlsx` 读不了、
   `.csv` 还行"。
 

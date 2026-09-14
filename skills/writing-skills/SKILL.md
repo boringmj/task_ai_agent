@@ -2,7 +2,7 @@
 name: writing-skills
 description: 当用户想给这个 agent 增加一个新技能(或者修改已有技能),或者你想把一套固定的流程、领域知识沉淀下来复用的时候使用。它讲清了技能目录怎么写、description 该怎么措辞、markdown 格式有什么硬要求、什么样的内容才值得做成技能,以及交出去之前怎么自检。**只管「技能这个形式怎么写」** —— 写普通文档(README、报告、笔记)不必套技能的结构,那些直接写就行;技能正文里承载的领域知识也不由它负责。
 optional:
-  - package: pyyaml
+  - pip: pyyaml
     reason: "自检脚本 `scripts/check_skill.py` 靠它把 frontmatter 完整解析出来(依赖字段是列表,简化解析器读不了)"
     fallback: 自检退到内置的简化解析器,会明说「依赖字段这次没被检查」;其余检查照常
 ---
@@ -114,7 +114,7 @@ description: <什么时候该用这个技能>
 
 ```yaml
 requires:                      # 硬依赖:缺一个,这个技能就干不了活
-  - package: pyyaml
+  - pip: pyyaml
     reason: 全部规则都写在 rules/*.yaml 里,读不出来就一条都用不上
 optional:                      # 可选依赖:缺了只是降级,代价可接受
   - skill: repo-structure-analysis
@@ -122,8 +122,9 @@ optional:                      # 可选依赖:缺了只是降级,代价可接受
     fallback: 自己用 grep 手工摸依赖,慢一些且容易漏掉循环
 ```
 
-只有 `package`(容器里的 Python 包)和 `skill`(另一个技能)两种 —— 因为它们能被**确切**
-回答"装没装"。像「VM 里得有 node」这种宿主查不到的,写进正文,别设成字段。
+只有 `pip`(容器里 pip 装的 Python 包)和 `skill`(另一个技能)两种 —— 因为它们能被
+**确切**回答"装没装"。`pip` 的范围要说死:**只管 `pip install --target .pylibs` 装的那些**;
+标准库、基础镜像自带的、npm/composer 那些、VM 里的,一概查不到 —— 写进正文,别设成字段。
 
 **硬还是可选,只看一条:缺了它,这个技能还能不能给出一个诚实的结果?** 整个做不了就
 `requires`;只是某一步降级、且降级的后果说得清就 `optional`。`optional` 的每一项**必须**
