@@ -9,12 +9,16 @@ from .registry import tool
 
 
 @tool(
-    description="把一件**具体的事**派给一个子 agent 去做,拿回它的结论。"
+    description="把一件**具体的事**派给一个子 agent 去做。"
+                "**默认派完就回来**(不等它)—— 你接着干别的、或者把这一轮结束掉,把终端"
+                "还给用户;它干完了会主动通报给你。要同时铺开好几件事,连着调几次就行。"
                 "适用:需要大量阅读或反复试错的活(代码审计、结构分析、质量检查、"
                 "去混淆)、能各自独立并行的活、以及你清单里标着 **[子 agent 专用]** 的技能 —— "
                 "那些你加载不了,只能派出去。"
                 "不适用:一两步就能答完的问题、要跟用户来回商量的对话 —— 那些你自己做更快;"
                 "派活的成本是**另起一次完整对话**,小事派出去反而更贵。"
+                "**只有下一步非等它的结果不可时,才传 wait=true 干等** —— 那会把你这一轮"
+                "卡住,期间派不了第二个活、也没法把终端还给用户(用户会以为程序死了)。"
                 "task 要写清**要达到什么结果**,不要写步骤(它有自己那套技能,写步骤是替它想)。"
                 "结果会带着它的结论、产出位置、以及**它没做成的部分**一起回来 —— 那部分"
                 "是真的没做,不要当成做完了。",
@@ -33,9 +37,9 @@ from .registry import tool
             },
             "wait": {
                 "type": "boolean",
-                "description": "true(默认)= 在这儿等它干完再往下走,直接拿到结论;"
-                               "false = 派完就撒手,你继续干别的,它干完会通知你。"
-                               "要并排铺开好几件事时用 false,一次派完再等。",
+                "description": "false(默认)= 派完就撒手,它干完通报你 —— **一般都用这个**。"
+                               "true = 在这儿干等它出结果:会把你这一轮卡住"
+                               "(期间派不了别的活、终端也还不回给用户)。",
             },
             "write": {
                 "type": "array",
@@ -64,7 +68,7 @@ from .registry import tool
         "required": ["task"],
     },
 )
-def dispatch_task(task: str, vm: bool = False, wait: bool = True,
+def dispatch_task(task: str, vm: bool = False, wait: bool = False,
                   write: list | None = None, read: list | None = None,
                   allow_delete: bool = False) -> str:
     from .. import ctx, tasks
@@ -148,12 +152,13 @@ def finish_task(task_id: str, verdict: str = "accept", note: str = "") -> str:
                        "description": "你对它那个问题的答复,或者让它继续的指示。"
                                       "它挂起时问什么,上面就照什么答。"},
             "wait": {"type": "boolean",
-                     "description": "true(默认)= 等它这一轮跑完再回来;false = 撒手。"},
+                     "description": "false(默认)= 放它去跑,结果回头通报你;"
+                                    "true = 在这儿等(会卡住你这一轮)。"},
         },
         "required": ["task_id"],
     },
 )
-def resume_task(task_id: str, answer: str = "", wait: bool = True) -> str:
+def resume_task(task_id: str, answer: str = "", wait: bool = False) -> str:
     from .. import tasks
     r = tasks.resume((task_id or "").strip(), answer=answer, wait=wait)
     return r.get("message") or f"{task_id} 已经接着跑了,干完会告诉你。"
