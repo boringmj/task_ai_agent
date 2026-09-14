@@ -46,7 +46,7 @@ description: 当用户要求**设计或重新设计**一个项目的架构、目
 ### 第 2 步:现状评估
 
 - 跑 `scripts/size_report.py <目标路径>` 拿到规模数字(文件数、行数、类与函数数、最大文件、目录深度)。
-- 结构分析复用 `repo-architecture-analysis` 的 `scripts/scan_repo.py`(容器路径见那个技能说明)。
+- 结构分析复用 `repo-structure-analysis` 的 `scripts/scan_repo.py`(容器路径见那个技能说明)。
 - 需要安全视角时可借用 `repo-security-audit` 的扫描,但不要把重构报告写成安全报告。
 
 ### 第 3 步:设计目标结构

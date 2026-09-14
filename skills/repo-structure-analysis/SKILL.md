@@ -1,9 +1,9 @@
 ---
-name: repo-architecture-analysis
+name: repo-structure-analysis
 description: 当用户明确要求分析某个仓库或项目的**结构**时使用 —— 目录怎么组织、模块怎么划分、依赖关系与方向、有没有循环依赖或层次倒挂、有没有上帝模块、是否偏离了宣称的架构模式。例如「这个项目是怎么组织的」「梳理一下 xx 的模块依赖」「这仓库的结构有什么问题」。**覆盖范围就是这些结构性内容**;数据架构、部署与运行时拓扑、性能与非功能特性**不在其中**(那些需要单独分析),目标形态与改造则分别属于 repo-architecture-design(重构)和 architecture-migration(跨形态迁移)。**代码质量审查也不在里面** —— 函数复杂度与长度、命名、错误处理、资源管理、重复代码、类型与测试覆盖,那是"单个文件写得怎么样",和"模块之间怎么组织"是两个维度,一个模块划分漂亮的项目每个函数也可能是 500 行。
 ---
 
-# 仓库架构分析
+# 仓库结构分析
 
 输入通常是一个或多个工作区里的代码仓库,产出是一份**结构化的架构分析报告**:技术栈、目录职责、模块依赖、核心流程、架构模式与风险点。
 
@@ -46,7 +46,7 @@ description: 当用户明确要求分析某个仓库或项目的**结构**时使
 ### 2. 跑扫描脚本,拿到全局图景
 
 ```bash
-python /skills/repo-architecture-analysis/scripts/scan_repo.py /workspace/clones/<名字>
+python /skills/repo-structure-analysis/scripts/scan_repo.py /workspace/clones/<名字>
 ```
 
 输出一份 JSON:目录树、语言统计、构建/依赖清单文件、入口候选、最大的文件与目录、近似依赖边。
