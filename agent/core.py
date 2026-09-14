@@ -82,34 +82,61 @@ SCRATCH_DIR = ROOT / ".tmp"
 SCRATCH_MAX_AGE_DAYS = int(os.environ.get("SCRATCH_MAX_AGE_DAYS", "7"))
 
 
-def scratch_scope(who: str = "main") -> str:
-    """某个 agent 的临时区在**授权范围**里的写法(末尾斜杠 = 这是目录)。"""
-    return f".tmp/{who or 'main'}/"
+def _seg(name: str) -> str:
+    """把一段名字弄成能安全当目录名的东西。规则和 session._safe_name 一样,
+    这儿再写一遍是因为 core 不能 import session(会成环)—— 差别只在本函数是防御性的:
+    正常路径上这两个名字(会话 id、任务号)本来就是干净的。"""
+    return "".join(c for c in (name or "") if c.isalnum() or c in "-_") or "x"
 
 
-def scratch_dir(who: str = "main") -> Path:
+def scratch_scope(sid: str, who: str = "main") -> str:
+    """某个 agent 的临时区在**授权范围**里的写法(末尾斜杠 = 这是目录)。
+
+    **必须带上会话 id**:多个会话可以共用同一个工作区(那是支持的用法,见 session.py
+    里认领占用那一套),而任务号是**每个进程各自从 t1 数起**的 —— 两个会话各自派的第一
+    个活都是 t1,只按任务号分就是同一个目录:两边互相覆盖,而且是**必然撞**,不是偶发。
+    """
+    return f".tmp/{_seg(sid)}/{_seg(who)}/"
+
+
+def scratch_dir(sid: str, who: str = "main") -> Path:
     """它的临时区路径(不建目录 —— 真写的时候自然会建)。"""
-    return SCRATCH_DIR / (who or "main")
+    return SCRATCH_DIR / _seg(sid) / _seg(who)
 
 
 def purge_scratch(max_age_days: int = SCRATCH_MAX_AGE_DAYS) -> str:
     """清掉过期的临时区,返回一句给人看的说明(没清到东西就返回空串)。
 
-    只按**目录的修改时间**判,不看里面单个文件 —— 一个还在干活的 agent 的临时区会
-    不断被写,它的 mtime 自然就新。
+    布局是 `.tmp/<会话>/<谁>/`,所以要走到**叶子**那一层去判:
+    只看会话目录的 mtime 是错的 —— 一个跑了三天的会话,它的目录 mtime 停在建立那一刻,
+    而里面的活一直在写。
+
+    只按**目录的修改时间**判,不看里面单个文件:还在干活的临时区会不断被写,mtime 自然新。
     """
     if not SCRATCH_DIR.is_dir() or max_age_days <= 0:
         return ""
     cutoff = time.time() - max_age_days * 86400
     gone = 0
-    for d in SCRATCH_DIR.iterdir():
+    for sdir in SCRATCH_DIR.iterdir():
+        if not sdir.is_dir():
+            continue
         try:
-            if not d.is_dir() or d.stat().st_mtime >= cutoff:
-                continue
-            shutil.rmtree(d, ignore_errors=True)
-            gone += 1
+            leaves = [d for d in sdir.iterdir() if d.is_dir()]
         except OSError:
-            continue                  # 删不掉(被占用)不该影响启动
+            continue
+        for d in leaves:
+            try:
+                if d.stat().st_mtime < cutoff:
+                    shutil.rmtree(d, ignore_errors=True)
+                    gone += 1
+            except OSError:
+                continue              # 删不掉(被占用)不该影响启动
+        # 会话目录空了就一并收掉;还有东西(没过期的、或别人正在写)就留着
+        try:
+            if not any(sdir.iterdir()):
+                sdir.rmdir()
+        except OSError:
+            pass
     return f"清理了 {gone} 个超过 {max_age_days} 天没动过的临时区" if gone else ""
 
 # 回收站:删除的内容移到这里,不做真删除。目录本身由 trash 工具确保存在

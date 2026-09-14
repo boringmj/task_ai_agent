@@ -226,6 +226,11 @@ class Task:
     def meta(self) -> dict:
         """落盘的元信息(不含 messages —— 那个单独一行行追加)。"""
         return {"id": self.id, "prompt": self.prompt, "status": self.status,
+                # **会话要落盘。** 不记的话,重启后读回来的任务 session 是空的,它的落盘
+                # (见 _dir)和临时区就跟着"此刻谁在前台"走了 —— 而 Task.session 那段注释
+                # 说的正是"文件放哪不该取决于此刻谁在前台"。它当时没落盘,所以只对
+                # "派活那一刻"成立;多会话共用工作区时,重启后就可能指到别的会话去。
+                "session": self.session,
                 "vm": self.vm, "created": self.created, "updated": self.updated,
                 "fs": {"read": list(self.fs.read), "write": list(self.fs.write),
                        "delete": self.fs.delete, "scratch": list(self.fs.scratch)},
@@ -445,7 +450,7 @@ def dispatch(prompt: str, vm: bool = False, wait: bool = True,
     # 不能顺手给它加上一块草稿纸。
     t = Task(id=_new_id(), prompt=prompt, vm=bool(vm), awaited=bool(wait), fs=fs,
              session=_sid())
-    t.fs = replace(t.fs, scratch=(scratch_scope(t.id),))
+    t.fs = replace(t.fs, scratch=(scratch_scope(t.session, t.id),))
     t.notifier = threading.Event()
     with _LOCK:
         _TASKS[t.id] = t
@@ -1038,8 +1043,9 @@ def _load(tid: str) -> Task | None:
                        delete=bool(fs.get("delete")),
                        scratch=tuple(fs.get("scratch") or ()))
         if not t.fs.scratch:
-            # 老数据(没有 scratch 字段)按规矩补一块 —— 它的 id 就是它的那块
-            t.fs = replace(t.fs, scratch=(scratch_scope(t.id),))
+            # 老数据(没有 scratch 字段)按规矩补一块。会话取它自己的,取不到就按当前会话 ——
+            # 和 _dir() 同一个口径(那边也是 `t.session or _sid()`)。
+            t.fs = replace(t.fs, scratch=(scratch_scope(t.session or _sid(), t.id),))
     t.messages = _load_messages(tid)
     # 悬空的工具调用补上说明 —— 不补的话,续跑的第一步就是 400
     _session.repair_dangling(t.messages)

@@ -317,6 +317,25 @@ def test_recover_marks_the_dead_ones_interrupted_and_does_not_rerun_them(model):
     assert meta["status"] == "interrupted", "新状态得落盘,不然下次启动又当它是 running"
 
 
+def test_a_restart_remembers_which_session_the_task_belongs_to(model):
+    """`Task.session` 原来是**没落盘**的 —— 重启后读回来的任务 session 是空的,它的落盘
+    和临时区就跟着"此刻谁在前台"走了。
+
+    `Task.session` 那段注释写明了本意("文件放哪不该取决于此刻谁在前台"),但它只对
+    "派活那一刻"成立。多会话共用一个工作区时(支持的用法),重启后它可能指到别的会话去。
+    """
+    model.reply("干完了。")
+    tid = tasks.dispatch("干活", fs=helpers.grant(), wait=False)["task_id"]
+    helpers.wait_status(tid, ("done", "failed"))
+    sid = tasks.get(tid).session
+
+    tasks._TASKS.clear()                       # 模拟:进程重启
+    t = tasks.get(tid)
+
+    assert t.session == sid, "会话没落盘 —— 读回来的任务成了无主的"
+    assert t.fs.scratch == (f".tmp/{sid}/{tid}/",), "临时区也该认得出是哪个会话的"
+
+
 # ============================== 清单与说话 ==============================
 
 

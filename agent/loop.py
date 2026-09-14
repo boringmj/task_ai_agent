@@ -334,4 +334,9 @@ def load_system_prompt() -> str:
     prompts/commands_list.md 生成成另一条 system 消息(见 cli.main)—— 那份清单是
     程序自动生成的"数据",不该混进系统提示词正文,免得其中的描述被当成系统指令照做。
     """
-    return prompts.load("system", max_steps=MAX_STEPS)
+    from .core import scratch_scope
+    from .session import current_session_id
+    # 临时区**按会话分**(见 core.scratch_scope):多会话可以共用一个工作区,而任务号
+    # 是每个进程各自从 t1 数起的 —— 只按任务号分的话两个会话会撞在同一个目录上。
+    return prompts.load("system", max_steps=MAX_STEPS,
+                        scratch=scratch_scope(current_session_id(), "main"))

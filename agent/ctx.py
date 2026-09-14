@@ -31,11 +31,6 @@ def _empty_usage() -> dict:
 
 FS_ANY = "*"        # 通配:整个工作区
 
-# 主 agent 的临时区(相对工作区,末尾斜杠 = 目录)。**和 core.scratch_scope("main")
-# 是同一个值** —— 这里写成字面量,是为了让 ctx 保持"叶子模块"(它不去 import core,
-# 理由见 out() 那段:core 会把 openai 客户端、工作区解析一串拖进来)。两边一致由测试钉住。
-MAIN_SCRATCH = ".tmp/main/"
-
 
 @dataclass
 class FsGrant:
@@ -57,8 +52,8 @@ class FsGrant:
     # 28KB 的 raw.json 倒进了 .pylibs,和装好的包混在一起)。
     #
     # **为什么不并进 write,而是单开一个字段**:
-    #   · 并进 write 会让它参与"两个 agent 是不是撞车"的判定 —— 而临时区是**按 agent
-    #     分开**的(.tmp/<谁>/),本来就不该撞;
+    #   · 并进 write 会让它参与"两个 agent 是不是撞车"的判定 —— 而临时区是**按
+    #     "会话 + 谁"分开**的(.tmp/<会话>/<谁>/,见 core.scratch_scope),本来就不该撞;
     #   · 并进 write 还会顺带给出**删除**权(删是跟着 write 范围走的),那等于为了给
     #     一块草稿纸,把它交付目录里的东西也变成可删的。
     scratch: tuple = ()
@@ -69,14 +64,16 @@ class FsGrant:
         return cls(read=(FS_ANY,), write=(FS_ANY,), delete=True)
 
     @classmethod
-    def for_main(cls) -> "FsGrant":
-        """主 agent 的:`full()` 再加一块**指定的**临时区。
+    def for_main(cls, scratch: str) -> "FsGrant":
+        """主 agent 的:`full()` 再加一块**指定的**临时区(路径由调用方算,见 core.scratch_scope)。
 
         它本来就哪儿都能写,所以这不是"权限"问题 —— 是**没个指定的地方,临时文件
         就全凭当时心情放**(实测:一份 28KB 的中间产物落在了 .pylibs 里)。
+
+        路径**不带默认值**:它跟着当前会话走,而"当前会话"是会变的(/switch)——
+        给个默认值就等于把"哪会儿算出来的"藏起来,那种 bug 最难查。
         """
-        return cls(read=(FS_ANY,), write=(FS_ANY,), delete=True,
-                   scratch=(MAIN_SCRATCH,))
+        return cls(read=(FS_ANY,), write=(FS_ANY,), delete=True, scratch=(scratch,))
 
     @staticmethod
     def _within(rel: str, scopes: tuple) -> bool:
@@ -166,9 +163,9 @@ class AgentCtx:
     vm_grant: bool = False
     # 能读写哪儿。默认**不限制** —— 这一条是给"主 agent 和独立调用"用的兼容默认值。
     # 子 agent **必须**由 tasks.py 显式给一份受限的,那里是唯一的入口。
-    # 默认那份顺带带上 `.tmp/main/`(见 FsGrant.for_main)—— 主 agent 哪儿都能写,
-    # 给它指定一块是为了**别乱放**,而不是为了多给权限。
-    fs: FsGrant = field(default_factory=FsGrant.for_main)
+    # 主 agent 的临时区由 cli 显式设上(FsGrant.for_main(路径))—— 它跟着**当前会话**
+    # 走,而"当前会话"在这儿还解析不出来(那要 import session,而 ctx 是叶子模块)。
+    fs: FsGrant = field(default_factory=FsGrant.full)
 
     # ---- 轮次级状态(原来散在各模块的全局变量里)----
     # 待注入的图片 data URL,img 工具跑过就填,下一轮请求前注入进对话

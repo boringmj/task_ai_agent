@@ -9,8 +9,9 @@
 
   · **单独一个字段、不并进 `write`** —— 并进去会让它参与"两个 agent 撞车"的判定,
     也会顺带把交付目录的删除权放开;
-  · **按 agent 分开**(`.tmp/<任务号>/`)—— 几个子 agent 并排跑时,共用一块就等于
-    把它们又放回"改同一批文件"的处境;
+  · **按"会话 + 谁"分开**(`.tmp/<会话>/<任务号>/`)—— 几个子 agent 并排跑时,共用一块
+    就等于把它们又放回"改同一批文件"的处境;**会话那一层不能省**:任务号是每个进程各自
+    从 t1 数起的,多会话共用工作区时两个 t1 会撞在同一个目录上(必然是撞,不是偶发);
   · **删只在自己那一块里放开** —— 临时产物本来就该边跑边清,但绝不能碰到交付物。
 """
 from __future__ import annotations
@@ -22,6 +23,11 @@ import helpers
 import pytest
 from agent import core, tasks
 from agent.ctx import AgentCtx, FsGrant, use
+
+
+def _scope(tid: str, sid: str | None = None) -> str:
+    """这个任务在某个会话下的临时区写法(路径里带会话 id,见 core.scratch_scope)。"""
+    return core.scratch_scope(sid or tasks._sid(), tid)
 
 # ============================== 权限语义 ==============================
 
@@ -44,10 +50,13 @@ def test_the_scratch_is_deletable_but_only_inside_itself():
 
 
 def test_the_scratch_does_not_swallow_a_sibling_agent():
-    """按 agent 分开:`.tmp/t2/` 盖不到 `.tmp/t3/`,也盖不到 `.tmp/` 这个根。"""
-    g = FsGrant(read=("*",), write=(), scratch=(".tmp/t2/",))
-    assert g.allows(".tmp/t2/a/b.json", "write")
-    assert not g.allows(".tmp/t3/raw.json", "write"), "别人的草稿纸"
+    """按"会话 + 谁"分开:`.tmp/s1/t2/` 盖不到同会话的 `.tmp/s1/t3/`,
+    **更盖不到另一个会话里那个同号的 `.tmp/s2/t2/`** —— 后者正是多会话共用工作区时会撞的那个。"""
+    g = FsGrant(read=("*",), write=(), scratch=(".tmp/s1/t2/",))
+    assert g.allows(".tmp/s1/t2/a/b.json", "write")
+    assert not g.allows(".tmp/s1/t3/raw.json", "write"), "同一个会话里别人的草稿纸"
+    assert not g.allows(".tmp/s2/t2/raw.json", "write"), "另一个会话里同号的那个"
+    assert not g.allows(".tmp/s1/main/x.json", "write"), "主 agent 那块也不归它"
     assert not g.allows(".tmp", "write")
     assert not g.allows(".tmpx/a.json", "write")
 
@@ -67,18 +76,32 @@ def test_a_refused_write_points_at_the_scratch():
 
 
 def test_the_main_agent_has_its_own_named_scratch():
-    """主 agent 本来就哪儿都能写,给它指定一块是为了**别乱放** —— 不说的话全凭当时心情。"""
-    assert FsGrant.for_main().scratch == (".tmp/main/",)
-    assert AgentCtx(role="main").fs.scratch == (".tmp/main/",), "默认就是主 agent 的授权"
-    # 子 agent 不用看这里的默认值:它的授权**必须**由 tasks.dispatch 显式给
-    # (见 test_every_task_brings_its_own_scratch)—— 默认那份是给"没人在场的独立调用"的。
+    """主 agent 本来就哪儿都能写,给它指定一块是为了**别乱放** —— 不说的话全凭当时心情。
+
+    路径**由调用方算**(不带默认值):它跟着当前会话走,而"当前会话"是会变的(/switch)。
+    给个默认值就等于把"哪会儿算出来的"藏起来,那种 bug 最难查。
+    """
+    assert FsGrant.for_main(".tmp/s1/main/").scratch == (".tmp/s1/main/",)
+    assert AgentCtx(role="main").fs.scratch == (), \
+        "AgentCtx 的默认授权不指定临时区 —— 主 agent 那份由 cli 显式设上(那时才解析得出会话)"
 
 
-def test_the_two_definitions_of_the_main_scratch_agree():
-    """`.tmp/main/` 在两处各写了一遍(`ctx.MAIN_SCRATCH` 是字面量,`core.scratch_scope`
-    算出来的)—— ctx 要保持叶子模块不 import core,所以只能这样。**两边一致由这条钉住。**"""
-    assert core.scratch_scope("main") == AgentCtx(role="main").fs.scratch[0]
-    assert core.scratch_scope("t2") == ".tmp/t2/"
+def test_the_scratch_is_scoped_by_session():
+    """**这是多会话共用工作区时唯一站得住的分法**:任务号是每个进程各自从 t1 数起的,
+    两个会话各自派的第一个活都是 t1 —— 只按任务号分,它们就是同一个目录。"""
+    assert core.scratch_scope("s1", "t1") == ".tmp/s1/t1/"
+    assert core.scratch_scope("s2", "t1") == ".tmp/s2/t1/"
+    assert core.scratch_scope("s1", "t1") != core.scratch_scope("s2", "t1")
+    assert core.scratch_scope("s1", "main") == ".tmp/s1/main/"
+
+
+@pytest.mark.parametrize("bad", ["../../etc", "a/b", "a\\b", "", "."])
+def test_a_session_id_cannot_climb_out_of_the_tmp_dir(bad):
+    """会话 id 正常是 12 位 hex,但 meta.json 是**可以被人手改的** —— 这条是防御性的:
+    不管里面写了什么,拼出来的路径都落在 `.tmp/` 底下。"""
+    scope = core.scratch_scope(bad, "t1")
+    assert scope.startswith(".tmp/") and ".." not in scope
+    assert core.scratch_dir(bad, "t1").is_relative_to(core.SCRATCH_DIR)
 
 
 # ============================== 派活时自动带上 ==============================
@@ -90,7 +113,7 @@ def test_every_task_brings_its_own_scratch(model):
                          wait=False)["task_id"]
     t = helpers.wait_status(tid, ("done", "failed"))
 
-    assert t.fs.scratch == (f".tmp/{tid}/",), "每块活都该自带一块草稿纸"
+    assert t.fs.scratch == (_scope(tid),), "每块活都该自带一块草稿纸"
     assert t.fs.write == ("reports/",), \
         "草稿纸**不并进 write** —— 并进去会连撞车判定一起卷进来"
 
@@ -104,8 +127,8 @@ def test_the_scratch_does_not_widen_the_write_scope(model):
     c = AgentCtx(role="sub", task_id=tid, fs=t.fs)
 
     with use(c):
-        assert core.safe_path(f".tmp/{tid}/raw.json", "write").name == "raw.json"
-        assert core.safe_path(f".tmp/{tid}/raw.json", "delete").name == "raw.json"
+        assert core.safe_path(_scope(tid) + "raw.json", "write").name == "raw.json"
+        assert core.safe_path(_scope(tid) + "raw.json", "delete").name == "raw.json"
         assert core.safe_path("reports/a.md", "write").name == "a.md"
         with pytest.raises(PermissionError):
             core.safe_path("notes/a.md", "write")
@@ -114,8 +137,9 @@ def test_the_scratch_does_not_widen_the_write_scope(model):
 def test_a_subagent_actually_writes_a_temp_file_end_to_end(model, workspace):
     """真跑一遍:它把中间产物写进草稿纸,文件**真出现在磁盘上**。"""
     assert tasks._new_id() == "t1", "这条测试假设任务号从头开始(autouse fixture 会清表)"
+    target = _scope("t1") + "raw.json"          # 路径里带会话 id,派活前就能算出来
     model.set(("先落个中间产物。",
-               [model.call("write_file", path=".tmp/t1/raw.json", content='{"a":1}')], ""),
+               [model.call("write_file", path=target, content='{"a":1}')], ""),
               ("落好了。", [], ""))
     tid = tasks.dispatch("扫一遍", fs=helpers.grant(write=["reports/"]),
                          wait=False)["task_id"]
@@ -123,7 +147,7 @@ def test_a_subagent_actually_writes_a_temp_file_end_to_end(model, workspace):
     t = helpers.wait_status(tid, ("done", "failed"))
     assert t.status == "done", f"实际 {t.status},error={t.error!r}"
 
-    assert (workspace / ".tmp" / "t1" / "raw.json").is_file(), "中间产物没落下去"
+    assert (workspace / _scope("t1") / "raw.json").is_file(), "中间产物没落下去"
     assert not (workspace / ".pylibs").exists(), "不该再往 pip 的包目录里倒了"
 
 
@@ -137,8 +161,8 @@ def test_the_subagent_is_told_where_its_scratch_is(model):
     prompt = t.messages[0]["content"]
     # 断言整句,而不是"里面有没有这几个字符":容器路径 `/workspace/.tmp/t1/` 天然包含
     # `.tmp/t1/`,光比对子串的话**宿主那条不写也照样通过**(实测漏过一次)。
-    assert f"中间产物有指定的地方:`.tmp/{tid}/`**" in prompt, "没告诉它草稿纸在哪儿"
-    assert f"/workspace/.tmp/{tid}/" in prompt, "容器里同一个位置,不说它就只会写 /tmp"
+    assert f"中间产物有指定的地方:`{_scope(tid)}`**" in prompt, "没告诉它草稿纸在哪儿"
+    assert f"/workspace/{_scope(tid)}" in prompt, "容器里同一个位置,不说它就只会写 /tmp"
     assert "别把产物放进去" in prompt, "pip 的包目录那条也得说清"
 
 
@@ -150,7 +174,94 @@ def test_the_details_show_the_scratch(model):
 
     out = tasks.show(tid)
 
-    assert "临时区" in out and f".tmp/{tid}/" in out
+    assert "临时区" in out and _scope(tid) in out
+
+
+# ============================== 多会话共用一个工作区 ==============================
+
+
+def test_two_sessions_never_share_a_scratch(model, monkeypatch):
+    """**用户报的漏洞**:多个会话共用一个工作区时,`.tmp/<任务号>/` 会撞。
+
+    撞的方式是**必然**的,不是偶发:任务号由每个进程各自从 t1 数起(`_new_id`),
+    两个会话派的第一块活都是 t1。这条测试就照这个来 —— 清空任务表模拟第二个进程,
+    于是两边都拿到 t1,再看它们的草稿纸是不是同一个。
+    """
+    model.reply("干完了。")
+    first = tasks.dispatch("会话 A 的活", fs=helpers.grant(write=["reports/"]),
+                           wait=False)["task_id"]
+    helpers.wait_status(first, ("done", "failed"))
+    scope_a = tasks.get(first).fs.scratch[0]
+
+    tasks._TASKS.clear()                       # 模拟:另一个终端/进程,另一个会话
+    monkeypatch.setattr(tasks, "_sid", lambda: "另一个会话的id")
+    second = tasks.dispatch("会话 B 的活", fs=helpers.grant(write=["reports/"]),
+                            wait=False)["task_id"]
+    helpers.wait_status(second, ("done", "failed"))
+    scope_b = tasks.get(second).fs.scratch[0]
+
+    assert first == second == "t1", "前提:两边都是各自的第一个活(所以才会撞)"
+    assert scope_a != scope_b, f"两个会话的草稿纸撞在一起了:{scope_a}"
+    assert ".tmp/另一个会话的id/t1/" == scope_b
+
+
+def test_a_task_from_another_session_is_not_writable(model, monkeypatch):
+    """不只是"目录不同",**权限上也得真的隔开** —— 否则另一个会话能改它的中间产物。"""
+    model.reply("干完了。")
+    tid = tasks.dispatch("本会话的活", fs=helpers.grant(), wait=False)["task_id"]
+    t = helpers.wait_status(tid, ("done", "failed"))
+
+    theirs = core.scratch_scope("别的会话", "t1")
+    with use(AgentCtx(role="sub", task_id=tid, fs=t.fs)):
+        with pytest.raises(PermissionError):
+            core.safe_path(theirs + "raw.json", "write")
+
+
+def test_the_main_scratch_follows_the_session(monkeypatch):
+    """主 agent 的草稿纸**跟着会话走**。它是在 cli 启动时算一次的 —— 换了会话不重算的话,
+    它还指着上一段的目录:路径照样能写,**只是写进了别人的地盘**(静默的那种错)。"""
+    from agent import cli, session as store
+
+    monkeypatch.setattr(store, "SESSIONS_DIR", cli.ROOT.parent / "sessions-x")
+    monkeypatch.setattr(store, "_current_session", None)
+    monkeypatch.setattr(store, "_resolve_note", "")
+
+    assert cli._main_grant().scratch == (core.scratch_scope(store.current_session_id(),
+                                                            "main"),)
+    old = store.current_session_id()
+    store.set_current_session("另一个会话")
+    assert cli._main_grant().scratch == (".tmp/另一个会话/main/",)
+    assert old not in cli._main_grant().scratch[0]
+
+
+def test_switching_sessions_actually_moves_it(monkeypatch):
+    """**真正会坏的那条路**:`/switch` 之后主 agent 那份授权得跟着换。
+
+    它是启动时算一次的(见 cli._main_grant)—— 切走之后不换,它还指着上一段的目录。
+    而"当前会话"是会变的、`/switch` 是**命令行**触发的,所以要有一条走命令层的测试,
+    光测那个函数算不对是看不出来的。
+    """
+    from agent import ctx as agent_ctx
+    from agent import session as store
+    from agent.commands import Context, dispatch as cmd
+    from agent.tools import vm as vm_tools
+
+    monkeypatch.setattr(store, "_current_session", None)
+    monkeypatch.setattr(store, "_resolve_note", "")
+    monkeypatch.setattr(vm_tools, "VM_AUTOSTART", False)   # 别在测试里真去起虚拟机
+
+    start = core.scratch_scope(store.current_session_id(), "main")
+    ctx_ = Context(messages=[{"role": "system", "content": "x"}])
+    with use(AgentCtx(role="main", fs=FsGrant.for_main(start))):
+        cmd("/switch new", ctx_)
+
+        now = store.current_session_id()
+        assert now != start.split("/")[1], "前提:确实换了一个会话"
+        assert agent_ctx.current().fs.scratch == (core.scratch_scope(now, "main"),), \
+            "切了会话,主 agent 的草稿纸还指着上一个"
+        # 提示词那一头也要跟上 —— 授权换了但提示词还说旧的,它就照旧往旧目录写
+        notice = ctx_.messages[-1]["content"]
+        assert core.scratch_scope(now, "main") in notice, "切换提示里也要说清新的是哪块"
 
 
 # ============================== 存下来、读回来 ==============================
@@ -166,7 +277,7 @@ def test_the_scratch_survives_a_restart(model):
     tasks._TASKS.clear()                       # 模拟:进程重启,内存里的都没了
     t = tasks.get(tid)
 
-    assert t.fs.scratch == (f".tmp/{tid}/",)
+    assert t.fs.scratch == (_scope(tid),)
 
 
 def test_an_old_task_without_a_scratch_gets_one_on_load(model):
@@ -181,7 +292,7 @@ def test_an_old_task_without_a_scratch_gets_one_on_load(model):
     meta.write_text(raw, encoding="utf-8")
     tasks._TASKS.clear()
 
-    assert tasks.get("t8").fs.scratch == (".tmp/t8/",)
+    assert tasks.get("t8").fs.scratch == (_scope("t8"),)
     assert _session  # (留着这个引用,免得 pyflakes 说未使用)
 
 
@@ -225,8 +336,8 @@ def test_git_ignores_the_scratch(workspace):
 def test_only_the_stale_scratch_areas_are_purged(monkeypatch, tmp_path):
     """按天清、不立刻删:出了事要回头看当时产出的中间文件,那正是排错时最想要的。"""
     monkeypatch.setattr(core, "SCRATCH_DIR", tmp_path / ".tmp")
-    old = core.scratch_dir("t1")
-    fresh = core.scratch_dir("t2")
+    old = core.scratch_dir("sess-a", "t1")
+    fresh = core.scratch_dir("sess-a", "t2")
     for d in (old, fresh):
         d.mkdir(parents=True)
         (d / "raw.json").write_text("{}", encoding="utf-8")
@@ -242,7 +353,7 @@ def test_only_the_stale_scratch_areas_are_purged(monkeypatch, tmp_path):
 
 def test_purging_is_off_when_the_age_is_zero(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "SCRATCH_DIR", tmp_path / ".tmp")
-    d = core.scratch_dir("t1")
+    d = core.scratch_dir("sess-a", "t1")
     d.mkdir(parents=True)
     assert core.purge_scratch(0) == ""
     assert d.exists(), "0 天 = 关掉清理,不能变成清空全部"

@@ -140,10 +140,18 @@ def cmd_switch(ctx: Context) -> str:
         kept += 1
     del ctx.messages[kept:]
     ctx.messages.extend(hist)
+    # 临时区**跟着会话走**,切完要一起换。不换的话它还指着上一个会话的目录 ——
+    # 那是个**静默**的错:路径照样能写,只是写进了别人的地盘(而多会话共用工作区是支持的用法)。
+    from .. import ctx as agent_ctx
+    from ..core import scratch_scope
+    from ..ctx import FsGrant
+    new_scratch = scratch_scope(target, "main")
+    agent_ctx.current().fs = FsGrant.for_main(new_scratch)
     ctx.messages.append({
         "role": "system",
         "content": prompts.load("switch_notice", session=target,
-                                note="(新建的)" if creating else ""),
+                                note="(新建的)" if creating else "",
+                                scratch=new_scratch),
     })
 
     # **先把旧会话的子 agent 停掉。** 它们是在那段对话的上下文里派的活,结果也只通报给

@@ -18,7 +18,9 @@ from .core import (
     TRASH_MAX_AGE_DAYS,
     console,
     purge_scratch,
+    scratch_scope,
 )
+from .ctx import FsGrant
 from .commands import Context as CommandContext
 from .commands import all_commands, dispatch as dispatch_command
 from .commands import system_message as commands_system_message
@@ -351,7 +353,7 @@ def main() -> None:
     (见 agent/ctx.py)—— 整个会话——包括工具调用——必须跑在**主 agent 那个上下文里**,
     否则它们会落到 ctx 的兜底上下文上,用量统计和搜索配额就都不生效了。
     """
-    with ctx.use(ctx.AgentCtx(role="main")):
+    with ctx.use(ctx.AgentCtx(role="main", fs=_main_grant())):
         _session_loop()
 
 
@@ -372,6 +374,16 @@ def _exit_or_detach() -> bool:
     console.print(f"(刚才在接管 {was} —— /exit 先退到主终端。"
                   f"真要退出程序,再敲一次 /exit。)", style="dim")
     return False
+
+
+def _main_grant() -> FsGrant:
+    """主 agent 的授权:不限制 + 一块**跟着当前会话**走的临时区。
+
+    路径每次现算,不缓存 —— 会话是会变的(`/switch`),而"存下来以后再用"在这个项目里
+    踩过三次(见 session.current_session_id 的说明)。切换时由 `cmd_switch` 直接换掉
+    上下文里那一份(它知道新会话是谁,而这一层不知道什么时候会切)。
+    """
+    return FsGrant.for_main(scratch_scope(current_session_id(), "main"))
 
 
 def _session_loop() -> None:
