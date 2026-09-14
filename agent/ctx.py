@@ -54,11 +54,25 @@ class FsGrant:
 
     @staticmethod
     def _within(rel: str, scopes: tuple) -> bool:
+        """在不在这些范围里。
+
+        **范围是不是目录,由末尾那个 `/` 说了算,不看文件系统:**
+
+        - `reports/`(带斜杠)→ 目录,它下面的一切都算
+        - `notes/plan.md`(不带)→ 文件,**只算它自己**
+
+        为什么不让"它现在是什么"来决定:那样同一个范围会随磁盘状态变意思 —— 文件还没
+        建出来的时候判一次、建出来之后再判一次,结果不一样。而且**判成目录是放宽、
+        判成文件是收紧**,凭猜的话猜错方向就是多给了权限。写清楚是唯一安全的路。
+        """
         for s in scopes:
             if s == FS_ANY:
                 return True
-            s = s.rstrip("/")
-            if rel == s or rel.startswith(s + "/"):
+            if s.endswith("/"):               # 目录:整个子树
+                base = s.rstrip("/")
+                if rel == base or rel.startswith(base + "/"):
+                    return True
+            elif rel == s:                    # 文件:只有它自己
                 return True
         return False
 
@@ -72,6 +86,17 @@ class FsGrant:
             # 范围是"允许在哪",两件事都成立才行。
             return self.delete and self._within(rel, self.write)
         return False
+
+    @staticmethod
+    def covers(a: str, b: str) -> bool:
+        """`a` 这个范围包不包得住 `b` 这个范围(或者那份文件)。给重叠检测用。"""
+        if a == FS_ANY:
+            return True
+        if a.endswith("/"):
+            base = a.rstrip("/")
+            b2 = b.rstrip("/") if b.endswith("/") else b
+            return b2 == base or b2.startswith(base + "/")
+        return a == b
 
     def explain(self, rel: str, mode: str) -> str:
         what = {"read": "读", "write": "写", "delete": "删除或移动"}.get(mode, mode)

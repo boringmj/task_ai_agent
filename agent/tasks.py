@@ -184,20 +184,13 @@ def _running_count() -> int:
 
 
 def _overlap(a: tuple, b: tuple) -> bool:
-    """两片写范围有没有交集。
+    """两片写范围有没有交集(任一方盖住另一方,就算撞上)。
 
-    两个路径只要一个是另一个的前缀就算重叠(`reports` 和 `reports/x.md`)—— 粗一点没关系,
     **宁可误拦也不要放过**:误拦的代价是"换个范围重派",放过的代价是两个 agent 同时改
-    同一批文件,而且改完谁也不知道(不报错,只是结果对不上)。
+    同一批文件,而且改完谁也不知道(不报错,只是结果对不上)。范围语义见
+    `FsGrant._within` —— 带 `/` 是目录,不带是文件。
     """
-    for x in a:
-        for y in b:
-            if x == FS_ANY or y == FS_ANY:
-                return True
-            x, y = x.rstrip("/"), y.rstrip("/")
-            if x == y or x.startswith(y + "/") or y.startswith(x + "/"):
-                return True
-    return False
+    return any(FsGrant.covers(x, y) or FsGrant.covers(y, x) for x in a for y in b)
 
 
 def conflict_for(rel: str, exclude: str = "") -> str:
@@ -217,13 +210,7 @@ def conflict_for(rel: str, exclude: str = "") -> str:
 
 
 def _within(rel: str, scopes: tuple) -> bool:
-    for s in scopes:
-        if s == FS_ANY:
-            return True
-        s = s.rstrip("/")
-        if rel == s or rel.startswith(s + "/"):
-            return True
-    return False
+    return FsGrant._within(rel, scopes)
 
 
 def _build_messages(t: Task) -> list[dict]:
@@ -314,6 +301,13 @@ def _run(t: Task) -> None:
         _save(t)
         if outcome == "done" and not t.awaited:
             _notify(t)
+        # 花了多少,给**人**看,不给主 agent —— 报告里那句"12 次请求 / 8400 tokens"是
+        # 纯账目,主 agent 拿它做不了任何决定,却要为它把整段上下文重发一遍。
+        try:
+            ctx.out().print(f"{t.id} [{t.status}] {_cost_line(t)}",
+                            style="dim", markup=False)
+        except Exception:  # noqa: BLE001
+            pass
         t.notifier.set()
 
 
@@ -391,7 +385,7 @@ def report(t: Task) -> dict:
             f"还是自己接手、或者放弃。"
         )}
     return {"status": "done", "task_id": t.id, "message": (
-        f"[子 agent {t.id} 完成] {_cost_line(t)}\n\n{_clip(t.result, t)}"
+        f"[子 agent {t.id} 完成]\n\n{_clip(t.result, t)}"
     )}
 
 

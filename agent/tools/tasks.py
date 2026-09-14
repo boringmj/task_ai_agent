@@ -41,9 +41,11 @@ from .registry import tool
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "允许它**写**哪些路径(相对工作区)。**不填就等于不许写任何文件**。"
-                               "一般是写目录(如 [\"reports\"]);要精确到单个文件就写文件名"
-                               "([\"notes/plan.md\"])。路径不存在时会被建出来 ——"
-                               "**有文件后缀的当文件建,其余当目录建**,建了什么会告诉你。"
+                               "**末尾的 `/` 决定是目录还是文件,必须写清**:目录写"
+                               "[\"reports/\"],单个文件写 [\"notes/plan.md\"]。"
+                               "**不带斜杠一律当文件** —— write=[\"reports\"] 是建一个叫"
+                               "reports 的**文件**,不是目录。方向是宁可少给:判成文件只是"
+                               "写不进去,判成目录是悄悄多给一片权限。"
                                "写范围必须给窄:并排派好几个时,两个范围撞上会被直接拒掉 ——"
                                "同时改一处,改完不报错、只是结果对不上,事后查不出是谁改的。",
             },
@@ -65,19 +67,22 @@ from .registry import tool
 def dispatch_task(task: str, vm: bool = False, wait: bool = True,
                   write: list | None = None, read: list | None = None,
                   allow_delete: bool = False) -> str:
-    from .. import tasks
+    from .. import ctx, tasks
     from ..ctx import FS_ANY, FsGrant
     from .container import prepare_scopes
     fs = FsGrant(read=tuple(read) if read else (FS_ANY,),
                  write=tuple(write or ()),
                  delete=bool(allow_delete))
-    # 范围不存在的话先建出来 —— 顺手把"按什么建的"回报给主 agent。
-    # 建早了才能早发现:等子 agent 在容器里撞上 Read-only 再说,中间已经隔着一层报告了。
-    notes = prepare_scopes(fs.write) if fs.write else []
+    # 范围不存在就先建出来(建早了才早发现)。但那些说明**只打到终端**:
+    # 每向主 agent 说一句话,它整段上下文就要重发一遍模型 —— 边角信息不值得那个价。
+    for note in prepare_scopes(fs.write) if fs.write else []:
+        try:
+            ctx.out().print(f"! {note}", style="dim", markup=False)
+        except Exception:      # noqa: BLE001 - 提示打不出来不该拦住派活
+            pass
     r = tasks.dispatch(task, vm=vm, wait=wait, fs=fs)
-    tail = ("\n\n另外:" + ";".join(notes)) if notes else ""
-    return (r.get("message") or (f"已派给 {r['task_id']},它在后台跑。"
-                                 f"用 task_status 看进展;干完我会告诉你。")) + tail
+    return r.get("message") or (f"已派给 {r['task_id']},它在后台跑。"
+                                f"用 task_status 看进展;干完我会告诉你。")
 
 
 @tool(
