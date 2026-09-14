@@ -31,6 +31,11 @@ def _empty_usage() -> dict:
 
 FS_ANY = "*"        # 通配:整个工作区
 
+# 主 agent 的临时区(相对工作区,末尾斜杠 = 目录)。**和 core.scratch_scope("main")
+# 是同一个值** —— 这里写成字面量,是为了让 ctx 保持"叶子模块"(它不去 import core,
+# 理由见 out() 那段:core 会把 openai 客户端、工作区解析一串拖进来)。两边一致由测试钉住。
+MAIN_SCRATCH = ".tmp/main/"
+
 
 @dataclass
 class FsGrant:
@@ -46,11 +51,32 @@ class FsGrant:
     # 删除/移动要**单独**开:写坏一个文件还能改回来,删掉就没了。
     # 这两件事不该共用一个"写"权限。
     delete: bool = False
+    # **临时区**:一块永远可写、也随便删的草稿纸(见 core.scratch_scope)。
+    # 技能脚本要产出中间文件(扫描的原始输出、抽出来的样本),而它的写范围常常只有
+    # "报告目录"那么窄 —— 没有指定的地方,它就会往唯一能写的地方倒(实测:一份
+    # 28KB 的 raw.json 倒进了 .pylibs,和装好的包混在一起)。
+    #
+    # **为什么不并进 write,而是单开一个字段**:
+    #   · 并进 write 会让它参与"两个 agent 是不是撞车"的判定 —— 而临时区是**按 agent
+    #     分开**的(.tmp/<谁>/),本来就不该撞;
+    #   · 并进 write 还会顺带给出**删除**权(删是跟着 write 范围走的),那等于为了给
+    #     一块草稿纸,把它交付目录里的东西也变成可删的。
+    scratch: tuple = ()
 
     @classmethod
     def full(cls) -> "FsGrant":
-        """不限制。主 agent 和"没人在场的独立调用"用这个。"""
+        """不限制,连临时区都没指定。给"没人在场的独立调用"和测试用。"""
         return cls(read=(FS_ANY,), write=(FS_ANY,), delete=True)
+
+    @classmethod
+    def for_main(cls) -> "FsGrant":
+        """主 agent 的:`full()` 再加一块**指定的**临时区。
+
+        它本来就哪儿都能写,所以这不是"权限"问题 —— 是**没个指定的地方,临时文件
+        就全凭当时心情放**(实测:一份 28KB 的中间产物落在了 .pylibs 里)。
+        """
+        return cls(read=(FS_ANY,), write=(FS_ANY,), delete=True,
+                   scratch=(MAIN_SCRATCH,))
 
     @staticmethod
     def _within(rel: str, scopes: tuple) -> bool:
@@ -77,6 +103,12 @@ class FsGrant:
         return False
 
     def allows(self, rel: str, mode: str) -> bool:
+        # 临时区**三样都算数**(读、写、删)。它是草稿纸:自己那一块里随便折腾,
+        # 出界了就照旧按上面的规矩判 —— 那才是"范围"要守的地方。
+        # 删也放开的理由:临时产物本来就该边跑边清,不给删的话它会越堆越多,
+        # 而"删"在这里的作用域只有它自己那一块,**不碰任何交付物**。
+        if self._within(rel, self.scratch):
+            return True
         if mode == "read":
             return self._within(rel, self.read)
         if mode == "write":
@@ -107,7 +139,11 @@ class FsGrant:
         else:
             scope = "、".join(self.write or self.read) or "(空)"
             why = f"你被允许的范围是:{scope},`{rel}` 不在里面"
-        return f"拒绝{what} `{rel}`:{why}。" + (
+        # **先给出临时区** —— 被拒时它正急着找个地方写,而"能写的地方"这句话里要是
+        # 没有草稿纸,它就会去别处找(实测:倒进了 .pylibs)。给了路,它就不用绕。
+        tip = f"纯中间产物写 {self.scratch[0]} 就行(那是给你的草稿纸,随便用)。" \
+            if self.scratch else ""
+        return f"拒绝{what} `{rel}`:{why}。" + tip + (
             "如果确实需要,**用 suspend 向主 agent 申请**,别绕。"
             if self.write != (FS_ANY,) else "")
 
@@ -130,7 +166,9 @@ class AgentCtx:
     vm_grant: bool = False
     # 能读写哪儿。默认**不限制** —— 这一条是给"主 agent 和独立调用"用的兼容默认值。
     # 子 agent **必须**由 tasks.py 显式给一份受限的,那里是唯一的入口。
-    fs: FsGrant = field(default_factory=FsGrant.full)
+    # 默认那份顺带带上 `.tmp/main/`(见 FsGrant.for_main)—— 主 agent 哪儿都能写,
+    # 给它指定一块是为了**别乱放**,而不是为了多给权限。
+    fs: FsGrant = field(default_factory=FsGrant.for_main)
 
     # ---- 轮次级状态(原来散在各模块的全局变量里)----
     # 待注入的图片 data URL,img 工具跑过就填,下一轮请求前注入进对话

@@ -25,12 +25,13 @@ import os
 import threading
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
 from . import ctx, prompts
 from .ctx import FS_ANY, FsGrant
+from .core import CONTAINER_WORKSPACE, scratch_scope
 from . import session as _session
 
 # 子 agent 的步数上限。比主 agent 小一些,但它要跑完一件**完整**的活 —— 实测一次真仓库的
@@ -227,7 +228,7 @@ class Task:
         return {"id": self.id, "prompt": self.prompt, "status": self.status,
                 "vm": self.vm, "created": self.created, "updated": self.updated,
                 "fs": {"read": list(self.fs.read), "write": list(self.fs.write),
-                       "delete": self.fs.delete},
+                       "delete": self.fs.delete, "scratch": list(self.fs.scratch)},
                 "result": self.result, "error": self.error, "ask": self.ask,
                 "usage": self.usage}
 
@@ -404,6 +405,11 @@ def _build_messages(t: Task) -> list[dict]:
         "subagent",
         task=t.prompt,
         skills=skills.prompt_section(role="sub"),
+        # 临时区**要写进提示词**:光在授权里给一块地方,它不知道那是干什么用的、
+        # 也不知道容器里对应哪个路径,照样会去别处找地方写。
+        scratch=t.fs.scratch[0] if t.fs.scratch else ".tmp/(未分配)",
+        scratch_in_container=(CONTAINER_WORKSPACE + "/" + t.fs.scratch[0]
+                              if t.fs.scratch else "(未分配)"),
     )
     return [{"role": "system", "content": system}]
 
@@ -432,8 +438,14 @@ def dispatch(prompt: str, vm: bool = False, wait: bool = True,
                 f"写范围和工作中的 {other.id} 撞上了(它管 {'、'.join(other.fs.write)},"
                 f"你要 {'、'.join(fs.write)})。两个 agent 同时改一处,撞了不报错、"
                 f"只是结果对不上,事后查不出是谁改的。换个不重叠的范围,或者等它回来。")}
+    # **每块活自带一小块临时区**(永远可写、随便删,见 core.scratch_scope)。
+    # 技能脚本要产出中间文件,而它的写范围常常只有"报告目录"那么窄 —— 没有指定地方,
+    # 它就会往"唯一能写的地方"倒(实测:一份 28KB 的 raw.json 倒进了 .pylibs,那是
+    # 容器里仅有的可写口子)。用 replace 而不是直接改 fs:调用方传进来的那份可能是共用的,
+    # 不能顺手给它加上一块草稿纸。
     t = Task(id=_new_id(), prompt=prompt, vm=bool(vm), awaited=bool(wait), fs=fs,
              session=_sid())
+    t.fs = replace(t.fs, scratch=(scratch_scope(t.id),))
     t.notifier = threading.Event()
     with _LOCK:
         _TASKS[t.id] = t
@@ -1019,9 +1031,15 @@ def _load(tid: str) -> Task | None:
     if isinstance(fs, dict):
         # 落盘的是纯字典,读回来要还原成 FsGrant —— 否则它会在 safe_path 里
         # 被当成对象用,属性全不存在,而报错会出现在很远的地方。
+        # **临时区也要一起还原**:漏了的话,读回来的任务续跑时写自己的草稿纸会被拒,
+        # 而它上一步明明刚往那儿写过(现象是"接着干就莫名没权限了")。
         t.fs = FsGrant(read=tuple(fs.get("read") or ()),
                        write=tuple(fs.get("write") or ()),
-                       delete=bool(fs.get("delete")))
+                       delete=bool(fs.get("delete")),
+                       scratch=tuple(fs.get("scratch") or ()))
+        if not t.fs.scratch:
+            # 老数据(没有 scratch 字段)按规矩补一块 —— 它的 id 就是它的那块
+            t.fs = replace(t.fs, scratch=(scratch_scope(t.id),))
     t.messages = _load_messages(tid)
     # 悬空的工具调用补上说明 —— 不补的话,续跑的第一步就是 400
     _session.repair_dangling(t.messages)
@@ -1177,6 +1195,8 @@ def show(tid: str) -> str:
         f"创建: {t.created}   更新: {t.updated}",
         f"权限: 读={'、'.join(t.fs.read) or '无'} 写={'、'.join(t.fs.write) or '无'}"
         f"{' 可删' if t.fs.delete else ''}{'  VM' if t.vm else ''}",
+        (f"临时区: {'、'.join(t.fs.scratch)}(中间产物放这儿,不动交付目录)"
+         if t.fs.scratch else "临时区: 无"),
     ]
     if t.ask:
         lines.append(f"在等: {t.ask}")

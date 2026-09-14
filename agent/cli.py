@@ -12,10 +12,12 @@ from . import prompts
 from .core import (
     AUTO_COMPACT_RATIO,
     ROOT,
+    SCRATCH_MAX_AGE_DAYS,
     SESSION_RESUME_CHARS,
     SESSION_RESUME_MESSAGES,
     TRASH_MAX_AGE_DAYS,
     console,
+    purge_scratch,
 )
 from .commands import Context as CommandContext
 from .commands import all_commands, dispatch as dispatch_command
@@ -174,6 +176,14 @@ def _cleanup_trash_on_start() -> None:
             console.print(f"回收站:{result}", style="dim")
     except Exception as exc:  # noqa: BLE001 - 回收站清理失败不应阻止 agent 启动
         console.print(f"回收站清理失败(不影响使用):{exc}", style="dim")
+    # 临时区同理:它本来是一次性的,但**不立刻删** —— 出事了要回头看当时产出的中间
+    # 文件,那正是排错时最想要的东西。所以和回收站一样按天清。
+    try:
+        note = purge_scratch(SCRATCH_MAX_AGE_DAYS)
+        if note:
+            console.print(f"临时区:{note}", style="dim")
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"临时区清理失败(不影响使用):{exc}", style="dim")
 
 
 _EXIT_WORDS = {"exit", "quit"}      # 裸敲也等价于 /exit,两处用法见下

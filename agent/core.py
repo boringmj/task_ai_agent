@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import shutil
 import socket
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -61,7 +63,54 @@ def _resolve_workspace() -> Path:
 
 # 沙箱:所有文件操作都被限制在这个目录内
 ROOT = _resolve_workspace()
+# 工作区在容器里的挂载点。集中定义一次 —— 提示词里要告诉模型"容器里这个路径叫什么",
+# 挂载那边也要用,两处各写一个字符串迟早对不上。
+CONTAINER_WORKSPACE = "/workspace"
 TRASH_MAX_AGE_DAYS = int(os.environ.get("TRASH_MAX_AGE_DAYS", "7"))
+
+# ---- 临时区:每个 agent 一块**永远可写**的草稿纸 ----
+# **为什么必须有**:子 agent 的写权限是按范围划的,而技能脚本经常要产出中间文件
+# (扫描的原始输出、临时的 csv、抽出来的一段样本)。没有指定的地方,它就只能往
+# "唯一能写的地方"倒 —— 实测:一份 28KB 的 raw.json 落进了 .pylibs(那是容器里
+# 唯一的可写口子,见 tools/container.py),和 45 个装好的包混在一起。
+#
+# 按 agent 分开(.tmp/<谁>/)而不是共用一块:几个子 agent 并排跑的时候,共用一块
+# 就等于把它们又放回"改同一批文件"的处境 —— 那正是范围划分要解决的事。
+SCRATCH_DIR = ROOT / ".tmp"
+# 临时区留多久。它本来就是一次性的,但**不立刻删** —— 出了事要回头看当时产出的
+# 中间文件,那正是排错时最想要的东西。所以和回收站同一个口径:按天清,默认 7 天。
+SCRATCH_MAX_AGE_DAYS = int(os.environ.get("SCRATCH_MAX_AGE_DAYS", "7"))
+
+
+def scratch_scope(who: str = "main") -> str:
+    """某个 agent 的临时区在**授权范围**里的写法(末尾斜杠 = 这是目录)。"""
+    return f".tmp/{who or 'main'}/"
+
+
+def scratch_dir(who: str = "main") -> Path:
+    """它的临时区路径(不建目录 —— 真写的时候自然会建)。"""
+    return SCRATCH_DIR / (who or "main")
+
+
+def purge_scratch(max_age_days: int = SCRATCH_MAX_AGE_DAYS) -> str:
+    """清掉过期的临时区,返回一句给人看的说明(没清到东西就返回空串)。
+
+    只按**目录的修改时间**判,不看里面单个文件 —— 一个还在干活的 agent 的临时区会
+    不断被写,它的 mtime 自然就新。
+    """
+    if not SCRATCH_DIR.is_dir() or max_age_days <= 0:
+        return ""
+    cutoff = time.time() - max_age_days * 86400
+    gone = 0
+    for d in SCRATCH_DIR.iterdir():
+        try:
+            if not d.is_dir() or d.stat().st_mtime >= cutoff:
+                continue
+            shutil.rmtree(d, ignore_errors=True)
+            gone += 1
+        except OSError:
+            continue                  # 删不掉(被占用)不该影响启动
+    return f"清理了 {gone} 个超过 {max_age_days} 天没动过的临时区" if gone else ""
 
 # 回收站:删除的内容移到这里,不做真删除。目录本身由 trash 工具确保存在
 TRASH_DIR = ROOT / ".trash"

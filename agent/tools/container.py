@@ -166,15 +166,21 @@ def _workspace_mounts() -> list[str]:
     不依赖模型配合,也没有"换个法子绕过去"的余地。
 
     副作用要说清楚:受限的子 agent 在容器里**创建不了新文件到未授权的地方**,
-    `/tmp` 是 tmpfs 所以临时文件照常。`.pylibs` 单独开一个可写口子 —— 那是 pip 的
-    安装目标,skills 里到处写着 `pip install --target /workspace/.pylibs`,堵了就没法装包了。
-    它是个包目录,不是用户的工作成果,拿它当例外是划算的。
+    `/tmp` 是 tmpfs 所以临时文件照常。**它自己的临时区**(见 core.scratch_scope)也挂成
+    可写 —— 那是给技能脚本产出中间文件用的,就在工作区里、能落到宿主上,不像 /tmp 那样
+    一关容器就没了。`.pylibs` 再单独开一个口子 —— 那是 pip 的安装目标,skills 里到处写着
+    `pip install --target /workspace/.pylibs`,堵了就没法装包了。
+
+    **`.pylibs` 这个例外原来是有副作用的**:它是受限子 agent 在容器里**唯一**能写的地方,
+    于是"没地方写"的中间产物全倒进去了 —— 实测一份 28KB 的 raw.json 和 45 个装好的包
+    混在一起。临时区补上之后,那个洞就不再是唯一出口了;但 `.pylibs` 本身还是得开着(pip 要用),
+    所以提示词里另外说清楚"那儿只放包"。
     """
     fs = ctx.current().fs
     if FS_ANY in fs.write:
         return ["-v", f"{ROOT}:/workspace"]
     out = ["-v", f"{ROOT}:/workspace:ro"]
-    writable = list(fs.write)
+    writable = list(fs.write) + [s for s in fs.scratch if s not in fs.write]
     if PYLIBS_REL not in writable:
         writable.append(PYLIBS_REL)
     prepare_scopes(tuple(writable))       # 不该由挂载来"顺手建",但漏了也得兜住

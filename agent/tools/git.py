@@ -29,8 +29,8 @@ GIT_SAFE = {
 GIT_RISKY = {"reset", "revert", "merge", "pull", "push"}
 # 彻底不可逆或对纯本地版本管理无用:即使用户确认也拒绝
 GIT_FORBIDDEN = {"gc", "clean", "rebase", "filter-branch"}
-# 工作区仓库要忽略的本地状态目录(含容器持久化的 .pylibs 包)
-GIT_EXCLUDE = (".agent/", ".trash/", "clones/", "__pycache__/", ".pylibs/")
+# 工作区仓库要忽略的本地状态目录(含容器持久化的 .pylibs 包、agent 的临时区)
+GIT_EXCLUDE = (".agent/", ".trash/", "clones/", "__pycache__/", ".pylibs/", ".tmp/")
 
 
 # ---------------- git:工作区内容的版本管理 ----------------
