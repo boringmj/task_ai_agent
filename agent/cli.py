@@ -25,6 +25,7 @@ from . import ctx
 from . import session
 from . import tasks
 from .llm import usage_line
+from . import loop
 from .loop import load_system_prompt, run
 from .session import (
     claim_owner,
@@ -245,7 +246,10 @@ def _read_multiline(prompt: str = "你 > "):
     """
     lines: list[str] = []
     try:
-        console.print(prompt, style="bold cyan", end="")
+        # markup=False:**提示符里会有方括号**(接管时是 "[t2] > ")。开着 markup 的话
+        # rich 会把 `[t2]` 当样式标记、**静默吃掉** —— 实测用户看到的提示符是一个光秃秃的
+        # " > ",完全看不出自己正在接管某个子 agent,于是也就不知道该怎么退出来。
+        console.print(prompt, style="bold cyan", end="", markup=False)
         while True:
             line = _take_line(_IDLE_POLL)
             if line is _IDLE:
@@ -259,6 +263,12 @@ def _read_multiline(prompt: str = "你 > "):
                 # (逐字符读 + 退格/方向键/粘贴),为这点收益不值得。
                 if not lines and _has_pending_work():
                     return _IDLE
+                # **接管时:子 agent 说完一段,提示符得自己回来。**
+                # 它是另一条线程直接写 stdout 的 —— 不像主 agent 的输出那样"打完就轮到
+                # 提示符"。不补的话用户看到的是:它输出完了,而 `[t2] > ` 不见了,得**再敲
+                # 一次回车**才回来(实测)。续行(`+ `)进行中不补,那会儿他正打字。
+                if not lines and tasks.attach_settle():
+                    console.print(prompt, style="bold cyan", end="", markup=False)
                 continue
             if line is None:        # EOF(Ctrl+D / Ctrl+Z)
                 sys.stdout.write("\n")
@@ -271,7 +281,7 @@ def _read_multiline(prompt: str = "你 > "):
                 break               # 指令:回车即走,连续行提示符都不打
             # 续行提示符用 ASCII 的 "+",别用省略号 —— 那个符号在终端里基本等于
             # "加载中/思考中",看到它会以为程序正忙、在那儿干等一个不会来的回复。
-            console.print("+ ", style="dim", end="")
+            console.print("+ ", style="dim", end="", markup=False)
     except KeyboardInterrupt:
         # 空闲时 Ctrl+C = 退出信号(返回 None)。
         # 必须包住整个函数(含提示打印),否则中断落在 console.print 里的
@@ -333,6 +343,25 @@ def main() -> None:
     """
     with ctx.use(ctx.AgentCtx(role="main")):
         _session_loop()
+
+
+def _exit_or_detach() -> bool:
+    """/exit 被敲下时,到底该退程序还是只退出接管。返回 True = 真的退出。
+
+    **为什么要拦一道**:用户想"退出接管"时最容易试的就是 /exit —— 它原来会直接把
+    agent 关掉,而用户以为自己只是从子 agent 里出来了(实测)。退出程序是有代价的动作
+    (收尾会话、收拢子 agent),不该被一次误试触发。
+
+    抽成函数是为了**能测**:这段判断原来埋在 `_session_loop` 中间,只有真跑起整个 REPL
+    才碰得到,而 REPL 一旦跑起来就没法在测试里断言"它到底退没退"。
+    """
+    was = tasks.attached()
+    if not was:
+        return True
+    console.print(tasks.detach(), markup=False)
+    console.print(f"(刚才在接管 {was} —— /exit 先退到主终端。"
+                  f"真要退出程序,再敲一次 /exit。)", style="dim")
+    return False
 
 
 def _session_loop() -> None:
@@ -399,6 +428,10 @@ def _session_loop() -> None:
     interrupted = tasks.recover()
     for note in interrupted:
         console.print(f"! {note.splitlines()[0]}", style="yellow")
+    # **把"已经通报过"这件事从对话历史里恢复回来。** delivered 只在内存里,重启后是空的 ——
+    # 不重算的话,用户昨天已经看过、也早就处理过的那些报告会再喊一遍(用户的原话:
+    # 已经消费过的消息不要反复吵闹)。历史就在手边,翻得到就不用再喊。
+    loop.reconcile_announced(messages)
     _replay_history(history)   # 把上次对话按原样重放一遍，接着聊
     console.print()
 
@@ -451,6 +484,9 @@ def _session_loop() -> None:
             cmd_ctx = CommandContext(messages)
             cmd_result = dispatch_command(text, cmd_ctx)
             if cmd_result is not None:
+                # **还在接管里的 /exit:先退到主终端,别把整个程序关掉**(见 _exit_or_detach)
+                if "exit" in cmd_ctx.events and not _exit_or_detach():
+                    continue
                 # 会话被重置 → 顺带说清虚拟机没跟着重置。为什么补在这层:只有装配层
                 # 同时认识"会话"和"VM"两边;命令层只声明事实,不去 import VM 模块。
                 if "session_reset" in cmd_ctx.events:
@@ -459,11 +495,20 @@ def _session_loop() -> None:
                     # 用终端默认亮度,别加 dim —— dim 是留给背景信息的(Docker/VM 状态、
                     # 工作区路径那些)。命令结果是用户主动敲的、正要读的内容,/help 一次
                     # 列八条指令,暗色下几乎看不清。
-                    console.print(cmd_result)
+                    #
+                    # markup=False:指令的返回文本里**到处是方括号**,而且是当普通文字用的
+                    # (「t1 [running]」「/subtasks t1 enter」)。开着 markup 会把它们当样式
+                    # 标记:实测 `[running]` 被**静默吃掉**(列表里那个状态就这么没了,不报错),
+                    # `[...]` 里带斜杠的则直接抛 MarkupError。指令输出是我们自己拼的纯文本,
+                    # 从来没用过富文本标记,所以关掉它只有收益。
+                    console.print(cmd_result, markup=False)
                 if "session_switched" in cmd_ctx.events:
                     # 切完会话,把新会话的历史按原样重放一遍 —— 只说一句"已切到 X",
                     # 用户看不到里面聊过什么。和启动时的重放共用同一套渲染,长得一样。
                     _replay_history(messages, source="刚切到的会话")
+                    # 切过来的这段历史里已经通报过的,别再喊一遍(和启动时同一个理由:
+                    # delivered 只活在内存里,而任务属于某个会话,换个会话就该重新对一遍)
+                    loop.reconcile_announced(messages)
                 if "exit" in cmd_ctx.events:      # /exit、/quit —— 收尾动作由这层做
                     break
                 continue

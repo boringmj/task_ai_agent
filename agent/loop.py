@@ -128,18 +128,51 @@ def _inject_notices(messages: list[dict]) -> None:
         _persist(messages[-1])
 
 
-def _forget_announced(messages: list[dict]) -> None:
-    """压缩之后重算"哪些通报还在对话里"。
+def _take_pending(messages: list[dict]) -> None:
+    """把半路插给**当前 agent** 的话,在安全点追加进对话。
+
+    这是 `tasks.tell` 的另一头(用户接管子 agent 时敲的话走这条路)。**为什么要排队而不是
+    写的人直接追加**:写的人(另一个线程)不知道它现在停在哪一步 —— 它可能正好卡在
+    "assistant(带 tool_calls) 写了、tool 结果还没写"的中间态(一次 vm_run 能跑几十秒),
+    这时插一条 user 进去,下一次请求就是非法的(API 直接 400),而它只会表现为"莫名失败"。
+
+    所以和通报同一个套路(见 _inject_notices):**排进队列,由它自己在每一步的开头自取**。
+    这一步的开头是安全的 —— 上一步的 tool 结果已经全部写完,末尾不存在半截的配对。
+    """
+    c = ctx.current()
+    if not c.pending_input:
+        return
+    while c.pending_input:
+        text = c.pending_input.pop(0)
+        messages.append({"role": "user", "content": text})
+        _persist(messages[-1])
+
+
+def reconcile_announced(messages: list[dict]) -> None:
+    """重算"哪些通报**已经在这个对话里**了":在的算已通报,不在的重新报一次。
 
     **不能无脑清标记然后重报** —— 压缩保留尾巴,那条通报如果正好在尾巴里,重报就变成
-    重复了(主 agent 收到同一份报告两遍)。所以这里**扫一遍幸存的消息**:谁的通知还在,
+    重复了(主 agent 收到同一份报告两遍)。所以这里**扫一遍在场的消息**:谁的通知还在,
     就仍旧算"已通报";被摘要掉的,才重新报一次。
 
-    这个扫描只在压缩之后做一次,平时不跑 —— 代价可以忽略。
+    **`Task.delivered` 只活在内存里**,所以它有两个时刻会归零,都得在这儿补回来:
+
+      · **压缩之后** —— 通报可能正好落进被摘要掉的那一段。那种情况要**重报**:它是一条
+        **待办**,不是背景信息,不该跟着消息一起消失。
+      · **进程退出再启动 / 切回某个会话之后** —— 对话历史是从盘上读回来的,而 `delivered`
+        是新的。不重算的话,主 agent 会把**用户早就看过、也早就处理过**的报告再收一遍:
+        实测就是这个现象 —— 都聊完、退出、第二天进来,一屏"某个子 agent 有结果了"。
+        对话历史就在这儿,它自己翻得到,没必要再喊一次。
+
+    反过来说,**历史里没有**那条通报(被 /reset 清过、或者本来就是新会话),就照报不误 ——
+    主 agent 确实不知道这件事。
     """
     try:
         from . import tasks
-        wanting = tasks.needs_attention()
+        # **必须带上已经通报过的那些** —— 这里要干的正是把它们的状态**重算一遍**
+        # (压缩吃掉了就改回未通报,重报一次)。用默认的那个集合会一个都看不见,
+        # 这段逻辑就永远不生效(见 needs_attention 的说明)。
+        wanting = tasks.needs_attention(include_delivered=True)
         if not wanting:
             return
         marks = {t.id: f"[子 agent {t.id}" for t in wanting}
@@ -208,6 +241,7 @@ def run(user_input: str | None, messages: list[dict], max_steps: int | None = No
         # 每一步的开头先收通报 —— 这是"安全点"(见 _inject_notices:插在 tool 配对中间
         # 会让历史非法)。子 agent 干完了就在这儿被吸收进对话,**不用等用户再说话**。
         _inject_notices(messages)
+        _take_pending(messages)
 
         # 上下文快满了就先压缩(工具调用过程中也照做),免得下一次请求超限;每轮最多压一次
         if not auto_compressed and context_ratio() >= AUTO_COMPACT_RATIO:
@@ -219,7 +253,7 @@ def run(user_input: str | None, messages: list[dict], max_steps: int | None = No
             # 背景信息,不该跟着消息一起消失。所以把"已通报"的标记清掉,让
             # _inject_notices 在下一步把还没处理的重报一遍(finish_task 关掉的不会重报,
             # 它已经不在 needs_attention 里了)。
-            _forget_announced(messages)
+            reconcile_announced(messages)
             ctx.out().print(f"[自动压缩上下文] {note}", style="dim")
         try:
             content, tool_calls, reasoning = stream_model(messages)

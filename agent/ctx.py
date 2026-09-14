@@ -151,6 +151,12 @@ class AgentCtx:
     console: object = None
     # 挂起时的交接内容(见 tasks.py)。工具把它填上,循环看到就停下来。
     suspend: dict = field(default_factory=dict)
+    # 半路插给这个 agent 的话(用户接管子 agent 时敲的,见 tasks.tell)。
+    # **排队而不是直接写进对话** —— 写的人(另一个线程)不知道它现在停在哪一步:
+    # 它可能正好卡在"assistant(带 tool_calls) 写了、tool 结果还没写"的中间态,
+    # 这时插一条 user 进去,下一次请求就是非法的(API 直接 400),而它只会表现为
+    # "莫名失败"。所以由**它自己**在每一步的开头(安全点)取走 —— 见 loop._take_pending。
+    pending_input: list = field(default_factory=list)
     # 叫停旗子(见 tasks.kill)。线程没法从外面强杀,所以只能每步之间 check 一次 ——
     # 它**不打断正在跑的那一次工具调用**,但不会再多走一步。
     cancelled: bool = False

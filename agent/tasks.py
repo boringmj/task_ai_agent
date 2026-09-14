@@ -42,8 +42,9 @@ SUB_MAX_STEPS = int(os.environ.get("SUBAGENT_MAX_STEPS", "60"))
 MAX_CONCURRENT = int(os.environ.get("SUBAGENT_MAX_CONCURRENT", "10"))
 # 交回给主 agent 的报告上限(字符)。子 agent 的报告要是比它干的活还长,那这个设计就白搭了。
 RESULT_MAX_CHARS = int(os.environ.get("SUBAGENT_RESULT_MAX", "4000"))
-# 输出缓冲区保留多少字符(给 /subtasks 看和排错用,不进上下文)
-BUFFER_MAX_CHARS = int(os.environ.get("SUBAGENT_BUFFER_MAX", "200000"))
+# 接管时最多补多少字符的历史(见 replay_text)。它只打到终端、不进模型上下文,
+# 但仍然得有个上限:接管一个跑了 40 步的子 agent,不该往屏幕上倒几百行。
+REPLAY_MAX_CHARS = int(os.environ.get("SUBAGENT_REPLAY_MAX", "6000"))
 # 等子 agent 时的轮询间隔。**必须带超时** —— 见 _wait_for 里那段说明(不可中断的
 # 阻塞锁会让 Ctrl+C 失效,用户以为程序死了)。
 WAIT_POLL = 0.25
@@ -60,21 +61,61 @@ _ATTACH_LOCK = threading.RLock()
 # 进程正在退出。**置上之后一律不再往 stdout 转发** —— 见 shutdown 的说明。
 _SHUTTING_DOWN = False
 
+# 接管时"一段输出安静下来"的判定时长(见 attach_settle)
+ATTACH_QUIET = float(os.environ.get("SUBAGENT_ATTACH_QUIET", "1.0"))
+# 上一次往终端转发是什么时候 / 有没有还没收尾的输出(见 _Sink.write 与 attach_settle)
+_ATTACH_LAST = 0.0
+_ATTACH_SETTLE = False
+
+
+def attach_settle() -> bool:
+    """接管的那段输出**安静下来了**没有?是的话返回 True 并收尾(调用方把提示符补回去)。
+
+    子 agent 说的话是**另一条线程**直接写 stdout 的,不像主 agent 的输出那样"打完就轮到
+    提示符"。所以主线程等输入时得自己盯着:它不写了,就把提示符补回最后一行。
+
+    **为什么要等安静**:子 agent 一次输出常常连着好几行、还夹着工具调用行。每行都补一次
+    提示符,屏幕上会插满 "[t2] > ",根本没法读。等它不写了再补,人一眼就能分清
+    "这是它说的""这是该我敲了"。
+
+    一段只收尾一次(收完就把标记清掉);它再开口,会重新开一段。
+    """
+    global _ATTACH_SETTLE
+    if _ATTACHED is None or not _ATTACH_SETTLE:
+        return False
+    if time.monotonic() - _ATTACH_LAST < ATTACH_QUIET:
+        return False
+    _ATTACH_SETTLE = False
+    return True
+
 
 def attached() -> str | None:
     return _ATTACHED
 
 
 def attach(tid: str) -> str:
-    """接管:它的输出实时打到终端,你敲的字进它的对话。"""
+    """接管:它的输出实时打到终端,你敲的字进它的对话。
+
+    **返回里只留一句"接管了哪个"** —— 怎么用、怎么退出,由 attach_hint() 单独放在
+    补出来的那段历史**后面**(见 commands/subtasks.py):提示语要是排在历史前面,
+    几十行输出会当场把它顶出屏幕,用户就又不知道该怎么退出来了(实测)。
+    """
     global _ATTACHED
     t = get(tid)
     if t is None:
         return f"没有 {tid} 这个任务。"
     with _ATTACH_LOCK:
-        _ATTACHED = tid
-    return (f"已接管 {tid}({t.status})。它说的话会带 [{tid}] 前缀打到这儿;"
-            f"你敲的会进它的对话。回去用 /subtasks off。")
+        _ATTACHED = t.id
+    return f"已接管 {t.id}({t.status})。"
+
+
+def attach_hint() -> str:
+    """接管状态下"你现在敲的字去哪儿、怎么出去"。没有接管时返回空串。"""
+    tid = _ATTACHED
+    if not tid:
+        return ""
+    return (f"! 你敲的字进 {tid} 的对话,它说的话带 [{tid}] 前缀打在这儿。\n"
+            f"! 退出接管:/subtasks off(带斜杠的指令仍归主终端处理,不会发给它)。")
 
 
 def detach() -> str:
@@ -91,28 +132,40 @@ class _Sink(io.TextIOBase):
     在说什么了 —— 这正是当初要解决的问题的一部分,不能从这个门再放回来。
 
     但**接管之后**(`/subtasks <id> enter`)例外:那时用户明确说了"我要看这个",就实时
-    转出去。留一个环形缓冲,一是给接管用(接管的瞬间先补上已经说过的),二是事后可查。
+    转出去。
+
+    **这里只做转发,不留历史。** 原来它还有一个环形缓冲,用来在接管时补上"它到刚才为止
+    的输出" —— 那是个错的选择:缓冲里只有"打到终端上的东西",**你给它的任务、工具返回的
+    结果、它交的结论都不在里面**(实测接管过去只补出一行"1 次请求 / 输出 32 tokens");
+    更要命的是它挂在**活的上下文**上,进程重启后读回来的任务根本没有它 —— 也就是"回来
+    之后再接管,历史是空的"。要重建历史得用**对话**(它逐条落盘,谁来了都拿得到),
+    见 replay_text。
     """
 
-    def __init__(self, tid: str = "", limit: int = BUFFER_MAX_CHARS):
+    def __init__(self, tid: str = ""):
         self.tid = tid
-        self.limit = limit
-        self.parts: list[str] = []
-        self.size = 0
         self._bol = True          # 上一个片段是不是停在行首(决定要不要加前缀)
 
     def write(self, s: str) -> int:      # noqa: D102 - TextIOBase 的接口
+        global _ATTACH_LAST, _ATTACH_SETTLE
         if not s:
             return 0
-        self.parts.append(s)
-        self.size += len(s)
-        while self.size > self.limit and len(self.parts) > 1:
-            self.size -= len(self.parts.pop(0))
         if self.tid and _ATTACHED == self.tid and not _SHUTTING_DOWN:
             # 直接用 sys.stdout,不走 rich:这些片段本来就是 rich 排版好的,
             # 再过一遍渲染只会把格式弄乱。打不出来也不该影响子 agent 干活。
             try:
                 import sys
+                now = time.monotonic()
+                if now - _ATTACH_LAST >= ATTACH_QUIET:
+                    # **一段新的输出开始:先把提示符那一行让出来。**
+                    # 主线程打完 "[t2] > " 就在等输入了,而我们这条线程直接写的话会糊在
+                    # 它后面("[t2] > 需要我做什么?")、并且那一行提示符就此作废 ——
+                    # 实测用户得**再敲一次回车**才看见提示符回来(因为他提交空行之后
+                    # 主循环才又打了一次)。先换行,让这块自成一段。
+                    sys.stdout.write("\n")
+                    self._bol = True     # 上面把它断成新的一行了,该重新加前缀
+                _ATTACH_LAST = now
+                _ATTACH_SETTLE = True    # 有输出还没收尾 —— 提示符等着补回去
                 text = f"[{self.tid}] {s}" if self._bol else s
                 self._bol = text.endswith("\n")
                 sys.stdout.write(text)
@@ -120,9 +173,6 @@ class _Sink(io.TextIOBase):
             except Exception:  # noqa: BLE001
                 pass
         return len(s)
-
-    def text(self) -> str:
-        return "".join(self.parts)
 
 
 def _now() -> str:
@@ -271,6 +321,21 @@ def rewrite_messages(tid: str, messages: list[dict]) -> None:
 
 # ========================= 派活 =========================
 
+def _norm(tid: str) -> str:
+    """把敲进来的任务号归一:`2`、`T2`、`t2` 都当 `t2`。
+
+    **为什么必须认纯数字**:列表里印的就是 `- t2 [done]`,人眼看进去的是那个 2 ——
+    实测用户就是照着敲 `/subtasks 2 enter`,然后收到一句「没有 2 这个任务」。
+    这种"我明明看着它写的"的失败最气人,而且用户不会去猜是不是要加个 t。
+    """
+    s = (tid or "").strip()
+    if s.isdigit():
+        return "t" + s
+    if len(s) > 1 and s[0] in "tT" and s[1:].isdigit():
+        return "t" + s[1:]
+    return s
+
+
 def _new_id() -> str:
     with _LOCK:
         n = 1
@@ -291,6 +356,25 @@ def _overlap(a: tuple, b: tuple) -> bool:
     `FsGrant._within` —— 带 `/` 是目录,不带是文件。
     """
     return any(FsGrant.covers(x, y) or FsGrant.covers(y, x) for x in a for y in b)
+
+
+def _conflicting(scope: tuple, exclude: str = "") -> Task | None:
+    """`scope` 这片写范围有没有和**正在跑**的别的子 agent 撞上?(返回那个任务)
+
+    派活和批权限用的是同一份判断 —— 见 `_extend_grant`:批权限要是绕开这道检查,
+    就等于给了一个后门,"划范围"这一整套就白做了(主 agent 一句话就能让两个 agent
+    同时改同一批文件,而且改完不报错)。
+    """
+    if not scope:
+        return None
+    with _LOCK:
+        snap = list(_TASKS.values())
+    for other in snap:
+        if other.id == exclude or other.status != "running":
+            continue
+        if _overlap(scope, other.fs.write):
+            return other
+    return None
 
 
 def conflict_for(rel: str, exclude: str = "") -> str:
@@ -342,12 +426,12 @@ def dispatch(prompt: str, vm: bool = False, wait: bool = True,
         # 不划就等于让几个并排的子 agent 随便改同一批文件。
         fs = FsGrant(read=(FS_ANY,), write=(), delete=False)
     if fs.write:
-        for other in list(_TASKS.values()):
-            if other.status == "running" and _overlap(fs.write, other.fs.write):
-                return {"status": "error", "message": (
-                    f"写范围和工作中的 {other.id} 撞上了(它管 {'、'.join(other.fs.write)},"
-                    f"你要 {'、'.join(fs.write)})。两个 agent 同时改一处,撞了不报错、"
-                    f"只是结果对不上,事后查不出是谁改的。换个不重叠的范围,或者等它回来。")}
+        other = _conflicting(fs.write)
+        if other is not None:
+            return {"status": "error", "message": (
+                f"写范围和工作中的 {other.id} 撞上了(它管 {'、'.join(other.fs.write)},"
+                f"你要 {'、'.join(fs.write)})。两个 agent 同时改一处,撞了不报错、"
+                f"只是结果对不上,事后查不出是谁改的。换个不重叠的范围,或者等它回来。")}
     t = Task(id=_new_id(), prompt=prompt, vm=bool(vm), awaited=bool(wait), fs=fs,
              session=_sid())
     t.notifier = threading.Event()
@@ -369,6 +453,34 @@ def _start(t: Task) -> None:
     th = threading.Thread(target=_run, args=(t,), name=f"subagent-{t.id}", daemon=True)
     t.thread = th
     th.start()
+
+
+def _say(c, t: Task) -> None:
+    """把它的**成品**打到它自己的输出口上(被接管时实时看到,没接管时进缓冲区)。
+
+    **为什么非打不可**:接管的全部意义是"跟它说话"。可它最后一轮说的话原来只是 return
+    出去存进 t.result —— 用户跟它说一句,屏幕上只有一行账目("1 次请求 / 输出 41 tokens"),
+    看不到它答了什么。那不叫接管,那叫往门缝里塞纸条。
+
+    打进输出口之后就对了:接着看着的人立刻看到,没接着看的也在缓冲区里
+    (`/subtasks <id> log` 或者下次接管时补出来的历史)。
+
+    **不发回主 agent、也不进任何上下文** —— 它照样只把 report() 那份交回去。
+    """
+    text = (t.result or "").strip()
+    if text:
+        try:
+            c.console.print(f"\n{t.id} >", style="bold cyan", markup=False)
+            c.console.print(text, markup=False, highlight=False)
+        except Exception:      # noqa: BLE001 - 打不出来不该影响它干活
+            pass
+    if t.ask:
+        # 挂起问话也一样:它停下来等回话,而接管的用户就在旁边看着 —— 不告诉他
+        # 他在等什么,他只会觉得它卡住了。
+        try:
+            c.console.print(f"{t.id} 在等回话:{t.ask}", style="yellow", markup=False)
+        except Exception:      # noqa: BLE001
+            pass
 
 
 def _run(t: Task) -> None:
@@ -422,6 +534,7 @@ def _run(t: Task) -> None:
         # 写 stdout,会直接触发 "Fatal Python error: could not acquire lock for
         # <_io.BufferedWriter name='<stdout>'>"。两条都踩过。
         try:
+            _say(c, t)               # 先把它说的话打出来,账目跟在后面当页脚
             c.console.print(f"{t.id} [{t.status}] {_cost_line(t)}",
                             style="dim", markup=False)
         except Exception:  # noqa: BLE001
@@ -502,8 +615,15 @@ def _beat(t: Task, elapsed: float, hint: str = "") -> None:
 _NEEDS_MAIN = ("done", "truncated", "failed", "waiting_input", "interrupted")
 
 
-def needs_attention() -> list["Task"]:
+def needs_attention(include_delivered: bool = False) -> list["Task"]:
     """**还没交到主 agent 手上、而且需要它处理**的任务(限本会话)。
+
+    `include_delivered=True` 时把已经通报过的也算进来 —— **只有"重算通报状态"那条路
+    (loop.reconcile_announced)需要它**,别的地方都该用默认值。加这个口子是因为它原来
+    漏掉了一整个函数:`reconcile_announced` 拿的正是这个集合,而它要干的事恰恰是把某个
+    任务的 delivered **从 True 改回 False**(通报被压缩吃掉了,得重报)。可它连那些任务
+    都看不见 —— 于是"压缩之后重报"这段逻辑**从来没生效过**:真被吃掉的时候,主 agent
+    就再也不知道有个子 agent 干完了(实测对不上就是这样)。
 
     这是"通报"的正确模型:它**不是一个一次性的消息,而是一个未处理的子 agent**。
 
@@ -520,7 +640,7 @@ def needs_attention() -> list["Task"]:
     return [t for t in snap
             if (not t.session or t.session == my)
             and t.status in _NEEDS_MAIN
-            and not t.delivered]
+            and (include_delivered or not t.delivered)]
 
 
 # ========================= 交回结果 =========================
@@ -545,7 +665,10 @@ def report(t: Task) -> dict:
         return {"status": "waiting_input", "task_id": t.id, "message": (
             f"[子 agent {t.id} 停下来等你决定]\n{t.ask}\n\n"
             f"它已经做完的部分在它的对话里,没丢。你答完用 "
-            f"resume_task('{t.id}', answer='...') 让它接着干。"
+            f"resume_task('{t.id}', answer='...') 让它接着干。\n\n"
+            f"**它要是缺权限,光在 answer 里说「批准」没用** —— 权限在派它的时候就定死了,"
+            f"得在 resume_task 里一并给出去(write=/read=/allow_delete=/vm=),"
+            f"否则它下一步还是被同一道墙挡住。"
         )}
     if t.status == "running":
         # **没有这一支的话会掉到下面那个"完成"分支上去** —— 问一个正在跑的活,回一句
@@ -605,15 +728,75 @@ def _rate(u: dict) -> str:
 
 # ========================= 恢复 =========================
 
+def _extend_grant(t: Task, write=None, read=None,
+                  allow_delete=None, vm=None) -> str:
+    """给一个已经派出去的任务**加**权限。返回拒绝理由,通过则返回空串。
+
+    **为什么批复必须落到这份授权上**:子 agent 挂起说"给我 reports/ 的写权限"时,
+    主 agent 回一句"批准"是**没有任何用处的** —— 权限在派活那一刻就定死了,那句话只是
+    一段文字,它下一步照样被 safe_path 拒绝。实测(假模型驱动真引擎)就是这样:子 agent
+    申请、主 agent 批准、它再写一次、**还是被拒**。那样整个"申请权限"就是个摆设:
+    它会以为批过了、主 agent 会以为给过了,而活干不成。
+
+    **只增不减**:这里加的范围是往已有范围上**并**,不是替换。答复是"再给你一块",
+    不是"改成这一块" —— 后者会让一次批准悄悄收走它原有的权限,而双方都以为只是在放宽。
+
+    **必须过重叠检查**:批准是主 agent 说的,但"两个 agent 同改一处、撞了不报错"这件事
+    不因为谁批准就消失。走和派活同一道闸门(见 _conflicting),批权限才不是后门。
+    """
+    add_write = tuple(write or ())
+    add_read = tuple(read or ())
+    if add_write:
+        merged = tuple(t.fs.write) + add_write
+        other = _conflicting(merged, exclude=t.id)
+        if other is not None:
+            return (f"不能给它 {'、'.join(add_write)}:和工作中的 {other.id} 撞上了"
+                    f"(它管 {'、'.join(other.fs.write)})。两个 agent 同时改一处,撞了"
+                    f"不报错、只是结果对不上,事后查不出是谁改的。要么等它回来,"
+                    f"要么给个不重叠的范围。")
+    if vm:
+        # VM 是主 agent 和所有子 agent 共用的**一台**。同一时刻只该有一个在用它
+        # 跑东西(命令之间会互相踩),所以这里不排队、直接拒 —— 让主 agent 决定。
+        holder = next((x.id for x in list(_TASKS.values())
+                       if x.id != t.id and x.vm and x.status == "running"), "")
+        if holder and not t.vm:
+            return (f"不能把 VM 开给 {t.id}:{holder} 正在用它。VM 是共用的一台,"
+                    f"两个子 agent 同时在里面跑命令会互相踩(而且看不出是谁踩的)。")
+
+    if add_write:
+        t.fs.write = tuple(t.fs.write) + add_write
+    if add_read:
+        t.fs.read = tuple(t.fs.read) + add_read
+    if allow_delete is not None:
+        t.fs.delete = bool(allow_delete)
+    if vm:
+        t.vm = True
+    _save(t)
+    return ""
+
+
 def resume(tid: str, answer: str = "", wait: bool = True,
-           timeout: float | None = None) -> dict:
-    """把主 agent 的答复交给一个挂起(或中断)的任务,让它接着干。"""
-    t = _TASKS.get(tid) or _load(tid)
+           timeout: float | None = None, write: list | None = None,
+           read: list | None = None, allow_delete: bool | None = None,
+           vm: bool = False) -> dict:
+    """把主 agent 的答复交给一个挂起(或中断)的任务,让它接着干。
+
+    `write` / `read` / `allow_delete` / `vm` 是**答复里附带的授权**:它挂起说"我没权限",
+    这里就得真的把权限给它(见 _extend_grant)。不附带授权时,答复只是一段话 —— 那对
+    "它不是缺权限、只是拿不准"这种挂起是对的,对"它缺权限"那种就没用。
+    """
+    t = get(tid)                      # 认 2 / T2 / t2(见 _norm)
     if t is None:
         return {"status": "error", "message": f"没有 {tid} 这个任务。"}
     if t.status not in ("waiting_input", "interrupted", "truncated"):
         return {"status": "error",
                 "message": f"{tid} 现在的状态是 {t.status},不在等回话 —— 没什么可接着干的。"}
+    why = _extend_grant(t, write=write, read=read,
+                        allow_delete=allow_delete, vm=vm)
+    if why:
+        # **授权给不出去就不别让它跑。** 让它带着"批准了"的错觉继续干,它会在同一个
+        # 地方再撞一次墙,而这一次没人知道为什么 —— 宁可现在把话退回去。
+        return {"status": "error", "message": f"没能扩权,{t.id} 还停在原地等你:{why}"}
     t.awaited = bool(wait)
     t.resumed.append(answer or "(主 agent 没有给具体答复,按你的判断继续;拿不准就再挂起问一次)")
     t.ask = ""
@@ -641,6 +824,16 @@ def tell(tid: str, text: str) -> str:
     if not text:
         return "(空话,没发)"
     if t.status == "running":
+        c = t.ctx
+        if c is not None:
+            # **不能直接往 t.messages 里塞。** 它现在可能正卡在"assistant(带 tool_calls)
+            # 已写、tool 结果还没写"的中间态(一次 vm_run 能有好几十秒),这时插一条
+            # user 进去,下一次请求的历史就是非法的 —— 它只会表现为"莫名失败"。
+            # 排进队列,由它在下一步开头自己取走(见 loop._take_pending)。
+            c.pending_input.append(text)
+            return f"已插进 {tid} 的对话,它下一步会看到。"
+        # 极窄的窗口:刚 _start 完、线程还没建出自己的上下文。这时它还没跑第一步,
+        # 历史末尾是干净的(不会切在 tool 配对中间),直接追加是安全的。
         t.messages.append({"role": "user", "content": text})
         return f"已插进 {tid} 的对话,它下一步会看到。"
     if t.status in ("waiting_input", "interrupted", "done", "closed", "truncated"):
@@ -878,16 +1071,39 @@ def shutdown(timeout: float = 3.0) -> str:
 
 
 def get(tid: str) -> Task | None:
-    return _TASKS.get(tid) or _load(tid)
+    return _TASKS.get(_norm(tid)) or _load(_norm(tid))
 
 
-def buffer_text(tid: str) -> str:
-    """它到刚才为止的输出(接管时先补一段,不然用户盯着空白不知道它在忙什么)。"""
+def replay_text(tid: str, limit: int | None = None) -> str:
+    """接管时补出来的那段"它到刚才为止干了什么" —— **从对话重建,不是终端输出缓冲。**
+
+    三件事决定了必须走对话:
+
+      · 终端缓冲里只有"打到终端上的东西"(它说的话、工具调用行、账目行),**你给它的
+        任务、工具返回的结果、它交的结论都不在里面** —— 实测补出来是孤零零一行
+        "t2 [done] 1 次请求 / 输出 32 tokens",跟没补一样。
+      · 那个缓冲挂在**活的上下文**上。**进程重启后读回来的任务没有它**(ctx 是 None)——
+        也就是用户说的"回来之后接管,历史是空的"。
+      · 对话是**逐条落盘**的(见 append_message):活着的、从盘上读回来的,拿到的都是
+        同一份完整记录,连"重做时被打断的那一步结果未知"这种补写都在里面。
+
+    太长就只补最后一段 —— 一次接管不该往屏幕上倒几百行,但必须说清"还有多少、
+    去哪儿看全的",不能让人以为这就是全部。
+    """
     t = get(tid)
-    if t is None or t.ctx is None:
+    if t is None:
         return ""
-    sink = getattr(getattr(t.ctx, "console", None), "file", None)
-    return sink.text() if sink is not None else ""
+    # 上限在这里取(而不是当默认参数写死)—— 写死的话这个常量就改不动了,
+    # 测试也没法用一个短上限去验"截断"这条分支
+    limit = REPLAY_MAX_CHARS if limit is None else limit
+    body = transcript(tid)
+    if len(body) <= limit:
+        return body
+    cut = body[-limit:]
+    nl = cut.find("\n")
+    if nl >= 0:
+        cut = cut[nl + 1:]               # 别从一行的中间切开
+    return (f"(它的对话很长,这里只补最后一段。完整的那份:/subtasks {t.id} log)\n\n" + cut)
 
 
 def show(tid: str) -> str:
@@ -907,7 +1123,7 @@ def show(tid: str) -> str:
         f"{' 可删' if t.fs.delete else ''}{'  VM' if t.vm else ''}",
     ]
     if t.ask:
-        lines.append(f"**在等**: {t.ask}")
+        lines.append(f"在等: {t.ask}")
     if t.status == "running":
         lines.append("(正在跑。要盯着它看、或者跟它说话:/subtasks %s enter)" % t.id)
     elif t.status == "waiting_input":

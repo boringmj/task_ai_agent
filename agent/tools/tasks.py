@@ -143,6 +143,11 @@ def finish_task(task_id: str, verdict: str = "accept", note: str = "") -> str:
                 "两种情况会用到:它中途挂起问你(申请权限、要问用户、拿不准要你定)、"
                 "或者上次进程退出把它中断了。"
                 "answer 里写清你的决定 —— 它会当成新信息接着往下做。"
+                "**它申请的是权限时,光说「批准」没用** —— 权限在派它的时候就定死了,"
+                "一句话改不了它能不能写文件、能不能用 VM。那种必须把权限**一并给出去**"
+                "(write / read / allow_delete / vm):它要写 reports/ 就传 write=[\"reports/\"]。"
+                "给的时候和派活一样划窄、一样是**增量**(在原有范围上加,不是替换)。"
+                "**用户没同意就别替用户答应** —— 它申请的是它没有的东西,该问用户就问。"
                 "中断的那种情况留意:它被中断时**正在做的那一步结果未知**,续跑会让那一步重做。",
     parameters={
         "type": "object",
@@ -151,6 +156,29 @@ def finish_task(task_id: str, verdict: str = "accept", note: str = "") -> str:
             "answer": {"type": "string",
                        "description": "你对它那个问题的答复,或者让它继续的指示。"
                                       "它挂起时问什么,上面就照什么答。"},
+            "write": {
+                "type": "array", "items": {"type": "string"},
+                "description": "**额外交给它的写权限**(相对工作区)。它申请写权限时**必须**"
+                               "在这里给,光在 answer 里说「批准」它照样写不进去。"
+                               "末尾的 `/` 决定是目录还是文件:目录写 [\"reports/\"],"
+                               "单个文件写 [\"notes/plan.md\"];不带斜杠一律当文件。",
+            },
+            "read": {
+                "type": "array", "items": {"type": "string"},
+                "description": "**额外交给它的读权限**。它本来就能读整个工作区,"
+                               "只有在你当初派活时收窄过读范围、而它现在要读那儿时才需要。",
+            },
+            "allow_delete": {
+                "type": "boolean",
+                "description": "把删除/移动也开给它。**默认不动**(不给就别传)——"
+                               "删掉就没了,和写权限是分开的两件事。",
+            },
+            "vm": {
+                "type": "boolean",
+                "description": "把虚拟机开给它(它申请用 VM 时)。**默认不动**。"
+                               "VM 是共用的一台,同时只该有一个子 agent 在里面跑东西,"
+                               "撞上会被拒 —— 那时先把另一个停掉或者等它回来。",
+            },
             "wait": {"type": "boolean",
                      "description": "false(默认)= 放它去跑,结果回头通报你;"
                                     "true = 在这儿等(会卡住你这一轮)。"},
@@ -158,9 +186,12 @@ def finish_task(task_id: str, verdict: str = "accept", note: str = "") -> str:
         "required": ["task_id"],
     },
 )
-def resume_task(task_id: str, answer: str = "", wait: bool = False) -> str:
+def resume_task(task_id: str, answer: str = "", wait: bool = False,
+                write: list | None = None, read: list | None = None,
+                allow_delete: bool | None = None, vm: bool = False) -> str:
     from .. import tasks
-    r = tasks.resume((task_id or "").strip(), answer=answer, wait=wait)
+    r = tasks.resume((task_id or "").strip(), answer=answer, wait=wait,
+                     write=write, read=read, allow_delete=allow_delete, vm=vm)
     return r.get("message") or f"{task_id} 已经接着跑了,干完会告诉你。"
 
 

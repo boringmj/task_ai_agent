@@ -2,6 +2,8 @@
 .env
 __pycache__/
 *.pyc
+# pytest 的缓存目录(测试跑完就在仓库根冒出来,不该进版本库)
+.pytest_cache/
 workspace/
 # QEMU 本体(500M+)与虚拟机镜像(各约 300M),都是本地资源,不进仓库
 vm/

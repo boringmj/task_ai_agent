@@ -11,6 +11,12 @@ from ..tools.vm import VM_AUTOSTART
 @command(
     "/reset",
     "丢弃当前会话的对话历史,重新开始。工作区文件和长期记忆都不受影响。",
+    usage="""
+/reset           丢掉对话历史,重新开始。
+/new             同上(旧名,等价)。
+                只清对话:工作区文件、长期记忆、虚拟机磁盘都不动。
+                虚拟机里跑着的东西不会被停掉。
+""",
     hint="用户想彻底换个话题、不想被前面的对话干扰,或会话被搞乱时。",
     aliases=("/new",),
 )
@@ -34,6 +40,11 @@ def cmd_reset(ctx: Context) -> str:
 @command(
     "/sessions",
     "列出这个工作区里用过的会话(每个会话有自己独立的对话历史与虚拟机),标明哪个是当前活跃的。",
+    usage="""
+/sessions        列出全部会话:id、最后使用时间、当前是哪个。
+                状态一栏:「← 当前」「! 被另一个 agent 占用」「(目录已丢失)」「空闲」。
+                想切过去用 /switch <id>。
+""",
     hint="用户问「以前聊过哪些 / 有几段会话」时。",
 )
 def cmd_sessions(ctx: Context) -> str:
@@ -64,6 +75,14 @@ def cmd_sessions(ctx: Context) -> str:
     "切换活跃会话。/switch <会话id> 切到那个会话,/switch new 新开一个会话。"
     "只能切到没被别的 agent 占用的会话上;切换会连带把虚拟机换成该会话自己的磁盘"
     "(所以 VM 会重启用)。",
+    usage="""
+/switch          不带参数:列出全部会话,让你挑一个 id。
+/switch <会话id> 切到那个会话,历史连同它的虚拟机磁盘一起换过去。
+                切不过去的两种情况:目标被另一个 agent 占着、id 不存在。
+/switch new      新开一个会话并切过去。
+                原会话还有在跑的子 agent 会被叫停(标成「中断」,切回去能接着做)。
+                虚拟机默认不自动启动 —— 要用的时候 agent 自己会起,不用你操心。
+""",
     hint="用户在几段不同主题的会话之间来回切时。",
 )
 def cmd_switch(ctx: Context) -> str:
@@ -140,7 +159,7 @@ def cmd_switch(ctx: Context) -> str:
     # 说法要和实际对得上:**叫停是商量式的**,它会在当前这一步做完之后才停
     # (正在跑的那次工具调用不打断),然后落到「中断」。别写成"已经停了"。
     stop_note = (f"原会话还有 {stopped} 个子 agent 在跑,已经通知它们停 —— "
-                 f"它们会在**当前这一步做完之后**停下(标成「中断」,切回去可以接着做)。"
+                 f"它们会在当前这一步做完之后停下(标成「中断」,切回去可以接着做)。"
                  if stopped else "")
     return f"{kind}会话 {target}({note}),{vm_note}" + (f" {stop_note}" if stop_note else "")
 
@@ -149,6 +168,12 @@ def cmd_switch(ctx: Context) -> str:
     "/compact",
     "把已有的对话历史压缩成一份摘要,释放上下文(会保留用户的偏好、已做的决定、"
     "文件改动和待办)。",
+    usage="""
+/compact         把前面的对话压成一份摘要,释放上下文。不带参数。
+                压缩同样要花一次模型请求(要读完整段历史)。上下文用到 90%
+                时会自动压一次,手动压是你想提前腾地方。
+                压掉的是对话本身;工作区文件、长期记忆、子 agent 的对话都不受影响。
+""",
     hint="上下文占用偏高、对话很长,或用户问「怎么省 token / 怎么清一下上下文」时。",
 )
 def cmd_compact(ctx: Context) -> str:
