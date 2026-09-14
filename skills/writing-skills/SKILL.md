@@ -141,3 +141,23 @@ skills/<技能名>/scripts/foo.py   →   容器里:/skills/<技能名>/scripts/
 
 技能是**自动发现**的:目录建好、`SKILL.md` 写好,下次启动就会出现在技能清单里,
 不需要改任何代码或提示词。可以用 `load_skill("<技能名>")` 验证能不能读出来。
+
+**交出去之前**跑一遍自检:
+
+```bash
+python3 /skills/writing-skills/scripts/check_skill.py           # 查全部技能
+python3 /skills/writing-skills/scripts/check_skill.py <技能名>   # 只查一个
+```
+
+它查的都是**改名或挪文件之后才会暴露、而且不会报错**的那类问题:
+
+- **交叉引用** —— `/skills/<名>/<路径>` 指向的技能和文件是否还在;正文里提到的 `某技能名`
+  是否还有效(改名之后最容易留下的就是旧名字)
+- **资源引用** —— 正文提到 `scripts/x.py`、`references/y.md`,那些文件是否真的存在
+- **frontmatter** —— `name` 与目录名是否一致、`description` 写了没有
+- **范围声明** —— description 里有没有交代"处理不了什么"(没写只是提醒,不算错)
+- 正文行数是否过长、附带 Python 脚本有没有语法错误
+
+**为什么非要机器查一遍**:技能**引用自己**是很常见的写法(正文里写
+`/skills/<自己的名字>/scripts/x.py`)—— 改自己名字的时候,眼睛正盯着别处,这类必漏。
+这个坑踩过两次,两次都是事后 grep 才发现的。
