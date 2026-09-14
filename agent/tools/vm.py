@@ -378,6 +378,24 @@ def _vm_worker(gen: int) -> None:
         _vm_state_set("error", "", error=str(exc))
 
 
+# 会话启动时**要不要顺手把虚拟机拉起来**。默认**不拉**。
+#
+# 为什么不默认拉:虚拟机是一台完整机器(几百 MB 内存 + 一块盘),而多数会话压根用不到它。
+# 花几十秒和实打实的资源去起一台可能一直闲置的机器,不划算;而且它一起来就会去碰那个会话的
+# 磁盘,多开时还容易撞上"盘被占用"。要用的时候(工具说需要、用户说要)再起,也就十几秒。
+#
+# 这只管**隐式**启动(会话启动、切换会话)。`vm_start` 和 `/vmreset` 是**明确要求你要
+# 一台机器**,不受这个开关影响 —— 否则用户说"重置虚拟机"却什么都不发生,那才叫怪。
+VM_AUTOSTART = os.environ.get("VM_AUTOSTART", "0").strip().lower() not in (
+    "0", "false", "no", "off", "")
+
+
+def vm_autostart_note() -> str:
+    """没自动启动时,给 /switch 和启动横幅用的一句话。"""
+    return ("虚拟机未自动启动(VM_AUTOSTART=0)—— 需要用的时候 vm_start 即可,约十几秒。"
+            if not VM_AUTOSTART else "")
+
+
 def vm_kickoff() -> None:
     """启动后台线程(幂等)。"""
     global _vm_thread, _vm_gen
@@ -1095,8 +1113,10 @@ def vm_switch_session() -> None:
     _vm_gen += 1                       # 先作废正在跑的启动流程(见 _vm_worker 的说明)
     _vm_cleanup()                      # 刷盘 + 停掉旧会话的 VM + 关转发
     _vm_stop_thread()                  # 还要等线程真的结束 —— 原来只是置 None,线程仍在跑
-    _vm_state_set("idle", "会话已切换,虚拟机将重新启动")
-    vm_kickoff()
+    _vm_state_set("idle", "会话已切换" + ("，虚拟机将重新启动" if VM_AUTOSTART
+                                        else "；虚拟机未自动启动(VM_AUTOSTART=0)"))
+    if VM_AUTOSTART:
+        vm_kickoff()
 
 
 def vm_reset() -> str:
@@ -1179,6 +1199,10 @@ atexit.register(_vm_cleanup)
     parameters={"type": "object", "properties": {}},
 )
 def vm_start() -> str:
-    """确保沙箱虚拟机在后台启动(已在配就返回当前状态)。"""
+    """确保沙箱虚拟机在后台启动(已在配就返回当前状态)。
+
+    **不受 VM_AUTOSTART 影响** —— 那是"会话起来时要不要顺手拉一台",而这句是
+    "我要一台机器"。用户或模型明确要的时候,就该给。
+    """
     vm_kickoff()
     return f"虚拟机正在后台启动({VM_INSTANCE[:8]}),可查 vm_status。"

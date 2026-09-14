@@ -35,7 +35,8 @@ from .session import (
 from .tools.container import docker_cleanup_stale, docker_health
 from .tools.memory import memory_text
 from .tools.trash import purge_trash
-from .tools.vm import vm_kickoff, vm_state_get, session_reset_hint, vm_status
+from .tools.vm import (VM_AUTOSTART, vm_autostart_note, vm_kickoff, vm_state_get,
+                       session_reset_hint, vm_status)
 
 
 def _clip(text: str, limit: int) -> tuple[str, int]:
@@ -280,11 +281,15 @@ def _session_loop() -> None:
         if n:
             console.print(f"已清理 {n} 个上次残留的容器", style="dim")
     console.print(f"Docker:{msg if ok else '! 不可用 —— ' + msg}", style="dim" if ok else "yellow")
-    # 后台拉起虚拟机(非阻断,失败仅提示,agent 照常启动)
+    # 虚拟机**默认不跟着会话起来**(见 VM_AUTOSTART):多数会话用不到它,而它是一台
+    # 完整机器。要用的时候 vm_start 就行,十几秒。
     try:
-        vm_kickoff()  # 后台线程启动/配置虚拟机,不阻塞
-        ready = vm_state_get()["status"] == "ready"
-        console.print(f"VM:{vm_status()}", style="dim" if ready else "yellow")
+        if VM_AUTOSTART:
+            vm_kickoff()  # 后台线程启动/配置虚拟机,不阻塞
+            ready = vm_state_get()["status"] == "ready"
+            console.print(f"VM:{vm_status()}", style="dim" if ready else "yellow")
+        else:
+            console.print(f"VM:{vm_autostart_note()}", style="dim")
     except Exception as exc:  # noqa: BLE001
         console.print(f"VM:启动失败(不影响 agent)—— {exc}", style="yellow")
     console.print("多行输入用空行提交;执行中 Ctrl+C 取消本轮,空闲时退出。", style="dim")
