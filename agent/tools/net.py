@@ -73,6 +73,7 @@ def _html_to_text(raw: str) -> tuple[str, str]:
 
 
 @tool(
+    agents=("main", "sub"),
     description="访问一个 http/https 网址并取回内容。HTML 会自动转成纯文本再返回。"
                 "适合读取用户给出的链接、查阅在线文档、获取实时信息。"
                 "只能发 GET 请求,不能提交表单或上传数据;只能访问公网地址,内网和本机服务会被拒绝。"
@@ -144,6 +145,7 @@ def fetch_url(url: str) -> str:
 
 
 @tool(
+    agents=("main", "sub"),
     description="从网上下载一个文件到工作区里。适合下载安装包、数据集、压缩包等二进制文件。"
                 "默认保存到工作区根目录并沿用 URL 的文件名,也可用 dest 指定子目录。"
                 "只写盘、内容不会进上下文,所以可下载较大的文件(默认上限 100MB)。"
@@ -312,6 +314,7 @@ SEARCH_PROVIDERS = {
 
 
 @tool(
+    agents=("main", "sub"),
     description="用关键词搜索互联网,返回若干条标题、网址和摘要。"
                 "需要查实时信息、你不了解的事物,或者不知道该访问哪个网址时使用。"
                 "摘要往往不足以回答问题,判断某条结果值得细看时,再用 fetch_url 打开它的网址。"

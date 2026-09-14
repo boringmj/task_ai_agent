@@ -170,6 +170,7 @@ def _git_clone(repo: Path, *args: str) -> str:
 
 
 @tool(
+    agents=("main", "sub"),
     description="执行 git 子命令。默认(不给 repo)操作工作区根仓库,管 workspace 内容自己的版本。"
                 "clone 外部仓库时用 'clone <url> <clones/下的目录>',仓库会落在 clones/ 下,独立于根仓库。"
                 "操作克隆进来的仓库时,把 repo 设成 'clones/xxx'。"

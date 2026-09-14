@@ -158,6 +158,7 @@ def _docker_run(inner: list[str]) -> str:
 
 
 @tool(
+    agents=("main", "sub"),
     description="在安全的 Docker 隔离容器里执行一段 Python 代码。适合数据分析、计算、"
                 "处理工作区文件 —— 你已有的工具做不到的运算用这个。"
                 "容器只能访问工作区、非 root、无内核特权、资源封顶、超时强杀;"
@@ -185,6 +186,7 @@ def run_python(code: str) -> str:
 
 
 @tool(
+    agents=("main", "sub"),
     description="在安全的 Docker 隔离容器里执行一条 shell 命令。适合在环境里跑工具、"
                 "装包、查看容器内情况。容器只能访问工作区、非 root、无内核特权、资源封顶、"
                 "超时强杀,执行完即销毁。"

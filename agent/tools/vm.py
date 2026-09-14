@@ -422,6 +422,7 @@ def session_reset_hint() -> str:
 
 
 @tool(
+    agents=("main", "sub"),
     description="查看沙箱虚拟机的当前状态:进行到哪一步、是否已就绪。"
                 "**别反复查** —— 只在 `vm_start` 之后确认一次,或者别的 vm 命令回了"
                 "「未就绪」时看一遍;`vm_run` / `vm_fetch` 能正常返回就说明虚拟机是好的,"
@@ -455,6 +456,7 @@ def vm_status() -> str:
 
 
 @tool(
+    agents=("main", "sub"),
     description="在沙箱虚拟机里执行一条命令,通过 socket 连 guest 内的 vmserver 执行(JSON 协议,非 SSH)。"
                 "适合在隔离的完整系统里装软件、跑服务、做重活。若虚拟机还没就绪,会返回当前进度并让你稍后再试。"
                 "命令默认最长跑 60 秒;构建、测试、下载这类长任务传 long_lived=true(上限 3 小时)。"
@@ -544,6 +546,7 @@ def _vm_exec_raw(command: str, timeout: int = 60) -> dict:
 
 
 @tool(
+    agents=("main", "sub"),
     description="把工作区里的一个文件上传到虚拟机(宿主 → guest)。"
                 "文件字节走 vmserver 全程在工具内部处理,只回「已上传 (n 字节)」摘要,不会把文件内容塞进上下文。"
                 "local_path 是工作区路径;guest_path 是 guest 里的绝对路径(如 /root/a.txt)。"
@@ -586,6 +589,7 @@ def vm_push(local_path: str, guest_path: str) -> str:
 
 
 @tool(
+    agents=("main", "sub"),
     description="把虚拟机里的一个文件下载到工作区(guest → 宿主)。"
                 "文件字节走 vmserver 全程在工具内部处理,只回「已下载 (n 字节)」摘要,不会把文件内容塞进上下文。"
                 "guest_path 是 guest 里的绝对路径;local_path 是工作区路径。"
@@ -635,6 +639,7 @@ def vm_pull(guest_path: str, local_path: str) -> str:
 
 
 @tool(
+    agents=("main", "sub"),
     description="转发访问 guest(沙箱虚拟机)内的 HTTP 服务 —— 通过 vmserver 的 proxy 把 guest 端口代理到本地。"
                 "适合访问你在 guest 里起的 http 服务(如 web:8080)并拿到响应。"
                 "只支持 http,不支持 https。URL 写 guest 视角:http://127.0.0.1:端口/路径。",
@@ -703,6 +708,7 @@ def vm_fetch(guest_url: str) -> str:
 
 
 @tool(
+    agents=("main", "sub"),
     description="向 guest(沙箱虚拟机)内任意 TCP 服务发送一段字节并读回复 —— 经 vmserver 的 proxy 转发。"
                 "通用 TCP,不限于 HTTP:适合 Redis、MySQL 查询、自定协议等请求/答型服务。"
                 "是「发一次、收一次」的一问一答,持续会话类(SSH)不适合。",
@@ -804,6 +810,7 @@ def _vm_proxy_relay(guest_port: int, client) -> None:
 
 
 @tool(
+    agents=("main", "sub"),
     description="把 guest(沙箱虚拟机)内某个端口**常驻转发**到宿主导,浏览器等程序可直接访问宿主口。"
                 "真正实现「将 VM 端口映射到宿主」,例如 vm_tunnel(8080, 8080) 后访问 http://127.0.0.1:8080。"
                 "每条连接经 vmserver proxy(带本进程 token)转发,不暴露原生 hostfwd。"
@@ -874,6 +881,7 @@ def vm_tunnel(host_port: int, guest_port: int) -> str:
 
 
 @tool(
+    agents=("main", "sub"),
     description="停止一个(给 host_port)或全部(不给)常驻端口转发。",
     parameters={
                 "type": "object",
@@ -903,6 +911,7 @@ _VM_SSH_PORT_BASE = int(os.environ.get("VM_SSH_PORT", "2222"))  # 宿主导从�
 
 
 @tool(
+    agents=("main", "sub"),
     description="为用户开一个「从宿主 SSH 登录虚拟机」的入口:重置登录用户的密码(每次都生成"
                 "新的随机密码)、确保 sshd 在运行且允许密码登录,再把 guest 的 22 端口映射到"
                 "宿主导,最后给出**可直接复制给用户的连接命令**。"
@@ -1164,6 +1173,7 @@ atexit.register(_vm_cleanup)
 
 
 @tool(
+    agents=("main", "sub"),
     description="确保内置的 Alpine 虚拟机(QEMU 沙箱)在后台启动与配置。已在配则返回当前状态。"
                 "这个虚拟机比容器隔离更强(独立内核),适合让它做容器里放不开的完整系统操作。配置是后台进行的,可配合 vm_status 看进度。",
     parameters={"type": "object", "properties": {}},

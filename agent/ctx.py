@@ -41,6 +41,11 @@ class AgentCtx:
     task_id: str = ""           # 子 agent 的任务 id;主 agent 为空
     label: str = ""             # 输出前缀(如 "a3");主 agent 为空 —— 不加前缀
 
+    # ---- 授权(跟着 agent 走,不跟着进程走)----
+    # VM 是**一份**、主和子共享,子 agent 没有自己的机器 —— 所以由主 agent 在派活时
+    # 决定这次给不给。默认**不给**:要用的任务才给,不是默认人人有份。
+    vm_grant: bool = False
+
     # ---- 轮次级状态(原来散在各模块的全局变量里)----
     # 待注入的图片 data URL,img 工具跑过就填,下一轮请求前注入进对话
     pending_images: list = field(default_factory=list)

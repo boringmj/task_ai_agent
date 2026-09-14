@@ -43,6 +43,7 @@ FS_MAX_GREP_LINE_CHARS = int(os.environ.get("MAX_GREP_LINE_CHARS", "200"))      
 FS_SEARCH_SKIP_DIRS = {"__pycache__", "node_modules", ".pylibs"}
 
 @tool(
+    agents=("main", "sub"),
     description="获取当前的日期、时间和星期。当用户询问「现在几点」「今天几号」「今天星期几」,"
                 "或需要判断某个日期是工作日还是周末时使用。",
     parameters={"type": "object", "properties": {}},
@@ -113,6 +114,7 @@ def _read_one(path: str, with_line_numbers: bool, start_line: int | None,
 
 
 @tool(
+    agents=("main", "sub"),
     description="读取文本文件的内容,**一次可以读多个**(单次最多返回 3145728 个字符,超出会明确提示截断)。"
                 "会自动识别编码,GBK 等中文编码的文件也能读。只能读取工作区内的文件。"
                 "**path 可以给数组**,一次读几个相关文件 —— 每多一次工具调用,模型就要重读一遍"
@@ -181,6 +183,7 @@ def read_file(path, with_line_numbers: bool = False,
 
 
 @tool(
+    agents=("main", "sub"),
     description="获取你的工作区目录(绝对路径)。所有相对路径都以它为基准,文件操作也不能超出它。当用户问「我在哪」「当前目录是什么」时使用。",
     parameters={"type": "object", "properties": {}},
 )
@@ -189,6 +192,7 @@ def get_current_directory() -> str:
 
 
 @tool(
+    agents=("main", "sub"),
     description="列出某个目录下的文件和子目录。目录名以 / 结尾,文件会附带字节大小。"
                 "当用户问「这里有什么文件」「列一下目录」,或者你需要先找到文件名再去读取它时使用。",
     parameters={
@@ -269,6 +273,7 @@ def _iter_search_paths(root: Path):
 
 
 @tool(
+    agents=("main", "sub"),
     description="按文件名在工作区里递归查找(支持目录)。"
                 "name 支持 * ? [ ] 通配符,不区分大小写;不含通配符时按「文件名包含该子串」匹配。"
                 "不知道文件叫什么名字、或在某个目录树里找某类文件时用它。"
@@ -364,6 +369,7 @@ def _detect_text_encoding(sample: bytes) -> str:
 
 
 @tool(
+    agents=("main", "sub"),
     description="按文件内容在工作区里搜索,返回命中的文件路径、行号和行内容。"
                 "pattern 是正则(不是通配符);ignore_case=true 可忽略大小写。"
                 "只搜文本文件(二进制自动跳过),结果是「文件:行号: 内容」的形式。"
@@ -528,6 +534,7 @@ def _check_writable(target: Path, content: str) -> int:
 
 
 @tool(
+    agents=("main", "sub"),
     description="把文本内容写入工作区内的文件,父目录不存在会自动创建。"
                 "默认不允许覆盖已存在的文件:如果文件已存在,调用会失败并提示你,"
                 "此时应当先征求用户同意,确认后再带 overwrite=true 重新调用。"
@@ -573,6 +580,7 @@ def write_file(path: str, content: str, overwrite: bool = False) -> str:
 
 
 @tool(
+    agents=("main", "sub"),
     description="在工作区内某个文件的末尾追加文本,文件不存在则自动创建。"
                 "适合记日志、往清单里加条目这类场景,不会破坏已有内容。"
                 "注意:本工具不会自动加换行,需要换行请在 content 里自己写 \\n。",
@@ -636,6 +644,7 @@ def _terminate(line: str) -> str:
 
 
 @tool(
+    agents=("main", "sub"),
     description="替换文件中指定行号区间的内容,只改这几行,文件其余部分原样保留。"
                 "行号从 1 开始,start_line 和 end_line 都包含在内。"
                 "把 content 留空('')就是删除这几行。"
@@ -682,6 +691,7 @@ def edit_lines(path: str, start_line: int, end_line: int, content: str = "") -> 
 
 
 @tool(
+    agents=("main", "sub"),
     description="在指定行之后插入新内容,不覆盖任何已有行。"
                 "after_line=0 表示插入到文件最开头,after_line=5 表示插到第 5 行和第 6 行之间。"
                 "只是往文件末尾补内容的话,用 append_file 更简单。",
@@ -765,6 +775,7 @@ def _move_one(source: str, destination: str, overwrite: bool) -> str:
 
 
 @tool(
+    agents=("main", "sub"),
     description="移动或重命名工作区内的文件、目录。同一目录内换个名字就是重命名,换到别的目录就是移动。"
                 "**source 可以给数组,一次移多个**(上限 20 个)—— 这时候 destination 要是个**目录**"
                 "(它们各自沿用原名移进去),目录不存在会自动创建;目标若是个已存在的文件则报错,"

@@ -5,10 +5,11 @@
 from __future__ import annotations
 
 from .registry import tool
-from .. import skills
+from .. import ctx, skills
 
 
 @tool(
+    agents=("main", "sub"),
     description="把一个技能的完整说明读进上下文。技能是按需加载的说明书:平时只看到清单"
                 "(名字 + 什么时候用),判断某个技能对当前任务有用时,用它把正文读进来再照做。"
                 "参数 name 就用清单里的名字;读错了或不存在会告诉你有哪些可选。"
@@ -28,8 +29,9 @@ from .. import skills
 )
 def load_skill(name: str) -> str:
     """读出一个技能的正文。清单在提示词里,正文不在 —— 这一步把它取出来。"""
+    # 角色从上下文里取 —— 主 agent 加载不了的技能,在**返回正文之前**就得拒掉
     try:
-        body = skills.load(name.strip())
+        body = skills.load(name.strip(), role=ctx.current().role)
     except skills.SkillError as exc:
         return f"错误:{exc}"
     return f"技能 {name} 的说明:\n\n{body}"

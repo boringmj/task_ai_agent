@@ -38,6 +38,7 @@ def _img_magic_ok(ext: str, data: bytes) -> bool:
 
 
 @tool(
+    agents=("main", "sub"),
     description="把工作区里的一张图片加载进来,让视觉模型真正看到它的内容。"
                 "当用户提到本地图片、或者需要你查看/分析一张图片(截图、图、图表等)时使用。"
                 "支持 jpg/png/webp/gif,单张不超过 3MB。图片会在下一轮以图像形式交给你。"

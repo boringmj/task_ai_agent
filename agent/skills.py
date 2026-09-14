@@ -72,6 +72,11 @@ PYLIBS = ROOT / ".pylibs"
 DEP_KINDS = ("skill", "pip")
 _DEP_FIELDS = set(DEP_KINDS) | {"reason", "fallback"}
 
+# 谁能加载这个技能。**必填,不给默认** —— 「没写」和「两边都能用」是两回事,
+# 默默默认成后者就等于没分类。分析型的技能动辄让主 agent 多吃几万 token 的上下文,
+# 这种事必须是有意为之,不能靠"没写就放行"。
+AGENT_ROLES = ("main", "sub")
+
 
 class SkillError(RuntimeError):
     """技能有问题(找不到、frontmatter 缺失或不是合法 YAML 等)。"""
@@ -113,6 +118,36 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
     if not isinstance(meta, dict):
         raise SkillError("frontmatter 要是一组 `键: 值`,现在解析出来不是")
     return meta, body
+
+
+def parse_agents(meta: dict) -> list[str]:
+    """读出这个技能谁能加载。
+
+    **必填。** 分析型的技能(安全审计、结构分析那一类)会让加载它的 agent 一口气多读
+    几万 token 的上下文 —— 那正是子 agent 存在的理由。这种事必须作者**明确声明**,
+    不能靠"没写就当谁都能用"放行,否则新写的重技能会默认继续压在主 agent 身上,
+    分类就白做了。
+    """
+    raw = meta.get("agents")
+    if raw is None or raw == []:
+        raise SkillError(
+            "frontmatter 缺 agents —— 这个技能给谁用?写 `agents: [main]`、`agents: [sub]` "
+            "或 `agents: [main, sub]`。不给默认值是故意的:分析型技能会让加载它的 agent "
+            "多吃很多上下文,那必须是有意为之"
+        )
+    if not isinstance(raw, list):
+        raise SkillError("agents 要是一个列表,如 `agents: [main, sub]`")
+    out = [str(a).strip() for a in raw]
+    bad = [a for a in out if a not in AGENT_ROLES]
+    if bad:
+        raise SkillError(
+            f"agents 里有不认识的角色 {'、'.join(bad)} —— 只认 {'、'.join(AGENT_ROLES)}"
+        )
+    seen: list[str] = []
+    for a in out:                       # 去重,但保持写的顺序(报错信息里读起来顺)
+        if a not in seen:
+            seen.append(a)
+    return seen
 
 
 def parse_deps(meta: dict, field: str) -> list[dict]:
@@ -178,8 +213,9 @@ def _read_skill(path: Path) -> tuple[dict, str]:
     except OSError as exc:
         raise SkillError(f"读不出 {_SKILL_FILE}:{exc}") from None
     meta, body = _parse_frontmatter(text)
-    # 依赖字段这里就校验,别拖到加载时才炸 —— 技能坏在元数据上,清单里就该看得出来。
+    # 元数据在这里就校验,别拖到加载时才炸 —— 技能坏在元数据上,清单里就该看得出来。
     # (只校验"写得对不对";能不能满足是加载时的事。)
+    parse_agents(meta)
     parse_deps(meta, "requires")
     parse_deps(meta, "optional")
     return meta, body
@@ -196,11 +232,12 @@ def discover() -> list[dict]:
     """
     out = []
     for path in _skill_paths():
-        entry = {"name": path.name, "description": "", "dir": path,
+        entry = {"name": path.name, "description": "", "dir": path, "agents": [],
                  "resources": [], "requires": [], "optional": [], "error": ""}
         try:
             meta, _ = _read_skill(path)
             entry["description"] = str(meta.get("description") or "").strip()
+            entry["agents"] = parse_agents(meta)
             entry["requires"] = parse_deps(meta, "requires")
             entry["optional"] = parse_deps(meta, "optional")
             entry["resources"] = [d for d in _RESOURCE_DIRS if (path / d).is_dir()]
@@ -268,13 +305,19 @@ def resolve_dep(dep: dict) -> str:
 _MARK = {"have": "[+]", "missing": "[!]"}
 
 
-def _dep_lines(deps: list[dict], field: str) -> list[str]:
+def _dep_lines(deps: list[dict], field: str, role: str = "main") -> list[str]:
     out = []
     for d in deps:
         state = resolve_dep(d)
         head = f"- {_MARK[state]} {d['kind']} `{d['name']}` —— {d['reason']}"
         if state == "have" and d["kind"] == "skill":
             head += f"(在容器里是 {CONTAINER_SKILLS_DIR}/{d['name']}/,可以用它的资源)"
+            # 依赖的**资源**能用、但它的**正文**这一方加载不了 —— 这种半可用状态必须
+            # 说清楚。不说的话,模型看到"在场"就会去 load_skill,被拒之后又得重新理解
+            # 一遍为什么,白烧一轮。
+            others = _agents_of(d["name"])
+            if others and role not in others:
+                head += f" —— 注意:它的**正文你加载不了**(只给子 agent),只能用它的文件"
         elif state == "missing" and d["kind"] == "pip":
             # 说清**查的是什么**,而不是断言"没装"。宿主只能看见 .pylibs,像基础镜像自带的
             # 包它就看不见 —— 写成"没有"是把话说过了头,而模型据此去告诉用户"做不了"。
@@ -287,7 +330,7 @@ def _dep_lines(deps: list[dict], field: str) -> list[str]:
     return out
 
 
-def _dependency_note(meta: dict) -> str:
+def _dependency_note(meta: dict, role: str = "main") -> str:
     """把依赖状况渲染成给模型看的一段话。
 
     这里的态度很关键,分两种:
@@ -309,7 +352,7 @@ def _dependency_note(meta: dict) -> str:
 
     parts: list[str] = []
     if requires:
-        lines = _dep_lines(requires, "requires")
+        lines = _dep_lines(requires, "requires", role)
         if any(resolve_dep(d) != "have" for d in requires):
             parts.append("这个技能声明了**硬依赖**,下面标 `[!]` 的在容器里没找到:")
             parts.append("\n".join(lines))
@@ -325,7 +368,7 @@ def _dependency_note(meta: dict) -> str:
         have = [d for d in optional if resolve_dep(d) == "have"]
         if have:
             parts.append("还带了几个**可选**能力,当前环境里是有的 —— 用得上就用:")
-            parts.append("\n".join(_dep_lines(have, "optional")))
+            parts.append("\n".join(_dep_lines(have, "optional", role)))
     # 一个字都没得说就别出声 —— 可选依赖全缺时正是这种情况,而那时候本来就该**静默**,
     # 留一个光秃秃的 "### 依赖" 标题纯属占地方(还容易让人以为下面漏印了东西)。
     if not parts:
@@ -335,7 +378,33 @@ def _dependency_note(meta: dict) -> str:
 
 # ========================= 加载 =========================
 
-def load(name: str) -> str:
+def _agents_of(name: str) -> list[str]:
+    """某个技能给了谁用(读不出来就返回空 —— 坏技能的事由别处报)。"""
+    try:
+        meta, _ = _read_skill(SKILLS_DIR / name)
+        return parse_agents(meta)
+    except (SkillError, OSError):
+        return []
+
+
+def _refuse_reason(agents: list[str], role: str) -> str:
+    """不能加载时,给一句**能接着往下走**的话。
+
+    只说"不行"是最糟的:模型会开始瞎绕 —— 换个工具硬做、或者干脆凭印象编。所以拒绝的
+    同时必须告诉它**该找谁**。两侧的说法不一样:主 agent 是"派出去",子 agent 是"报上去"
+    —— 后者自己不能往下派(深度锁死一层)。
+    """
+    who = "、".join("主 agent" if a == "main" else "子 agent" for a in agents)
+    if role == "main":
+        return (f"这个技能只给{who}用,你不能直接加载。它做的事整套都在子 agent 那边 —— "
+                f"**把活派给一个子 agent 去做**,别自己硬做:你的上下文要留着协调全局,"
+                f"把这类分析塞进来就正好毁掉这件事。")
+    return (f"这个技能只给{who}用,你是子 agent,加载不了。"
+            f"如果这个任务确实需要它,把这件事**写进你的报告**交由主 agent 决定 —— "
+            f"不要用别的方法凑一个结果出来。")
+
+
+def load(name: str, role: str = "main") -> str:
     """读一个技能的**正文**(不含 frontmatter),供模型按需加载。
 
     正文之外还附两段说明:能补上什么(依赖)和到哪去找(附带资源)。那些文件**不会**
@@ -353,6 +422,12 @@ def load(name: str) -> str:
         raise SkillError(f"没有名为 {name} 的技能。现有:{available}")
 
     meta, body = _read_skill(path)
+
+    # 谁能加载:在**返回正文之前**拦。放进去再拦就晚了 —— 正文一进上下文,省上下文
+    # 这件事就已经失败了。
+    agents = parse_agents(meta)
+    if role not in agents:
+        raise SkillError(_refuse_reason(agents, role))
 
     # 附带资源不进上下文,但要说清"在哪、怎么用" —— 尤其脚本:技能目录在工作区**之外**,
     # 你的文件工具够不到;它是**只读**挂载在容器里的 /skills 下(见 container.py 的挂载),
@@ -379,21 +454,43 @@ def load(name: str) -> str:
             f"(只读:能跑能读,改不了。VM 里看不到这些文件。)"
         )
 
-    dep = _dependency_note(meta)
+    dep = _dependency_note(meta, role)
     if dep:
         body += f"\n\n---\n{dep}"
     return body
 
 
-def prompt_section() -> str:
-    """把技能清单渲染进提示词(只有名字和"什么时候用",正文不进去)。"""
+_SUB_ONLY_TAG = " **[子 agent 专用]**"
+_SUB_SCOPE = ("(这份清单只列**你能用**的技能 —— 你是子 agent,不能再往下派活。)")
+_MAIN_SCOPE = (
+    "标着 **[子 agent 专用]** 的技能,你**加载不了**(`load_skill` 会直接拒绝)—— "
+    "它们照样列在下面,因为**你得知道有哪些活可以派出去**。要用的办法是派一个子 agent "
+    "去做,而不是自己硬做。"
+)
+
+
+def prompt_section(role: str = "main") -> str:
+    """把技能清单渲染进提示词(只有名字和"什么时候用",正文不进去)。
+
+    **主 agent 看得见全部技能,包括它自己加载不了的** —— 这是有意的:不知道有哪些活
+    可以派出去,就没法合理分配任务。所以"只给子 agent"的技能在这里是**列出来并打标**,
+    而不是藏起来;真正拦人的地方在 `load()`。
+
+    子 agent 反过来:只列它能加载的 —— 它不能往下派,给它看一堆用不了的技能只是
+    白占上下文,还会诱导它去试。
+    """
     from . import prompts
     lines = []
     for s in discover():
         if s["error"]:
             lines.append(f"- `{s['name']}` —— !(这个技能有错,加载会失败:{s['error']})")
             continue
+        sub_only = "sub" in s["agents"] and "main" not in s["agents"]
+        if role == "sub" and role not in s["agents"]:
+            continue
         desc = s["description"] or "(没有写 description —— 模型将无从判断何时该用它)"
-        lines.append(f"- `{s['name']}` —— {desc}")
+        tag = _SUB_ONLY_TAG if (sub_only and role == "main") else ""
+        lines.append(f"- `{s['name']}`{tag} —— {desc}")
     body = "\n".join(lines) if lines else "(目前没有任何技能)"
-    return prompts.load("skills_list", skills=body)
+    return prompts.load("skills_list", skills=body,
+                        scope=_SUB_SCOPE if role == "sub" else _MAIN_SCOPE)

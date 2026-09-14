@@ -50,6 +50,8 @@ BOUNDARY_HINTS = (
     "不适用", "不覆盖", "不在其中", "不提供", "不涉及", "不负责", "不支持", "不含",
     "只管", "只做", "只覆盖", "仅覆盖", "限于", "限定", "覆盖",
 )
+# 谁能加载这个技能 —— 和 agent/skills.py 的 parse_agents 是**同一套**。
+AGENT_ROLES = ("main", "sub")
 # 依赖项的规矩 —— 和 agent/skills.py 的 parse_deps 是**同一套**。
 DEP_KINDS = ("skill", "pip")
 DEP_FIELDS = set(DEP_KINDS) | {"reason", "fallback"}
@@ -157,7 +159,59 @@ def _load_meta(raw: str) -> tuple[dict, list[str]]:
     return meta, note
 
 
-def check_deps(meta: dict, known: set[str], field: str) -> list[str]:
+def check_agents(meta: dict, known: dict) -> list[str]:
+    """查 agents 字段写得对不对。
+
+    **必填,不给默认。**「没写」和「两边都能用」是两回事 —— 分析型技能会让加载它的
+    agent 多吃几万 token 上下文,那必须是有意为之,不能靠"没写就放行"。
+    """
+    raw = meta.get("agents")
+    if raw is None or raw == []:
+        return ["frontmatter 缺 agents —— 给谁用?写 `agents: [main]` / `[sub]` / `[main, sub]`"]
+    if not isinstance(raw, list):
+        return ["agents 要是一个列表,如 `agents: [main, sub]`"]
+    bad = [str(a) for a in raw if str(a).strip() not in AGENT_ROLES]
+    if bad:
+        return [f"agents 里有不认识的角色 {'、'.join(bad)} —— 只认 {'、'.join(AGENT_ROLES)}"]
+    return []
+
+
+def check_dep_agents(meta: dict, known: dict, field: str) -> list[str]:
+    """**硬**依赖的类型对不对得上:本技能给谁用,被依赖的技能就得谁都能用。
+
+    **只看 requires,不看 optional** —— 这条差别是实打实的:
+
+    - `requires` 是说"没有它这活干不成"。可要是**能加载本技能的那一方压根加载不了它**,
+      这个"硬"就是空头承诺 —— 一个 `[main]` 的技能硬依赖一个 `[sub]` 的技能,主 agent
+      永远拿不到它,而这个错**当场不报**,跑到那一步才发现。
+    - `optional` 本来就带着 `fallback`(缺了怎么办)。对加载它的那一方来说"角色不对、
+      加载不了"**就是"缺了"的一种**,照着 fallback 走即可 —— 不需要额外拦。
+      而且 `skill:` 依赖多半只是要**用对方的资源**(跑个脚本),那件事跟能不能加载
+      对方的**正文**是两回事,不该混为一谈。
+    """
+    mine = {str(a).strip() for a in (meta.get("agents") or []) if isinstance(a, str)}
+    if not mine:
+        return []
+    problems = []
+    for item in (meta.get(field) or []):
+        if not isinstance(item, dict) or not item.get("skill"):
+            continue
+        dep = str(item["skill"]).strip()
+        theirs = known.get(dep)
+        if theirs is None:
+            continue                      # 技能不存在,check_deps 那边已经报过了
+        missing = mine - set(theirs)
+        if missing:
+            who = lambda s: "、".join("主 agent" if a == "main" else "子 agent" for a in sorted(s))
+            problems.append(
+                f"{field} 里的 `skill: {dep}` 对不上类型:本技能给{who(mine)}用,"
+                f"但 `{dep}` 只给{who(set(theirs))}用 —— 加载本技能的那一方会加载不了它。"
+                f"要么把 `{dep}` 也开给{who(missing)},要么本技能别只给{who(mine)}用"
+            )
+    return problems
+
+
+def check_deps(meta: dict, known: dict, field: str) -> list[str]:
     """查 requires / optional 写得对不对,外加引用的技能在不在。
 
     规矩和 agent/skills.py 的 parse_deps 一致(那边是运行时的把关,这边是交出去之前的)。
@@ -425,9 +479,11 @@ def check_skill(skill_dir: pathlib.Path, known: set[str]) -> list[str]:
             "建议写明(如「不适用于…」「只覆盖…」),否则模型会拿它硬答"
         )
 
-    # ---- 依赖字段 ----
+    # ---- 谁用、依赖 ----
+    problems.extend(check_agents(meta, known))
     problems.extend(check_deps(meta, known, "requires"))
     problems.extend(check_deps(meta, known, "optional"))
+    problems.extend(check_dep_agents(meta, known, "requires"))
     declared = {
         str(d[k]).strip() for f in ("requires", "optional")
         for d in (meta.get(f) or []) if isinstance(d, dict) for k in DEP_KINDS if d.get(k)
@@ -648,10 +704,32 @@ def print_graph(root: pathlib.Path, known: set[str]) -> None:
         print("  (没有需要特别留意的)")
 
 
+def _known_skills(root: pathlib.Path) -> dict:
+    """{技能名: 它的 agents}。
+
+    是个 dict 但**当集合用也没问题**(`x in dict` 查的是键),所以老的交叉引用检查不用改;
+    多带一份 agents 是为了查"依赖的类型对不对得上"。
+    """
+    out: dict = {}
+    if not root.is_dir():
+        return out
+    for d in sorted(root.iterdir()):
+        if not (d / "SKILL.md").is_file():
+            continue
+        try:
+            meta, _ = _load_meta(_split_frontmatter(
+                (d / "SKILL.md").read_text(encoding="utf-8"))[0])
+            agents = meta.get("agents")
+            out[d.name] = [str(a).strip() for a in agents] if isinstance(agents, list) else []
+        except (OSError, UnicodeDecodeError):
+            out[d.name] = []
+    return out
+
+
 def main() -> int:
     args = sys.argv[1:]
     root = _default_skills_dir()
-    known = {p.name for p in root.iterdir() if p.is_dir()} if root.is_dir() else set()
+    known = _known_skills(root)
 
     if args and args[0] == "--graph":
         print_graph(root, known)

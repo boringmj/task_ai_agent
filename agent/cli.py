@@ -249,7 +249,9 @@ def _session_loop() -> None:
     # "数据",里面写明信任边界,免得描述文字被当成系统指令(详见 commands.system_message)
     messages.append({"role": "system", "content": commands_system_message()})
     # 技能清单同理:只放"名字 + 什么时候用",正文留在磁盘上按需读(见 agent/skills.py)
-    messages.append({"role": "system", "content": skills.prompt_section()})
+    # 清单按角色渲染:主 agent 看得见**全部**技能(包括它自己加载不了的,否则没法
+    # 合理分配任务),子 agent 只看得见它能加载的
+    messages.append({"role": "system", "content": skills.prompt_section(role="main")})
     # 定下本次的活跃会话。规则(见 session._resolve_session):接回本工作区最后跑过的
     # 那一个,但**如果它正被另一个活着的 agent 用着,就另开一个新的**,不去抢 ——
     # 抢的话两边会共用一个对话历史和一块虚拟机磁盘,互相覆盖。

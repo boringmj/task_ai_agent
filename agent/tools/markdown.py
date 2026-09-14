@@ -15,6 +15,7 @@ _SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", "site-pack
 
 
 @tool(
+    agents=("main", "sub"),
     description="检查 markdown 的格式是否规范(和 markdownlint 对齐的一套规则),"
                 "返回具体哪一行有什么问题。写 .md 文件时系统会自动查并把问题附在结果里,"
                 "所以平时不用特意调用;想单独复查某个文件、或一次检查一个目录下所有 .md 时用它。"
