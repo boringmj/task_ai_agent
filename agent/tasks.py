@@ -140,7 +140,11 @@ def _buffer_console(tid: str):
 class Task:
     id: str
     prompt: str
-    # queued → running → done / waiting_input / failed / interrupted → closed(验收后)
+    # **它属于哪个会话,派活时就记下来。** 不记的话,`/switch` 之后它的落盘会跟着
+    # "当前会话"走 —— 实测:对话进了新会话的目录,原会话只剩一份过期的 meta。
+    # 文件放哪不该取决于"此刻谁在前台"。
+    session: str = ""
+    # queued → running → waiting_input → done / failed / truncated / interrupted → closed
     status: str = "queued"
     vm: bool = False             # 主 agent 有没有把 VM 开给它
     fs: FsGrant = field(default_factory=FsGrant)   # 它能读写哪儿
@@ -196,6 +200,11 @@ def task_dir(tid: str, sid: str | None = None) -> Path:
     return tasks_root(sid) / tid
 
 
+def _dir(t: Task) -> Path:
+    """这个任务的文件该放哪 —— 认它**自己的**会话,不认"当前会话"。"""
+    return task_dir(t.id, t.session or _sid())
+
+
 def _save(t: Task) -> None:
     """落盘:meta 一份、消息一行行追加。
 
@@ -203,7 +212,7 @@ def _save(t: Task) -> None:
     这和会话本身用的是同一套理由(见 session.py 头部):崩溃/强杀是常态,不是意外。
     """
     try:
-        d = task_dir(t.id)
+        d = _dir(t)
         d.mkdir(parents=True, exist_ok=True)
         (d / "meta.json").write_text(
             json.dumps(t.meta(), ensure_ascii=False, indent=1), encoding="utf-8")
@@ -218,7 +227,7 @@ def _save_messages(t: Task) -> None:
     逐行增量保护 —— 真正怕丢的是主 agent 那边。重写顺带解决了压缩后要改历史的问题。
     """
     try:
-        d = task_dir(t.id)
+        d = _dir(t)
         d.mkdir(parents=True, exist_ok=True)
         with (d / "messages.jsonl").open("w", encoding="utf-8") as f:
             for m in t.messages:
@@ -306,7 +315,8 @@ def dispatch(prompt: str, vm: bool = False, wait: bool = True,
                     f"写范围和工作中的 {other.id} 撞上了(它管 {'、'.join(other.fs.write)},"
                     f"你要 {'、'.join(fs.write)})。两个 agent 同时改一处,撞了不报错、"
                     f"只是结果对不上,事后查不出是谁改的。换个不重叠的范围,或者等它回来。")}
-    t = Task(id=_new_id(), prompt=prompt, vm=bool(vm), awaited=bool(wait), fs=fs)
+    t = Task(id=_new_id(), prompt=prompt, vm=bool(vm), awaited=bool(wait), fs=fs,
+             session=_sid())
     t.notifier = threading.Event()
     with _LOCK:
         _TASKS[t.id] = t
@@ -459,13 +469,26 @@ def _notify(t: Task) -> None:
 
 
 def pending_notifications() -> list[str]:
-    """取走"跑完了但主 agent 还没看到"的通报(取走即清空)。"""
+    """取走"跑完了但主 agent 还没看到"的通报(取走即清空)。
+
+    只取**当前会话**的:切换会话之后,别的会话的子 agent 干完了,不该报给这边的主
+    agent —— 那是另一段对话的事,这边既没有它的上下文、也无从处置。它的结果在它
+    自己会话的盘上,回到那个会话就翻得到。
+    """
+    my = _sid()
     with _LOCK:
         ids, _NOTIFY[:] = list(_NOTIFY), []
     out = []
     for tid in ids:
         t = _TASKS.get(tid)
-        if t is not None and t.status == "done":
+        if t is None:
+            continue
+        if t.session and t.session != my:
+            # 不是这个会话的 —— **扔回队列**,等回到那个会话再交(不是丢弃)
+            with _LOCK:
+                _NOTIFY.append(tid)
+            continue
+        if t.status == "done":
             out.append(report(t)["message"])
     return out
 
@@ -480,7 +503,7 @@ def _clip(text: str, t: Task, limit: int = RESULT_MAX_CHARS) -> str:
     """
     if len(text) <= limit:
         return text
-    where = task_dir(t.id) / "messages.jsonl"
+    where = _dir(t) / "messages.jsonl"
     return (text[:limit]
             + f"\n\n(报告过长,以上是前 {limit} 字,还有 {len(text) - limit} 字没显示。"
               f"全文和它干活的完整过程在 {where} —— 需要细节就去读,不要凭猜。)")
@@ -517,7 +540,7 @@ def report(t: Task) -> dict:
     if t.status == "failed":
         return {"status": "failed", "task_id": t.id, "message": (
             f"[子 agent {t.id} 失败] {t.error}\n\n"
-            f"它的对话落在 {task_dir(t.id) / 'messages.jsonl'},要查原因就去读。"
+            f"它的对话落在 {_dir(t) / 'messages.jsonl'},要查原因就去读。"
             f"**别把失败当成「干完了但没结果」** —— 那部分活没做,要重派或者自己接。"
         )}
     if t.status == "interrupted":
@@ -631,7 +654,7 @@ def finish(tid: str, verdict: str = "accept", note: str = "") -> str:
         t.ctx = None                  # 缓冲区不小,关了就别留着
         _save(t)
         return (f"已验收关闭 {tid}。它的对话和产出都还在"
-                f"({task_dir(tid)}),用户之后有疑问翻得到。")
+                f"({_dir(t)}),用户之后有疑问翻得到。")
 
     if verdict in ("rework", "redo"):
         if not note.strip():
@@ -791,8 +814,11 @@ def listing(show_closed: bool = False) -> str:
         return "(还没有派过任何子 agent)"
     lines = []
     closed = 0
+    my = _sid()
     for tid in sorted(_TASKS, key=lambda k: int(k[1:] or 0)):
         t = _TASKS[tid]
+        if t.session and t.session != my:
+            continue          # 别的会话的,不在这儿列(回到那个会话再见)
         if t.status == "closed":
             closed += 1
             if not show_closed:
@@ -870,7 +896,7 @@ def show(tid: str) -> str:
         lines.append("\n--- 它交回来的报告 ---\n" + t.result[:1500])
     if t.error:
         lines.append(f"\n出错: {t.error}")
-    lines.append(f"\n对话在 {task_dir(t.id) / 'messages.jsonl'}(共 {len(t.messages)} 条);"
+    lines.append(f"\n对话在 {_dir(t) / 'messages.jsonl'}(共 {len(t.messages)} 条);"
                  f"看全过程:/subtasks {t.id} log")
     return "\n".join(lines)
 
