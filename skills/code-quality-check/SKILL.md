@@ -90,6 +90,17 @@ python3 /skills/code-quality-check/scripts/php_quality_scan.py <目标路径> --
 专用的用 tree-sitter 补齐了函数规模(行数 / 嵌套 / 圈复杂度 / 参数数)、类型标注与 catch 处理。
 选错了不会报错,只是**候选少一大截**,你会以为这个项目很干净。
 
+**但第二条要先把依赖装上,而这件事必须先问用户。** 它依赖 `tree_sitter` 与 `tree_sitter_php`,
+**装包是在动用户的环境**,不该自作主张:
+
+- **先停下来问**:把「要装哪两个包、装它做什么」讲清楚,由用户决定 ——
+  装法是 `pip install --target /workspace/.pylibs tree_sitter tree_sitter_php`(装一次持久保留)。
+- **用户不同意,就回退到第一条通用脚本**,别硬来。代价是 PHP 只能查到空 catch 与重复块 ——
+  **这一点要写进报告**(「PHP 的函数规模与类型标注没能自动度量,只覆盖了错误处理与重复块」),
+  别让用户以为"PHP 那部分没问题"。
+
+**宁可报告里明写"这块没覆盖",也不要偷偷装包、或者装着扫全了。**
+
 输出 JSON:按维度和预估等级分组的候选命中,每条带文件、行号、代码片段与度量值。**先只看汇总**,
 不要在这一步读源码。
 
@@ -128,8 +139,11 @@ python3 /skills/code-quality-check/scripts/php_quality_scan.py <目标路径> --
 
 - `references/dimensions.md` —— 七个维度的判据、各语言典型信号、什么情况**不算**问题
 - `references/report-template.md` —— 报告结构与 quality JSON 字段
-- `scripts/quality_scan.py` —— 静态扫描器:函数度量、坏味道候选、近似重复,输出 JSON
-- `scripts/php_quality_scan.py` —— **PHP 项目用这个**。通用扫描器的 AST 度量只支持 Python,
-  对 PHP 只能认空 catch 与重复块;这个用 tree-sitter 补齐函数规模(行数 / 嵌套 / 圈复杂度 /
-  参数数)、类型标注、catch 处理。依赖 `tree_sitter` 与 `tree_sitter_php`,容器里装一次
-  持久保留:`pip install --target /workspace/.pylibs tree_sitter tree_sitter_php`
+- `scripts/quality_scan.py` —— 静态扫描器:函数度量、坏味道候选、近似重复,输出 JSON。
+  **纯标准库,不用装任何东西**
+- `scripts/php_quality_scan.py` —— **PHP 项目用这个**,也是本技能里**唯一需要装依赖**的一个。
+  通用扫描器的 AST 度量只支持 Python,对 PHP 只能认空 catch 与重复块;这个用 tree-sitter 补齐
+  函数规模(行数 / 嵌套 / 圈复杂度 / 参数数)、类型标注、catch 处理。依赖 `tree_sitter` 与
+  `tree_sitter_php`,装法:`pip install --target /workspace/.pylibs tree_sitter tree_sitter_php`
+  —— **装之前先问用户**(见上面第 2 步);用户不同意就用通用脚本,并在报告里写明 PHP 的函数
+  规模与类型标注没能覆盖

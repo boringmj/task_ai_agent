@@ -30,10 +30,18 @@ description: 当用户要求对某个仓库或项目做安全审计、漏洞扫�
 脚本在容器里跑,**路径要换算**成 `/workspace/...` 或 `/skills/...`(宿主路径 `D:\...` 在容器里不存在)。
 
 ```bash
-# 依赖 pyyaml(已装在 .pylibs 就不用重复装);bandit 缺失会自动跳过
+# 依赖 pyyaml —— **装之前先问用户**(装包动的是用户环境);bandit 缺失会自动跳过
 python /skills/repo-security-audit/scripts/scan.py \
     /workspace/clones/<仓库> --out /workspace/findings-<仓库>.json
 ```
+
+**缺 pyyaml 要先问用户再装** —— 装法是 `pip install --target /workspace/.pylibs pyyaml`
+(装一次持久保留),但**装包是在动用户的环境**,不该自作主张。把「要装什么、装它做什么」讲清楚,
+由用户决定。**用户不同意时**:没有 pyyaml 规则根本读不出来,**第 2 步的静态扫描整个做不了** ——
+如实说明,不要为了"跑出点东西"去硬凑。
+
+(第 3 步的 `scan_git.py` 依赖 `dulwich`,同样要先问。但它不同:没有 dulwich 只是 git 历史那步
+跳过,其余照常 —— 那种情况在报告结尾的「未覆盖范围」里写明「git 历史未扫」即可。)
 
 子命令(默认全跑,也可以只跑其中几项):
 
@@ -118,7 +126,7 @@ python /skills/repo-security-audit/scripts/scan_git.py \
 ## 附带资源
 
 - `scripts/scan.py` —— 工作区静态快扫器,数据驱动,规则在 `scripts/rules/*.yaml`。
-- `scripts/scan_git.py` —— git 历史扫描器(纯 dulwich,不需要 git 命令)。
+- `scripts/scan_git.py` —— git 历史扫描器(靠 `dulwich`,不需要 git 命令;这个包也要先问用户再装)。
 - `scripts/rules/` —— `secrets.yaml`(密钥)、`sinks.yaml`(危险 API)、`config.yaml`(配置)。**要扩规则直接改这里,不用动代码**;字段说明见各文件头部注释。
 - `references/vuln-patterns.md` —— 各类漏洞的 source→sink、语言差异、确认要点、常见误报。
 - `references/exploit-chain.md` —— 利用链的构成要素与常见链模板。
