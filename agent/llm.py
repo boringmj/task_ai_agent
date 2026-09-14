@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from rich.markdown import Markdown
 
+from . import ctx
 from .core import (
     MODEL,
     MAX_CONTEXT_TOKENS,
@@ -12,34 +13,34 @@ from .tools.registry import TOOLS
 
 # ---------------- 核心循环 ----------------
 
-# 最近一次请求的 token 用量(来自 API 的 usage)。prompt_tokens 就是"当前上下文多大"。
-_last_usage: dict = {}
-# 本轮的起点快照(见 begin_turn)。一轮对话里模型可能调好几次工具,每次都会发出新请求、
-# 重发整个历史;只报"最后一次请求"会把前面几次全漏掉,而用户关心的恰恰是"这一句花了多少"。
-_turn_start: dict = {}
-# 本会话累计:请求数、总输出 token;以及"输入侧"的总量与总命中 ——
-# 输入每轮重发,单看累计没意义,但**命中比例**有意义(它反映缓存整体好不好使)。
-_total_usage: dict = {"requests": 0, "completion": 0, "prompt": 0, "cache_hit": 0}
+# 用量**记在当前 agent 的上下文里**(见 ctx.py),不再是进程级的一份 ——
+# 否则子 agent 和主 agent 的账会混在一起,连"该压谁的上下文"都判不出来。
 
 
 def _record_usage(usage) -> None:
-    """记录 API 返回的用量(流式要开 include_usage 才有)。"""
+    """记录 API 返回的用量(流式要开 include_usage 才有)。记在**发这次请求的** agent 账上。"""
     if usage is None:
         return
-    _last_usage["prompt"] = getattr(usage, "prompt_tokens", 0) or 0
-    _last_usage["completion"] = getattr(usage, "completion_tokens", 0) or 0
-    _last_usage["cache_hit"] = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
-    _total_usage["requests"] += 1
-    _total_usage["completion"] += _last_usage["completion"]
-    _total_usage["prompt"] += _last_usage["prompt"]
-    _total_usage["cache_hit"] += _last_usage["cache_hit"]
+    c = ctx.current()
+    last, total = c.last_usage, c.total_usage
+    # prompt_tokens 就是"这个 agent 现在的上下文有多大"
+    last["prompt"] = getattr(usage, "prompt_tokens", 0) or 0
+    last["completion"] = getattr(usage, "completion_tokens", 0) or 0
+    last["cache_hit"] = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
+    total["requests"] += 1
+    total["completion"] += last["completion"]
+    total["prompt"] += last["prompt"]
+    total["cache_hit"] += last["cache_hit"]
 
 
 def context_ratio() -> float:
-    """最近一次请求的上下文占用比例(0~1),用于判断要不要自动压缩。"""
+    """**当前 agent** 最近一次请求的上下文占用比例(0~1),用于判断要不要自动压缩。
+
+    每个 agent 要压的是自己的上下文,所以这个值必须跟着上下文走,不能是全局的一份。
+    """
     if MAX_CONTEXT_TOKENS <= 0:
         return 0.0
-    return _last_usage.get("prompt", 0) / MAX_CONTEXT_TOKENS
+    return ctx.current().last_usage.get("prompt", 0) / MAX_CONTEXT_TOKENS
 
 
 def _cache_rate(prompt: int, hit: int) -> float:
@@ -54,13 +55,14 @@ def begin_turn() -> None:
     历史。用户问一句话触发了三次工具调用,那是四次请求 —— 只看最后那次,消耗被少算成
     四分之一,而且上下文越大、工具越多,少算得越离谱。
     """
-    global _turn_start
-    _turn_start = dict(_total_usage)
+    c = ctx.current()
+    c.turn_start = dict(c.total_usage)
 
 
 def _turn_usage() -> dict:
-    """本轮至今的消耗(字段与 _total_usage 相同)。"""
-    return {k: _total_usage.get(k, 0) - _turn_start.get(k, 0) for k in _total_usage}
+    """**当前 agent** 本轮至今的消耗(字段与 total_usage 相同)。"""
+    c = ctx.current()
+    return {k: c.total_usage.get(k, 0) - c.turn_start.get(k, 0) for k in c.total_usage}
 
 
 def usage_line() -> str:
@@ -71,12 +73,12 @@ def usage_line() -> str:
     - **其余**:一律报本轮 —— 缓存命中率、输出 token 都是"这一轮整体如何",只报最后一次
       会把中间几次工具调用白算进去的那部分漏掉
     """
-    ctx = _last_usage.get("prompt")
-    if not ctx:
+    used = ctx.current().last_usage.get("prompt")
+    if not used:
         return ""
     t = _turn_usage()
-    pct = (ctx / MAX_CONTEXT_TOKENS * 100) if MAX_CONTEXT_TOKENS else 0.0
-    return (f"上下文 {ctx:,}/{MAX_CONTEXT_TOKENS:,}({pct:.1f}%)"
+    pct = (used / MAX_CONTEXT_TOKENS * 100) if MAX_CONTEXT_TOKENS else 0.0
+    return (f"上下文 {used:,}/{MAX_CONTEXT_TOKENS:,}({pct:.1f}%)"
             f" · 本轮 {t['requests']} 次请求"
             f" · 缓存命中 {_cache_rate(t['prompt'], t['cache_hit']):.1f}%"
             f" · 输出 {t['completion']:,} tokens")
@@ -89,16 +91,17 @@ def usage_detail() -> str:
     花了多少",累计是"这个会话一共花了多少"。只报最后那次请求是没意义的:一轮里调了几次
     工具就有几次请求,每次都重发了整个历史。
     """
-    if not _last_usage.get("prompt"):
+    c = ctx.current()
+    if not c.last_usage.get("prompt"):
         return "(还没有用量数据)"
-    ctx = _last_usage["prompt"]
-    pct = (ctx / MAX_CONTEXT_TOKENS * 100) if MAX_CONTEXT_TOKENS else 0.0
+    used = c.last_usage["prompt"]
+    pct = (used / MAX_CONTEXT_TOKENS * 100) if MAX_CONTEXT_TOKENS else 0.0
     t = _turn_usage()
     tp, th, tc, tr = t["prompt"], t["cache_hit"], t["completion"], t["requests"]
-    ap, ah, ac, ar = (_total_usage["prompt"], _total_usage["cache_hit"],
-                      _total_usage["completion"], _total_usage["requests"])
+    ap, ah, ac, ar = (c.total_usage["prompt"], c.total_usage["cache_hit"],
+                      c.total_usage["completion"], c.total_usage["requests"])
     return (
-        f"上下文 {ctx:,}/{MAX_CONTEXT_TOKENS:,} tokens({pct:.1f}%)\n"
+        f"上下文 {used:,}/{MAX_CONTEXT_TOKENS:,} tokens({pct:.1f}%)\n"
         f"本轮:{tr} 次请求,输出 {tc:,} tokens,缓存命中 "
         f"{_cache_rate(tp, th):.1f}%({th:,}/{tp:,})\n"
         f"本会话:{ar} 次请求,累计输出 {ac:,} tokens,整体缓存命中 "

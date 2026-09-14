@@ -6,10 +6,8 @@ import os
 
 import base64
 
-from ..core import (
-    safe_path,
-    _pending_images,
-)
+from .. import ctx
+from ..core import safe_path
 
 
 # ---- media 工具专属配置(环境变量名不变,仍可在 .env 覆盖)----
@@ -76,7 +74,7 @@ def img(path: str) -> str:
         raise ValueError(f"{target.name} 的文件头与 {ext} 格式不符,可能不是有效的 {ext} 图片。")
 
     b64 = base64.b64encode(data).decode("ascii")
-    _pending_images.append(f"data:{MEDIA_IMG_MIME[ext]};base64,{b64}")
+    ctx.current().pending_images.append(f"data:{MEDIA_IMG_MIME[ext]};base64,{b64}")
     return f"图片 {target.name} 已加载({size} 字节),将在下一轮作为图像信息交给模型。"
 
 
@@ -139,7 +137,7 @@ def screen() -> str:
     orig_w, orig_h = image.size
     ox, oy = _virtual_screen_origin()
     url = _image_to_data_url(image)
-    _pending_images.append(url)
+    ctx.current().pending_images.append(url)
     cw = max(1, int(orig_w * MEDIA_SCREEN_MAX_DIM / max(orig_w, orig_h)))
     ch = max(1, int(orig_h * MEDIA_SCREEN_MAX_DIM / max(orig_w, orig_h)))
     # 给出原分辨率、压缩尺寸和虚拟桌面原点,方便模型算真实点击坐标。
@@ -157,15 +155,16 @@ def inject_pending_images(messages: list[dict]) -> None:
     图像只能出现在消息的 content 列表里(tool 结果只能是字符串),所以单独
     追加一条带图像内容的消息,而不是塞进工具返回值。
     """
-    if not _pending_images:
+    pending = ctx.current().pending_images
+    if not pending:
         return
     messages.append(
         {
             "role": "user",
             "content": (
                 [{"type": "text", "text": "(以下为 img 工具加载的图片,请据此处理当前任务。)"}]
-                + [{"type": "image_url", "image_url": {"url": u}} for u in _pending_images]
+                + [{"type": "image_url", "image_url": {"url": u}} for u in pending]
             ),
         }
     )
-    _pending_images.clear()
+    pending.clear()

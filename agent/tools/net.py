@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
+from .. import ctx
 from ..core import (
     safe_path,
     _assert_public_url,
@@ -307,7 +308,7 @@ SEARCH_PROVIDERS = {
     "duckduckgo": _search_duckduckgo,
 }
 
-_searches_this_turn = 0  # 每轮用户提问前清零,见 run()
+# 配额记在当前 agent 的上下文里(见 ctx.py):子 agent 搜几次不该算在主 agent 头上。
 
 
 @tool(
@@ -332,7 +333,6 @@ _searches_this_turn = 0  # 每轮用户提问前清零,见 run()
             },
 )
 def web_search(query: str, count: int = 5) -> str:
-    global _searches_this_turn
 
     provider = SEARCH_PROVIDERS.get(NET_SEARCH_PROVIDER)
     if provider is None:
@@ -344,12 +344,13 @@ def web_search(query: str, count: int = 5) -> str:
         raise RuntimeError(f"搜索服务 {NET_SEARCH_PROVIDER} 需要密钥,请在 .env 里设置 NET_SEARCH_API_KEY。")
 
     # agent 会自动循环调用,搜索通常按次计费,必须有刹车
-    if _searches_this_turn >= NET_MAX_SEARCHES_PER_TURN:
+    used = ctx.current().searches_this_turn
+    if used >= NET_MAX_SEARCHES_PER_TURN:
         raise RuntimeError(
             f"本轮对话的搜索次数已达上限({NET_MAX_SEARCHES_PER_TURN} 次)。"
             f"请基于已有结果作答,或让用户重新提问。"
         )
-    _searches_this_turn += 1
+    ctx.current().searches_this_turn = used + 1
 
     count = max(1, min(count, NET_MAX_SEARCH_RESULTS))
     results = provider(query, count)
@@ -366,6 +367,5 @@ def web_search(query: str, count: int = 5) -> str:
 
 
 def reset_turn_searches() -> None:
-    """把单轮搜索配额清零(run() 每轮开始时调用)。"""
-    global _searches_this_turn
-    _searches_this_turn = 0
+    """把**当前 agent** 的单轮搜索配额清零(每轮开始时调用)。"""
+    ctx.current().searches_this_turn = 0

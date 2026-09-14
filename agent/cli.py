@@ -19,6 +19,7 @@ from .commands import Context as CommandContext
 from .commands import all_commands, dispatch as dispatch_command
 from .commands import system_message as commands_system_message
 from . import skills
+from . import ctx
 from .llm import usage_line
 from .loop import load_system_prompt, run
 from .session import (
@@ -226,6 +227,17 @@ def _on_exit() -> None:
 
 
 def main() -> None:
+    """入口:**建主 agent 的上下文,然后在它里面跑整个会话**。
+
+    为什么要包这一层:待注入的图片、搜索配额、用量这些状态现在都挂在上下文上
+    (见 agent/ctx.py)—— 整个会话——包括工具调用——必须跑在**主 agent 那个上下文里**,
+    否则它们会落到 ctx 的兜底上下文上,用量统计和搜索配额就都不生效了。
+    """
+    with ctx.use(ctx.AgentCtx(role="main")):
+        _session_loop()
+
+
+def _session_loop() -> None:
     _make_stdio_forgiving()
     messages: list[dict] = [{"role": "system", "content": load_system_prompt()}]
     memory = memory_text().strip()  # 跨会话记住的关键事实最先注入,始终在场

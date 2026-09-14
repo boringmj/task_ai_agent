@@ -30,13 +30,8 @@ SESSION_RESUME_CHARS = int(os.environ.get("SESSION_RESUME_CHARS", "400"))
 # 护栏:单次写入的字节上限,防止模型一口气写爆磁盘
 MAX_WRITE_BYTES = int(os.environ.get("MAX_WRITE_BYTES", str(3 * 1024 * 1024)))
 
-
-
-
-
-_pending_images: list[str] = []  # 本轮待注入的图片 data URL,img 工具有效时会填一个
-
-
+# 注:待注入的图片、搜索配额、用量这些**轮次级状态**已经搬到 agent/ctx.py ——
+# 它们得跟着"当前是哪个 agent"走,不能是进程级的一份(否则子 agent 会串味)。
 
 # 项目根 = 本包(agent/)的上一级。拆分成包之后 __file__ 在 agent/ 里,
 # 不能再直接用 Path(__file__).parent(那样会指到 agent/ 自己,提示词/工作区全找错);
