@@ -127,7 +127,7 @@ def stream_model(messages: list[dict]) -> tuple[str, list[dict], str]:
     def _close_reasoning() -> None:
         nonlocal reasoning_open
         if reasoning_open:
-            console.print()            # 思考结束,换行
+            ctx.out().print()            # 思考结束,换行
             reasoning_open = False
 
     stream = client.chat.completions.create(
@@ -143,10 +143,10 @@ def stream_model(messages: list[dict]) -> tuple[str, list[dict], str]:
         if rc:
             reason_parts.append(rc)
             if not reasoning_open:
-                console.print("* 思考", style="dim", markup=False)
+                ctx.out().print("* 思考", style="dim", markup=False)
                 reasoning_open = True
             # 思考文本可能含 [ ] 之类的字符,关掉 markup/highlight,原样输出
-            console.print(rc, style="dim italic", end="", markup=False,
+            ctx.out().print(rc, style="dim italic", end="", markup=False,
                           highlight=False, soft_wrap=True)
         if delta.content:
             _close_reasoning()
@@ -183,8 +183,8 @@ def stream_model(messages: list[dict]) -> tuple[str, list[dict], str]:
     # content 存进 messages,而 cli 只渲染最终 reply —— 于是用户只能靠事后重放才看得到。
     # 既然就在上下文里,没道理不显示。(最后一轮不打,那个由 cli 用它自己的样式渲染。)
     if tool_calls and content.strip():
-        console.print("AI >", style="bold green", markup=False)
-        console.print(Markdown(content.strip()))
+        ctx.out().print("AI >", style="bold green", markup=False)
+        ctx.out().print(Markdown(content.strip()))
 
     return content, tool_calls, "".join(reason_parts)
 

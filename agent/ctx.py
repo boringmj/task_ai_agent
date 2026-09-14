@@ -58,6 +58,14 @@ class AgentCtx:
     # 本会话累计
     total_usage: dict = field(default_factory=_empty_usage)
 
+    # 输出出口(rich Console)。None = 用真正那个终端。
+    # 子 agent 的默认值是一块**自己的缓冲区**(见 tasks.py)—— 它说的话不该打到主终端:
+    # 主终端是用户跟**主 agent** 对话的地方,子 agent 往那儿刷几百行,用户就看不见
+    # 主 agent 在说什么了。
+    console: object = None
+    # 挂起时的交接内容(见 tasks.py)。工具把它填上,循环看到就停下来。
+    suspend: dict = field(default_factory=dict)
+
     @property
     def is_sub(self) -> bool:
         return self.role == "sub"
@@ -65,6 +73,19 @@ class AgentCtx:
     def prefix(self) -> str:
         """终端输出的前缀(主 agent 不加前缀,免得每条都多两个字符)。"""
         return f"[{self.label}] " if self.label else ""
+
+
+def out():
+    """当前 agent 该往哪儿输出。
+
+    工具和循环里一律用 `ctx.out().print(...)`,不要直接 import 那个全局 console ——
+    否则子 agent 的思考、工具调用、中间说明会全部打到主终端上。
+    """
+    c = _current.get()
+    if c.console is not None:
+        return c.console
+    from .core import console           # 延迟导入:ctx 要当叶子模块,别拖进 core 那一串
+    return console
 
 
 # 没人在场时的兜底上下文。**刻意不是主 agent 那一份**:测试、独立脚本直接调工具时用它,

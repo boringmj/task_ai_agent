@@ -52,7 +52,14 @@ def compact(messages: list[dict], keep_recent: int = 0) -> str:
     return f"已压缩上下文: {len(head)} 条消息 → 1 条摘要({len(summary)} 字)"
 
 
-def run(user_input: str, messages: list[dict]) -> str:
+def run(user_input: str, messages: list[dict], max_steps: int | None = None) -> str:
+    """跑一轮:把 user_input 加进对话,循环"模型 → 工具 → 模型"直到它不再要工具。
+
+    主 agent 和子 agent 用的是**同一个循环** —— 差别只在步数上限和各自的上下文
+    (子 agent 的上下文是它自己那份,见 ctx.py)。同一套逻辑跑两种角色,才不会出现
+    "主 agent 会做的事子 agent 不会"这种莫名其妙的不一致。
+    """
+    steps = max_steps or MAX_STEPS
     # 搜索配额和待注入图片都按轮重置 —— 而且重置的是**当前 agent** 的那一份
     reset_turn_searches()  # 子 agent 跑自己的循环时,重置的是它自己的配额
     ctx.current().pending_images.clear()  # 避免上一轮的图带到下一轮
@@ -62,11 +69,11 @@ def run(user_input: str, messages: list[dict]) -> str:
     messages.append({"role": "user", "content": user_input})
 
     auto_compressed = False
-    for _ in range(MAX_STEPS):
+    for _ in range(steps):
         # 上下文快满了就先压缩(工具调用过程中也照做),免得下一次请求超限;每轮最多压一次
         if not auto_compressed and context_ratio() >= AUTO_COMPACT_RATIO:
             auto_compressed = True
-            console.print(f"[自动压缩上下文] {compact(messages, keep_recent=2)}", style="dim")
+            ctx.out().print(f"[自动压缩上下文] {compact(messages, keep_recent=2)}", style="dim")
         try:
             content, tool_calls, reasoning = stream_model(messages)
         except Exception as exc:  # noqa: BLE001 - 网络/流中断,给提示而不是崩掉
@@ -95,7 +102,7 @@ def run(user_input: str, messages: list[dict]) -> str:
             # 打印只是一行提示,渲染失败(如老终端编码不支持某个字符)不该中断整个回合,
             # 更不能让这一步之后的历史缺 tool 结果 —— 那会直接让下一次请求 400。
             try:
-                console.print(
+                ctx.out().print(
                     f"• {fname}({fargs})",
                     style="dim",
                     markup=False,
@@ -114,7 +121,14 @@ def run(user_input: str, messages: list[dict]) -> str:
         # 这一轮若调用了 img,把登记好的图片作为 image_url 注入,给下一轮模型看
         inject_pending_images(messages)
 
-    return f"[强制终止] 已达到最大步数 {MAX_STEPS},对话强制中止"
+        # 子 agent 交了问题上来(申请权限、要问用户)→ 停在这儿,别接着往下跑。
+        # 接手的是 tasks.py:它把状态记成"等回话",把问题交给主 agent。
+        # **停在这儿而不是抛出异常**:对话历史是完整的(最后一条是 tool 结果),
+        # 后面 resume 时直接往下走就行。
+        if ctx.current().suspend:
+            return content
+
+    return f"[强制终止] 已达到最大步数 {steps},对话强制中止"
 
 
 def load_system_prompt() -> str:

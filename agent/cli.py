@@ -20,6 +20,7 @@ from .commands import all_commands, dispatch as dispatch_command
 from .commands import system_message as commands_system_message
 from . import skills
 from . import ctx
+from . import tasks
 from .llm import usage_line
 from .loop import load_system_prompt, run
 from .session import (
@@ -285,6 +286,10 @@ def _session_loop() -> None:
                   style="dim")
     console.print(f"工作区:{ROOT}", style="dim")
     console.print(f"会话:{session_id} — {session_note};{resume_note}", style="dim")
+    # 上次进程退出时没跑完的子 agent:标成「中断」并告诉主 agent —— **不自动续跑**,
+    # 中断那一步的副作用是未知的,由它决定接着干还是重派。
+    for note in tasks.recover():
+        messages.append({"role": "system", "content": note})
     _replay_history(history)   # 把上次对话按原样重放一遍，接着聊
     console.print()
 
@@ -301,6 +306,15 @@ def _session_loop() -> None:
             # 否则"纯字符退出"和"指令退出"两套逻辑各走各的,早晚对不上。
             if text.strip().lower() in _EXIT_WORDS:
                 text = "/exit"
+
+            # 后台子 agent 干完了 → 在这儿把通报塞进对话,主 agent 下一句话就带着它。
+            # 放在用户输入**之前**追加:子 agent 是在用户上一句话的上下文里干完的,
+            # 通报属于那件事的后续,不该排在新问题后面。
+            for note in tasks.pending_notifications():
+                messages.append({
+                    "role": "system",
+                    "content": "（后台子 agent 的通报,你没在等它,它自己干完了）\n\n" + note,
+                })
             # 终端指令(/compact、/reset、/tokens…)。注册在 agent/commands/ 里,
             # 系统提示词中那段说明也由同一份注册表生成,不用两头各维护一遍。
             cmd_ctx = CommandContext(messages)
