@@ -3,14 +3,14 @@ name: repo-security-audit
 description: 当用户要求对某个仓库或项目做安全审计、漏洞扫描、排查安全隐患或分析潜在利用链时使用,例如「扫一下这个仓库有没有安全问题」「审计一下这个项目的安全性」「看看这些代码有没有能被利用的漏洞」「帮我找找利用链」。语言特定规则覆盖 Python / JavaScript / Java / Go / PHP;其它语言只有通用 Web 模式,覆盖会薄很多,报告里要说明这一点。
 requires:
   - package: pyyaml
-    why: 全部扫描规则都写在 `scripts/rules/*.yaml` 里;读不出来就一条规则都用不上,整个静态扫描无从谈起
+    reason: 全部扫描规则都写在 `scripts/rules/*.yaml` 里;读不出来就一条规则都用不上,整个静态扫描无从谈起
 optional:
   - package: dulwich
-    why: "`scripts/scan_git.py` 靠它直接读 git 对象库(容器里没有 git 命令),历史泄露那一步要用"
-    if_missing: git 历史那步跳过,其余照常;在报告结尾的「未覆盖范围」里写明「git 历史未扫」
+    reason: "`scripts/scan_git.py` 靠它直接读 git 对象库(容器里没有 git 命令),历史泄露那一步要用"
+    fallback: git 历史那步跳过,其余照常;在报告结尾的「未覆盖范围」里写明「git 历史未扫」
   - package: bandit
-    why: "`scan.py` 的 bandit 子命令用 `python -m bandit` 做 Python 深度扫描,能多出一路结果"
-    if_missing: 脚本自己会跳过并在摘要里注明;报告「未覆盖范围」里补一句 Python 深度扫描未跑
+    reason: "`scan.py` 的 bandit 子命令用 `python -m bandit` 做 Python 深度扫描,能多出一路结果"
+    fallback: 脚本自己会跳过并在摘要里注明;报告「未覆盖范围」里补一句 Python 深度扫描未跑
 ---
 
 # 仓库安全审计

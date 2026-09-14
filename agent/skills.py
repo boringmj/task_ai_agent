@@ -28,8 +28,8 @@ frontmatter 用**标准 YAML**(`yaml.safe_load`),不是自己糊的简版解析�
     requires     可选。**硬依赖**:缺一个这个技能就干不了活
     optional     可选。**可选依赖**:缺了只是降级,代价可接受
 
-依赖项里 `skill` / `package` **二选一**,加上 `why`(为什么需要它);可选依赖还要
-`if_missing`(缺了怎么办)。**这两样怎么用、写不写得出 `if_missing` 意味着什么,
+依赖项里 `skill` / `package` **二选一**,加上 `reason`(为什么需要它);可选依赖还要
+`fallback`(缺了怎么办)。**这两样怎么用、写不写得出 `fallback` 意味着什么,
 见 `skills/writing-skills/SKILL.md`** —— 那是给人看的规矩,这里只负责机械地执行。
 
 **为什么只有这两种依赖**:因为只有它们能被**确切**回答"装没装" —— `skill` 看技能目录
@@ -67,7 +67,7 @@ PYLIBS = ROOT / ".pylibs"
 # 一个依赖项能声明的东西。二选一 —— 一个 dep 只说一件事,别混着写。
 # 只有"宿主能确切回答"的两种才配进来,理由见模块开头。
 DEP_KINDS = ("skill", "package")
-_DEP_FIELDS = set(DEP_KINDS) | {"why", "if_missing"}
+_DEP_FIELDS = set(DEP_KINDS) | {"reason", "fallback"}
 
 
 class SkillError(RuntimeError):
@@ -113,7 +113,7 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
 
 
 def parse_deps(meta: dict, field: str) -> list[dict]:
-    """把一个依赖字段(requires / optional)规整成 [{'kind','name','why',...}]。
+    """把一个依赖字段(requires / optional)规整成 [{'kind','name','reason',...}]。
 
     这里**只做机械校验**(结构对不对、字段全不全),不判断依赖本身存不存在 ——
     那是 `resolve_dep` 的事。分两步是因为"写得对不对"是作者的问题(该在自检时就报),
@@ -138,24 +138,24 @@ def parse_deps(meta: dict, field: str) -> list[dict]:
         kinds = [k for k in DEP_KINDS if item.get(k)]
         if len(kinds) != 1:
             raise SkillError(
-                f"{field} 里每一项要**恰好**声明 skill / package / command 中的一个,"
+                f"{field} 里每一项要**恰好**声明 skill / package 中的一个,"
                 f"现在有 {len(kinds)} 个:{item}"
             )
         kind = kinds[0]
-        if not item.get("why"):
+        if not item.get("reason"):
             raise SkillError(
-                f"{field} 里的 `{kind}: {item[kind]}` 没写 why —— "
+                f"{field} 里的 `{kind}: {item[kind]}` 没写 reason —— "
                 f"不写清为什么需要它,读的人没法判断它到底能不能少(也判断不了它该不该是可选依赖)"
             )
-        if field == "optional" and not item.get("if_missing"):
+        if field == "optional" and not item.get("fallback"):
             raise SkillError(
-                f"{field} 里的 `{kind}: {item[kind]}` 没写 if_missing —— "
+                f"{field} 里的 `{kind}: {item[kind]}` 没写 fallback —— "
                 f"**可选依赖的缺失代价必须写出来**,否则没法证明这个代价是可以接受的;"
                 f"要是写不出一个能接受的下场,它就该是 requires(硬依赖)"
             )
         out.append({"kind": kind, "name": str(item[kind]).strip(),
-                    "why": str(item["why"]).strip(),
-                    "if_missing": str(item.get("if_missing") or "").strip()})
+                    "reason": str(item["reason"]).strip(),
+                    "fallback": str(item.get("fallback") or "").strip()})
     return out
 
 
@@ -269,11 +269,11 @@ def _dep_lines(deps: list[dict], field: str) -> list[str]:
     out = []
     for d in deps:
         state = resolve_dep(d)
-        head = f"- {_MARK[state]} {d['kind']} `{d['name']}` —— {d['why']}"
+        head = f"- {_MARK[state]} {d['kind']} `{d['name']}` —— {d['reason']}"
         if state == "have" and d["kind"] == "skill":
             head += f"(在容器里是 {CONTAINER_SKILLS_DIR}/{d['name']}/,可以用它的资源)"
         elif state == "missing" and field == "optional":
-            head += f";缺了怎么办:{d['if_missing']}"
+            head += f";缺了怎么办:{d['fallback']}"
         out.append(head)
     return out
 

@@ -52,7 +52,7 @@ BOUNDARY_HINTS = (
 )
 # 依赖项的规矩 —— 和 agent/skills.py 的 parse_deps 是**同一套**。
 DEP_KINDS = ("skill", "package")
-DEP_FIELDS = set(DEP_KINDS) | {"why", "if_missing"}
+DEP_FIELDS = set(DEP_KINDS) | {"reason", "fallback"}
 # 举例用的占位名,不当成真实引用 —— 按**主名**判,不看扩展名(foo.py / foo.md 都算)
 PLACEHOLDERS = {"foo", "bar", "baz", "qux", "xxx", "yyy", "name"}
 # 单字母文件名(x.py / y.md)也是写说明时常用的举例写法
@@ -178,14 +178,14 @@ def check_deps(meta: dict, known: set[str], field: str) -> list[str]:
             )
             continue
         kind, name = kinds[0], str(item[kinds[0]]).strip()
-        if not item.get("why"):
+        if not item.get("reason"):
             problems.append(
-                f"{field} 里的 `{kind}: {name}` 没写 why —— "
+                f"{field} 里的 `{kind}: {name}` 没写 reason —— "
                 f"不写清为什么需要它,读的人没法判断它能不能少"
             )
-        if field == "optional" and not item.get("if_missing"):
+        if field == "optional" and not item.get("fallback"):
             problems.append(
-                f"{field} 里的 `{kind}: {name}` 没写 if_missing —— "
+                f"{field} 里的 `{kind}: {name}` 没写 fallback —— "
                 f"**可选依赖的缺失代价必须写出来**,写不出一个能接受的下场,它就该是 requires"
             )
         if kind == "skill" and name not in known:

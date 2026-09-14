@@ -3,8 +3,8 @@ name: architecture-migration
 description: 当用户要求把现有项目从一个架构形态、技术栈或部署方式迁移到另一个时使用 —— 例如单体拆微服务、Django 迁移到 FastAPI、虚拟机迁移到容器或 K8s、自建服务迁移到托管服务、SQLite 迁移到 PostgreSQL、跨大版本升级。产出 Go/No-Go 评估、迁移策略选择、数据迁移与回滚方案、分阶段计划。不适用于:同一技术栈内的结构调整、试验性技术预研、以及没有现存系统的从零新建。
 optional:
   - skill: repo-architecture-design
-    why: "它的 `references/interview.md` 是现成的背景访谈清单,迁移可以直接拿来问"
-    if_missing: 用下面第 1 步自己列的那几个问题问,够用;只是没那份清单系统
+    reason: "它的 `references/interview.md` 是现成的背景访谈清单,迁移可以直接拿来问"
+    fallback: 用下面第 1 步自己列的那几个问题问,够用;只是没那份清单系统
 ---
 
 # 架构迁移

@@ -7,19 +7,19 @@
 | `requires` | 硬依赖 | 这个技能干不了活 |
 | `optional` | 可选依赖 | 只是降级,代价可接受 |
 
-每项写成一个键值对,`skill` / `package` 二选一,外加 `why`;`optional` 还要 `if_missing`:
+每项写成一个键值对,`skill` / `package` 二选一,外加 `reason`;`optional` 还要 `fallback`:
 
 ```yaml
 requires:
   - package: pyyaml
-    why: 全部规则都写在 rules/*.yaml 里,读不出来就一条都用不上
+    reason: 全部规则都写在 rules/*.yaml 里,读不出来就一条都用不上
 optional:
   - package: dulwich
-    why: git 历史扫描那一步要用
-    if_missing: 跳过那一步,在报告「未覆盖范围」里写明 git 历史未扫
+    reason: git 历史扫描那一步要用
+    fallback: 跳过那一步,在报告「未覆盖范围」里写明 git 历史未扫
   - skill: repo-structure-analysis
-    why: "它的 `scripts/scan_repo.py` 能出模块依赖图"
-    if_missing: 自己用 grep 手工摸依赖,慢一些且容易漏掉循环
+    reason: "它的 `scripts/scan_repo.py` 能出模块依赖图"
+    fallback: 自己用 grep 手工摸依赖,慢一些且容易漏掉循环
 ```
 
 ## 为什么只有 `package` 和 `skill` 两种
@@ -42,11 +42,11 @@ optional:
 - **只是某一步降级,而且降级的后果说得清** → `optional`。少了 dulwich 只是 git 历史那步
   扫不了,其余照常,报告里写明就行。
 
-`optional` 的**每一项都必须写 `if_missing`**,自检会拦。这条不是形式主义:
+`optional` 的**每一项都必须写 `fallback`**,自检会拦。这条不是形式主义:
 
 > **"代价可接受"是要被证明的,不是被声称的。** 写不出一个能接受的下场,就说明它其实是硬依赖。
 
-`why` 同样必写。写不出来的话,多半是你自己也没想清楚它到底是不是必需的。
+`reason` 同样必写。写不出来的话,多半是你自己也没想清楚它到底是不是必需的。
 
 ## 加载时会发生什么
 
@@ -74,14 +74,14 @@ optional:
 
 1. 要装什么、怎么装 —— `pip install --target /workspace/.pylibs <包>`(装一次持久保留)
 2. 装它做什么
-3. **不装的后果是什么** —— 正是上面那个 `if_missing`
+3. **不装的后果是什么** —— 正是上面那个 `fallback`
 
 ## 一个例子
 
 一个"扫描报表"的技能靠 `pandas` 读 `.xlsx`:
 
 - 声明 `requires: package: pandas` —— 没有它一个报表都读不了。
-- 要是少了它还能读 `.csv`,那就降为 `optional`,并在 `if_missing` 里写明"`.xlsx` 读不了、
+- 要是少了它还能读 `.csv`,那就降为 `optional`,并在 `fallback` 里写明"`.xlsx` 读不了、
   `.csv` 还行"。
 
 两种后果,报告的写法完全不同 —— 所以必须写下来。

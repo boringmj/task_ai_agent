@@ -3,8 +3,8 @@ name: writing-skills
 description: 当用户想给这个 agent 增加一个新技能(或者修改已有技能),或者你想把一套固定的流程、领域知识沉淀下来复用的时候使用。它讲清了技能目录怎么写、description 该怎么措辞、markdown 格式有什么硬要求、什么样的内容才值得做成技能,以及交出去之前怎么自检。**只管「技能这个形式怎么写」** —— 写普通文档(README、报告、笔记)不必套技能的结构,那些直接写就行;技能正文里承载的领域知识也不由它负责。
 optional:
   - package: pyyaml
-    why: "自检脚本 `scripts/check_skill.py` 靠它把 frontmatter 完整解析出来(依赖字段是列表,简化解析器读不了)"
-    if_missing: 自检退到内置的简化解析器,会明说「依赖字段这次没被检查」;其余检查照常
+    reason: "自检脚本 `scripts/check_skill.py` 靠它把 frontmatter 完整解析出来(依赖字段是列表,简化解析器读不了)"
+    fallback: 自检退到内置的简化解析器,会明说「依赖字段这次没被检查」;其余检查照常
 ---
 
 # 编写技能
@@ -115,11 +115,11 @@ description: <什么时候该用这个技能>
 ```yaml
 requires:                      # 硬依赖:缺一个,这个技能就干不了活
   - package: pyyaml
-    why: 全部规则都写在 rules/*.yaml 里,读不出来就一条都用不上
+    reason: 全部规则都写在 rules/*.yaml 里,读不出来就一条都用不上
 optional:                      # 可选依赖:缺了只是降级,代价可接受
   - skill: repo-structure-analysis
-    why: 它的 `scripts/scan_repo.py` 能出模块依赖图
-    if_missing: 自己用 grep 手工摸依赖,慢一些且容易漏掉循环
+    reason: 它的 `scripts/scan_repo.py` 能出模块依赖图
+    fallback: 自己用 grep 手工摸依赖,慢一些且容易漏掉循环
 ```
 
 只有 `package`(容器里的 Python 包)和 `skill`(另一个技能)两种 —— 因为它们能被**确切**
@@ -127,7 +127,7 @@ optional:                      # 可选依赖:缺了只是降级,代价可接受
 
 **硬还是可选,只看一条:缺了它,这个技能还能不能给出一个诚实的结果?** 整个做不了就
 `requires`;只是某一步降级、且降级的后果说得清就 `optional`。`optional` 的每一项**必须**
-写 `if_missing`(自检会拦)—— 写不出一个能接受的下场,它其实就是硬依赖。`why` 也必写。
+写 `fallback`(自检会拦)—— 写不出一个能接受的下场,它其实就是硬依赖。`reason` 也必写。
 
 **装包之前永远先问用户** —— 装包是**在动用户的环境**,不在"看代码"这个授权范围内。
 
@@ -181,8 +181,8 @@ python3 scripts/check_skill.py <技能名>   # 只查一个
 它查的都是**改名或挪文件之后才会暴露、而且不会报错**的那类问题:
 
 - **写死的路径** —— 正文或脚本里出现 `/skills/<名>/…` 就是错,改成相对路径
-- **依赖** —— `requires` / `optional` 的字段写全了没有(`why` 必写,可选依赖还要
-  `if_missing`)、`skill:` 指的技能在不在、用了人家的资源有没有声明
+- **依赖** —— `requires` / `optional` 的字段写全了没有(`reason` 必写,可选依赖还要
+  `fallback`)、`skill:` 指的技能在不在、用了人家的资源有没有声明
 - **资源引用** —— 正文提到 `scripts/x.py`、`references/y.md`,那些文件是否真的存在
 - **frontmatter** —— `name` 与目录名是否一致、`description` 写了没有
 - **范围声明** —— description 里有没有交代"处理不了什么"(没写只是提醒,不算错)
