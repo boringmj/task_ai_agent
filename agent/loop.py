@@ -52,6 +52,99 @@ def compact(messages: list[dict], keep_recent: int = 0) -> str:
     return f"已压缩上下文: {len(head)} 条消息 → 1 条摘要({len(summary)} 字)"
 
 
+def _persist(msg: dict) -> None:
+    """**产生一条就落一条。** 主 agent 和子 agent 走的是同一个循环,落盘位置按当前上下文分。
+
+    为什么要逐条而不是"这一轮完了整体写一次":
+      · 一轮里可能有几十次工具调用、跑好几分钟。整体写意味着**中途崩溃/被打断就全丢**,
+        而中途被打断是常态(用户按 Ctrl+C、进程被杀、网络断)。
+      · 用户按 Ctrl+C 想留下的是"已经发生过的",不是"什么都没有"。整体写把这两者绑死在一起了。
+
+    落盘失败一律吞掉 —— 存不下不该打断对话(session 那边也是这个口径)。
+    """
+    c = ctx.current()
+    try:
+        if c.is_sub:
+            from . import tasks
+            tasks.append_message(c.task_id, msg)
+        else:
+            from . import session
+            session.append_messages([msg], session.current_session_id())
+    except Exception:  # noqa: BLE001 - 持久化失败不该影响对话
+        pass
+
+
+def _persist_rewrite(messages: list[dict]) -> None:
+    """整体重写。**只在历史被改写过时用**(如自动压缩把前半段换成了摘要)——
+    那种情况下追加会把"压缩前"和"压缩后"的消息混在一个文件里。"""
+    c = ctx.current()
+    try:
+        if c.is_sub:
+            from . import tasks
+            tasks.rewrite_messages(c.task_id, messages)
+        else:
+            from . import session
+            session.rewrite_session(messages, session.current_session_id())
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _inject_notices(messages: list[dict]) -> None:
+    """把后台子 agent 跑完的通报插进主 agent 的对话。
+
+    **插在每一步的开头,不能随便什么时候插。** 主 agent 的历史里,
+    `assistant(带 tool_calls)` 后面必须**紧跟**它的 tool 结果 —— 中间插一条 user
+    进去,那个历史就是非法的,下一次请求直接 400。子 agent 是在**另一个线程**里跑完的,
+    它随时可能来插一脚;所以不是"来了就写",而是**排进队列、由主 agent 在安全点自取**。
+    代价是最多等一步(那一步通常就是一次工具调用),换来的是历史永远是合法的。
+
+    **以 user 身份发,但要写明这不是用户打的字。** 用 user 是因为它确实是给主 agent 的
+    一条新输入(该被当成待办去处理,而不是一段参考信息);写明来源是因为不写的话,
+    主 agent 会以为用户刚说了句话,可能去回应一个根本不在场的人。
+    """
+    if ctx.current().is_sub:
+        return                      # 子 agent 不该收别的子 agent 的通报
+    from . import tasks
+    for t in tasks.needs_attention():
+        # 已经交给主 agent 过的就不再重复打扰(比如它 wait=true 干等拿到的那份)
+        t.delivered = True
+        messages.append({
+            "role": "user",
+            "content": "（系统消息,不是用户打的字:你之前派出去的后台子 agent 有结果了。\n\n"
+                       + tasks.report(t)["message"] +
+                       "\n\n**你自己判断怎么接**:手头这件事正做到一半、或者现在处理它会打断"
+                       "你的思路 —— 那就先不管它,把手上的做完再说。手头正好告一段落、"
+                       "或者它的结果恰好是你下一步要用的,就现在处理。别为了「及时」"
+                       "硬把正在做的事切断。)",
+        })
+        _persist(messages[-1])
+
+
+def _forget_announced(messages: list[dict]) -> None:
+    """压缩之后重算"哪些通报还在对话里"。
+
+    **不能无脑清标记然后重报** —— 压缩保留尾巴,那条通报如果正好在尾巴里,重报就变成
+    重复了(主 agent 收到同一份报告两遍)。所以这里**扫一遍幸存的消息**:谁的通知还在,
+    就仍旧算"已通报";被摘要掉的,才重新报一次。
+
+    这个扫描只在压缩之后做一次,平时不跑 —— 代价可以忽略。
+    """
+    try:
+        from . import tasks
+        alive = set()
+        for m in messages:
+            c = m.get("content")
+            if not isinstance(c, str):
+                continue
+            for t in tasks.needs_attention():
+                if f"[子 agent {t.id}" in c:
+                    alive.add(t.id)
+        for t in tasks.needs_attention():
+            t.delivered = t.id in alive
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def run(user_input: str, messages: list[dict], max_steps: int | None = None) -> str:
     """跑一轮:把 user_input 加进对话,循环"模型 → 工具 → 模型"直到它不再要工具。
 
@@ -67,13 +160,26 @@ def run(user_input: str, messages: list[dict], max_steps: int | None = None) -> 
                            # 结尾那行统计要把这一轮的全部算进来,不能只看最后一次
 
     messages.append({"role": "user", "content": user_input})
+    _persist(messages[-1])
 
     auto_compressed = False
     for _ in range(steps):
+        # 每一步的开头先收通报 —— 这是"安全点"(见 _inject_notices:插在 tool 配对中间
+        # 会让历史非法)。子 agent 干完了就在这儿被吸收进对话,**不用等用户再说话**。
+        _inject_notices(messages)
+
         # 上下文快满了就先压缩(工具调用过程中也照做),免得下一次请求超限;每轮最多压一次
         if not auto_compressed and context_ratio() >= AUTO_COMPACT_RATIO:
             auto_compressed = True
-            ctx.out().print(f"[自动压缩上下文] {compact(messages, keep_recent=2)}", style="dim")
+            note = compact(messages, keep_recent=2)
+            _persist_rewrite(messages)      # 历史被换掉了,只能整体重写
+            # **压缩会把通报吃掉。** 那条"某个子 agent 干完了等你处理"如果正好在被
+            # 摘要掉的那一段里,主 agent 就再也不知道这件事了 —— 而它是**待办**,不是
+            # 背景信息,不该跟着消息一起消失。所以把"已通报"的标记清掉,让
+            # _inject_notices 在下一步把还没处理的重报一遍(finish_task 关掉的不会重报,
+            # 它已经不在 needs_attention 里了)。
+            _forget_announced(messages)
+            ctx.out().print(f"[自动压缩上下文] {note}", style="dim")
         try:
             content, tool_calls, reasoning = stream_model(messages)
         except Exception as exc:  # noqa: BLE001 - 网络/流中断,给提示而不是崩掉
@@ -90,6 +196,7 @@ def run(user_input: str, messages: list[dict], max_steps: int | None = None) -> 
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
         messages.append(assistant_msg)
+        _persist(assistant_msg)
 
         # 模型不再要求调用工具 —— 说明它已经能回答了,循环结束
         if not tool_calls:
@@ -117,9 +224,13 @@ def run(user_input: str, messages: list[dict], max_steps: int | None = None) -> 
                     "content": dispatch(fname, fargs),
                 }
             )
+            _persist(messages[-1])
 
         # 这一轮若调用了 img,把登记好的图片作为 image_url 注入,给下一轮模型看
+        n_before = len(messages)
         inject_pending_images(messages)
+        for m in messages[n_before:]:       # 注入的那条也要落盘
+            _persist(m)
 
         # 被叫停了(见 tasks.kill)。**放在工具跑完之后 check** —— 正在执行的那次
         # 工具调用不打断,否则可能把它做到一半的文件留在那儿;但不会再走下一步。

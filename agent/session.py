@@ -63,6 +63,48 @@ def _persistable(messages: list[dict]) -> list[dict]:
     return messages[start:]
 
 
+def repair_dangling(messages: list[dict]) -> int:
+    """把**悬空的工具调用**补上一条结果(原地改),返回补了几条。
+
+    什么时候会悬空:模型已经发出了 tool_calls、但结果还没写回对话时被打断了 ——
+    Ctrl+C、进程被杀、网络断。这时历史里留着一个没有配对结果的 assistant 消息,
+    **直接发给 API 会 400**。
+
+    原来的对策是**整轮回滚**(把这一轮的对话全丢掉)。那是"宁可丢掉也不出错",
+    但代价太实在:用户等了半天的思考、跑完的工具调用,全没了。
+
+    更好的做法是**补一条说明**,而不是删掉:
+    - 已经跑完的工具调用,结果就在原地,一条都不会少
+    - 那个被打断的,补一句"这步的结果未知"——**不编一个成功**,因为编了会让模型
+      以为它做过了(而它可能连执行都没执行)
+    """
+    added = 0
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        if m.get("role") != "assistant" or not m.get("tool_calls"):
+            i += 1
+            continue
+        # 紧跟在后面的那串 tool 结果就是"已经答过的"
+        have, j = set(), i + 1
+        while j < len(messages) and messages[j].get("role") == "tool":
+            have.add(messages[j].get("tool_call_id"))
+            j += 1
+        missing = [c for c in m["tool_calls"] if (c.get("id") or "") not in have]
+        # **补在已有结果之后**(插在 i+1 会把真的结果挤到它后面,顺序就乱了):
+        # 工具结果的顺序该和 tool_calls 一致。
+        for k, c in enumerate(missing):
+            messages.insert(j + k, {
+                "role": "tool", "tool_call_id": c.get("id") or "",
+                "content": "（这一步被打断了:工具到底执行没执行、结果是什么,都未知。"
+                           "如果它可能有副作用(写文件、发请求、改状态),继续之前先确认"
+                           "实际发生了什么。)",
+            })
+            added += 1
+        i = j + len(missing)
+    return added
+
+
 def _safe_name(sid: str) -> str:
     """会话 id 只允许简单字符,免得拼出目录之外的路径。"""
     return "".join(c for c in sid if c.isalnum() or c in "-_") or "invalid"

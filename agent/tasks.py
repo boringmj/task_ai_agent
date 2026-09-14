@@ -165,6 +165,10 @@ class Task:
     # 用量和"在等什么"。
     ctx: object = None
     thread: object = None        # 它那条线程(退出时要收拢,见 shutdown)
+    # **结果交到主 agent 手上了吗。** 决定它还要不要再被通报一次 —— 主 agent 干等
+    # 拿到的(wait=true)不该回头再收一遍自己的通报。只活在内存里:重启之后重新通报
+    # 一次是对的(那会儿主 agent 确实不知道)。
+    delivered: bool = False
 
     def meta(self) -> dict:
         """落盘的元信息(不含 messages —— 那个单独一行行追加)。"""
@@ -183,7 +187,6 @@ class Task:
 
 _LOCK = threading.RLock()
 _TASKS: dict[str, Task] = {}
-_NOTIFY: list[str] = []          # 跑完的子 agent 的通报,等主 agent 下一轮开头收
 
 
 # ========================= 存储 =========================
@@ -223,8 +226,8 @@ def _save(t: Task) -> None:
 def _save_messages(t: Task) -> None:
     """整个对话重写一遍。
 
-    用"重写"而不是"追加":子 agent 的对话是**它自己的**,不需要像主会话那样为崩溃做
-    逐行增量保护 —— 真正怕丢的是主 agent 那边。重写顺带解决了压缩后要改历史的问题。
+    **平时用不到**(消息是产生一条落一条的,见 append_message)。留着是给"历史被改写过"
+    的情况:它自己的自动压缩把前半段换成了摘要,那时追加会把压缩前后混在一个文件里。
     """
     try:
         d = _dir(t)
@@ -233,6 +236,34 @@ def _save_messages(t: Task) -> None:
             for m in t.messages:
                 f.write(json.dumps(m, ensure_ascii=False) + "\n")
     except (OSError, TypeError, ValueError):
+        pass
+
+
+def append_message(tid: str, msg: dict) -> None:
+    """**产生一条就落一条。**
+
+    子 agent 跑起来动辄几十步、几分钟。只在跑完整体写一次的话,中途崩溃/被杀就什么都
+    没留下 —— 而"中途被打断"是常态不是意外(和会话那边同一个理由,见 session.py 头部)。
+    """
+    try:
+        d = task_dir(tid, _TASKS[tid].session if tid in _TASKS else None)
+        d.mkdir(parents=True, exist_ok=True)
+        with (d / "messages.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+            f.flush()
+    except (OSError, KeyError, TypeError, ValueError):
+        pass
+
+
+def rewrite_messages(tid: str, messages: list[dict]) -> None:
+    """整体重写(只在它自己的历史被改写过时用,如自动压缩)。"""
+    try:
+        d = task_dir(tid, _TASKS[tid].session if tid in _TASKS else None)
+        d.mkdir(parents=True, exist_ok=True)
+        with (d / "messages.jsonl").open("w", encoding="utf-8") as f:
+            for m in messages:
+                f.write(json.dumps(m, ensure_ascii=False) + "\n")
+    except (OSError, KeyError, TypeError, ValueError):
         pass
 
 
@@ -375,10 +406,9 @@ def _run(t: Task) -> None:
         t.status = outcome
         t.usage = dict(c.total_usage)
         t.updated = _now()
-        _save_messages(t)
+        # 消息是逐条落盘的(见 append_message),收尾不用再整体重写 ——
+        # 只有它自己被压缩过的那种情况才需要,那个由 loop 负责调 rewrite_messages
         _save(t)
-        if outcome == "done" and not t.awaited:
-            _notify(t)
         # 花了多少,给**人**看,不给主 agent —— 报告里那句"12 次请求 / 8400 tokens"是
         # 纯账目,主 agent 拿它做不了任何决定,却要为它把整段上下文重发一遍。
         #
@@ -422,6 +452,7 @@ def _wait_for(t: Task, timeout: float | None) -> dict:
     try:
         while True:
             if t.notifier.wait(WAIT_POLL):
+                t.delivered = True      # 交到主 agent 手上了,别再通报一遍
                 return report(t)
             now = time.monotonic()
             if now >= deadline:
@@ -462,35 +493,30 @@ def _beat(t: Task, elapsed: float, hint: str = "") -> None:
         pass
 
 
-def _notify(t: Task) -> None:
-    """跑完了,给主 agent 留一条通报 —— 它下一轮开头会收到。"""
-    with _LOCK:
-        _NOTIFY.append(t.id)
+# 这些状态都需要主 agent 过一眼:干完了要验收、被砍断了要决定接着干还是算了、
+# 停着等回话要答、失败/中断要处置。
+_NEEDS_MAIN = ("done", "truncated", "failed", "waiting_input", "interrupted")
 
 
-def pending_notifications() -> list[str]:
-    """取走"跑完了但主 agent 还没看到"的通报(取走即清空)。
+def needs_attention() -> list["Task"]:
+    """**还没交到主 agent 手上、而且需要它处理**的任务(限本会话)。
 
-    只取**当前会话**的:切换会话之后,别的会话的子 agent 干完了,不该报给这边的主
-    agent —— 那是另一段对话的事,这边既没有它的上下文、也无从处置。它的结果在它
-    自己会话的盘上,回到那个会话就翻得到。
+    这是"通报"的正确模型:它**不是一个一次性的消息,而是一个未处理的子 agent**。
+
+    为什么不能是消息:消息进了对话就可能被**压缩掉**。实测会发生的场景 —— 主 agent
+    决定"先干完手上的再管它"(那是它该有的判断),两步之后上下文触发自动压缩,那条
+    通报正好在要被摘要掉的那一段里。而"这件事还没被处理"**不该跟着消息一起消失**。
+
+    所以每一轮都**重新问一遍**"还有谁等着主 agent",而不是发一次就忘。已经交过的
+    (delivered)不重复打扰;`finish_task` 关掉的自然就不在这个集合里了。
     """
     my = _sid()
     with _LOCK:
-        ids, _NOTIFY[:] = list(_NOTIFY), []
-    out = []
-    for tid in ids:
-        t = _TASKS.get(tid)
-        if t is None:
-            continue
-        if t.session and t.session != my:
-            # 不是这个会话的 —— **扔回队列**,等回到那个会话再交(不是丢弃)
-            with _LOCK:
-                _NOTIFY.append(tid)
-            continue
-        if t.status == "done":
-            out.append(report(t)["message"])
-    return out
+        snap = list(_TASKS.values())
+    return [t for t in snap
+            if (not t.session or t.session == my)
+            and t.status in _NEEDS_MAIN
+            and not t.delivered]
 
 
 # ========================= 交回结果 =========================
@@ -723,7 +749,9 @@ def _load(tid: str) -> Task | None:
         t.fs = FsGrant(read=tuple(fs.get("read") or ()),
                        write=tuple(fs.get("write") or ()),
                        delete=bool(fs.get("delete")))
-    t.messages = _repair(_load_messages(tid))
+    t.messages = _load_messages(tid)
+    # 悬空的工具调用补上说明 —— 不补的话,续跑的第一步就是 400
+    _session.repair_dangling(t.messages)
     return t
 
 
@@ -740,38 +768,6 @@ def _load_messages(tid: str) -> list[dict]:
             out.append(json.loads(line))
         except ValueError:
             continue                      # 最后一行可能写了一半(崩溃),跳过就好
-    return out
-
-
-def _repair(messages: list[dict]) -> list[dict]:
-    """把**悬空的工具调用**补上一条结果。
-
-    崩溃可能正好发生在"模型已经发出 tool_calls"和"结果写回对话"之间。这时历史里留着
-    一个没有配对结果的 assistant 消息,直接发给 API 会 400 —— 恢复出来的任务**第一步就
-    卡死**,而且看起来像是"它自己不干了"。
-
-    补的那条要说清是**中断**,不能编一个结果:那一步到底有没有产生副作用(写了文件?
-    发了请求?)是未知的,编一个"成功"会让人以为它做过了。
-    """
-    out: list[dict] = []
-    for i, m in enumerate(messages):
-        out.append(m)
-        if m.get("role") != "assistant" or not m.get("tool_calls"):
-            continue
-        answered = set()                  # 紧跟其后的那串 tool 结果
-        j = i + 1
-        while j < len(messages) and messages[j].get("role") == "tool":
-            answered.add(messages[j].get("tool_call_id"))
-            j += 1
-        for c in m["tool_calls"]:
-            cid = c.get("id") or ""
-            if cid and cid not in answered:
-                out.append({
-                    "role": "tool", "tool_call_id": cid,
-                    "content": "（中断:进程在这一步之后退出了,这个工具到底执行没执行、"
-                               "结果是什么,都未知。如果这一步可能有副作用(写文件、发请求、"
-                               "改状态),重做之前先确认实际发生了什么。）",
-                })
     return out
 
 

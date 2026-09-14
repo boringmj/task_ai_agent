@@ -29,7 +29,6 @@ from .session import (
     load_session,
     release_owner,
     session_note as session_note_text,
-    rewrite_session,
     touch_session,
 )
 from .tools.container import docker_cleanup_stale, docker_health
@@ -329,11 +328,11 @@ def _session_loop() -> None:
             # 后台子 agent 干完了 → 在这儿把通报塞进对话,主 agent 下一句话就带着它。
             # 放在用户输入**之前**追加:子 agent 是在用户上一句话的上下文里干完的,
             # 通报属于那件事的后续,不该排在新问题后面。
-            for note in tasks.pending_notifications():
-                messages.append({
-                    "role": "system",
-                    "content": "（后台子 agent 的通报,你没在等它,它自己干完了）\n\n" + note,
-                })
+            # 后台子 agent 的通报**不在这里收** —— 由 loop 在每一步开头收(见
+            # loop._inject_notices)。那两个位置看起来一样(都是"用户输入之前"),
+            # 但 loop 那个多覆盖一种情况:**主 agent 还在干活时子 agent 干完了** ——
+            # 那时它下一步就会看到,不用等用户再敲一次键盘。收在一个地方就够了。
+            #
             # 终端指令(/compact、/reset、/tokens…)。注册在 agent/commands/ 里,
             # 系统提示词中那段说明也由同一份注册表生成,不用两头各维护一遍。
             cmd_ctx = CommandContext(messages)
@@ -356,36 +355,35 @@ def _session_loop() -> None:
                     break
                 continue
 
-            # 快照这一轮开始前的整份历史。存"内容"而不是长度 —— 本轮里可能发生
-            # 自动压缩(把历史改短),那时按长度回滚会算错位置:短了删不掉、长了会
-            # 把压缩后的新历史也削掉一截。整份快照才能精确还原。
-            # 浅拷贝即可,消息字典本身不再改动;还原用切片赋值,list 对象身份不变。
-            snapshot = list(messages)
             try:
                 reply = run(text, messages)
             except KeyboardInterrupt:
-                # 执行中 Ctrl+C:回滚半截对话,回到提示,会话不退出
-                messages[:] = snapshot
-                console.print("\n[已取消]", style="bold red")
+                # 执行中 Ctrl+C:**不回滚,只打断。**
+                # 已经说过的话、已经跑完的工具调用全都留着 —— 用户按 Ctrl+C 想停下的是
+                # "还在跑的那个东西",不是"把刚才发生的事都抹掉"。
+                #
+                # 但半截历史里可能留着一个**没有配对结果的 tool_calls**(正好在工具执行
+                # 途中被打断),那个直接发给 API 会 400 —— 这就是原来回滚的原因。
+                # 对策从"删掉整轮"换成"**补一条说明**":已经发生的照原样留着,被打断的
+                # 那一步补一句"结果未知"(不编一个成功 —— 它可能压根没执行)。
+                n = session.repair_dangling(messages)
+                if n:
+                    session.append_messages(messages[len(messages) - n:], current_session_id())
+                console.print("\n[已取消 —— 上面已经发生的都留着]", style="bold red")
                 continue
             except Exception as exc:  # noqa: BLE001
-                # 未预期的错误(渲染、网络、工具内部崩了……)绝不能掀翻整个会话 ——
-                # 丢掉这一轮的对话会让人白等,还要从头把上下文喂一遍。
-                # 这里 **同样要回滚**:半截历史里很可能留着一个没有 tool 结果配对的
-                # tool_calls,那个发给 API 会直接 400,回滚才能保证历史始终合法。
-                messages[:] = snapshot
-                console.print(f"\n[出错,本轮已回滚]{type(exc).__name__}: {exc}", style="bold red")
+                # 未预期的错误(渲染、网络、工具内部崩了……)绝不能掀翻整个会话。
+                # 同样**不回滚**:理由和上面一样,把已经跑完的丢掉太可惜了,而且用户
+                # 往往正是靠那些信息才看得懂出了什么事。修好历史合法性就够了。
+                n = session.repair_dangling(messages)
+                if n:
+                    session.append_messages(messages[len(messages) - n:], current_session_id())
+                console.print(f"\n[出错,本轮中止]{type(exc).__name__}: {exc}", style="bold red")
                 continue
 
-            # 这一轮成功了才落盘(回滚的两个分支上面都 continue 了,不会被写进去)。
-            # 整份重写而不是追加:本轮里可能发生过自动压缩,历史已被整体换掉,
-            # 追加会把"压缩后"和"压缩前"的消息混在一个文件里。文件本身有界
-            # (受上下文上限与压缩约束,通常几百 KB),整体重写的开销可忽略,
-            # 换来的是怎么都不会错。
-            # 会话 id 每次现取 —— /switch 会换掉它,而启动时那个 session_id 是局部变量、
-            # 切完就过期了。取错的那个会把**新会话的历史写进旧会话的文件**,而且落盘是
-            # 整份重写,旧会话原有内容会被直接覆盖掉(实测踩过:切一次会话丢一份记录)。
-            rewrite_session(messages, current_session_id())
+            # 消息是**产生一条落一条**的(见 loop._persist),所以这里不用再整体落盘 ——
+            # 中途被打断时,已经发生过的那些已经在盘上了。**只有历史被改写过的情况**
+            # (自动压缩)才需要整体重写,那个由 loop 自己在压缩之后做掉。
 
             console.print("AI >", style="bold green")
             # Markdown 要拿到完整文本才能正确解析,所以是等模型说完再一次性渲染
