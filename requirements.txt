@@ -10,3 +10,7 @@ pyperclip>=1.8
 # 跑 tests/ 才需要(不在运行时被 import):
 #   .venv/Scripts/python.exe -m pytest tests/ -q
 pytest>=8.0
+# 看覆盖率(回答"哪些核心功能还没被盯住"),跑法:
+#   .venv/Scripts/python.exe -m coverage run --source=agent -m pytest tests/ -q
+#   .venv/Scripts/python.exe -m coverage report -m
+coverage>=7.0
