@@ -108,6 +108,33 @@ def task_status(task_id: str = "") -> str:
 
 
 @tool(
+    description="**验收并收尾**一个子 agent。它干完/停下来之后,由你做这个判断 —— "
+                "它是不会自己消失的,得你明确处置。"
+                "verdict=accept:验收通过,关闭它(对话和产出仍留在盘上,用户之后有疑问"
+                "翻得到);**收尾之前先看一眼它的产出**:报告里说的「产出」路径去确认存在、"
+                "抽查内容,别只信它的摘要 —— 摘要是概括,概括可能漏。"
+                "verdict=rework:打回重做,note 里写清哪里不行、要它怎么改(空着打回等于"
+                "让它把同一件事再做一遍)。"
+                "verdict=stop:不要了,停下并关闭。",
+    parameters={
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "任务号,如 t1"},
+            "verdict": {"type": "string", "enum": ["accept", "rework", "stop"],
+                        "description": "accept=验收通过并关闭;rework=打回重做;stop=不要了。"},
+            "note": {"type": "string",
+                     "description": "verdict=rework 时**必填**:哪里不行、要它怎么改。"
+                                    "其他情况可以不填。"},
+        },
+        "required": ["task_id", "verdict"],
+    },
+)
+def finish_task(task_id: str, verdict: str = "accept", note: str = "") -> str:
+    from .. import tasks
+    return tasks.finish((task_id or "").strip(), verdict, note)
+
+
+@tool(
     description="把一个**停下来等你回话**的子 agent 接着放下去跑。"
                 "两种情况会用到:它中途挂起问你(申请权限、要问用户、拿不准要你定)、"
                 "或者上次进程退出把它中断了。"

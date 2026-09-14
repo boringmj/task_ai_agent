@@ -213,6 +213,13 @@ def _make_stdio_forgiving() -> None:
 
 
 def _on_exit() -> None:
+    # 先把还在跑的子 agent 叫停并等一小会儿 —— 它们是 daemon 线程,主线程一退
+    # 解释器就开始关停,那时还有线程碰 stdout 会直接 Fatal error(见 tasks.shutdown)
+    try:
+        tasks.shutdown()
+    except Exception:  # noqa: BLE001 - 收尾失败不该阻止退出
+        pass
+
     """退出收尾:把 last 指向当前会话,再摘掉自己的占用标记。
 
     两个都要现取会话 id,**别用启动时那个 session_id** —— /switch 会换掉它,而局部变量

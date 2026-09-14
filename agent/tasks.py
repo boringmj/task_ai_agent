@@ -47,6 +47,8 @@ BUFFER_MAX_CHARS = int(os.environ.get("SUBAGENT_BUFFER_MAX", "200000"))
 # 用户当前"接管"着哪个子 agent(见 attach)。**只有一个** —— 一次看一个才看得清。
 _ATTACHED: str | None = None
 _ATTACH_LOCK = threading.RLock()
+# 进程正在退出。**置上之后一律不再往 stdout 转发** —— 见 shutdown 的说明。
+_SHUTTING_DOWN = False
 
 
 def attached() -> str | None:
@@ -96,7 +98,7 @@ class _Sink(io.TextIOBase):
         self.size += len(s)
         while self.size > self.limit and len(self.parts) > 1:
             self.size -= len(self.parts.pop(0))
-        if self.tid and _ATTACHED == self.tid:
+        if self.tid and _ATTACHED == self.tid and not _SHUTTING_DOWN:
             # 直接用 sys.stdout,不走 rich:这些片段本来就是 rich 排版好的,
             # 再过一遍渲染只会把格式弄乱。打不出来也不该影响子 agent 干活。
             try:
@@ -127,7 +129,8 @@ def _buffer_console(tid: str):
 class Task:
     id: str
     prompt: str
-    status: str = "queued"       # queued / running / waiting_input / done / failed / interrupted
+    # queued → running → done / waiting_input / failed / interrupted → closed(验收后)
+    status: str = "queued"
     vm: bool = False             # 主 agent 有没有把 VM 开给它
     fs: FsGrant = field(default_factory=FsGrant)   # 它能读写哪儿
     created: str = field(default_factory=_now)
@@ -146,6 +149,7 @@ class Task:
     # 它的运行时上下文(活的才有;从磁盘读回来的没有)。留着是为了能看它的输出缓冲、
     # 用量和"在等什么"。
     ctx: object = None
+    thread: object = None        # 它那条线程(退出时要收拢,见 shutdown)
 
     def meta(self) -> dict:
         """落盘的元信息(不含 messages —— 那个单独一行行追加)。"""
@@ -309,6 +313,7 @@ def _start(t: Task) -> None:
     t.updated = _now()
     _save(t)
     th = threading.Thread(target=_run, args=(t,), name=f"subagent-{t.id}", daemon=True)
+    t.thread = th
     th.start()
 
 
@@ -325,7 +330,11 @@ def _run(t: Task) -> None:
     try:
         with ctx.use(c):
             t.result = loop_run(t, c)
-        if c.suspend:
+        if c.cancelled:
+            # 叫停(用户 /subtasks kill,或主 agent finish_task stop)。
+            # **直接落到 closed**:它没有"结果"可验收,再要一次确认只是多一步。
+            outcome = "closed"
+        elif c.suspend:
             outcome, t.ask = "waiting_input", str(c.suspend.get("ask") or "")
     except Exception as exc:  # noqa: BLE001 - 子 agent 崩溃不能带走主 agent
         outcome = "failed"
@@ -346,8 +355,14 @@ def _run(t: Task) -> None:
             _notify(t)
         # 花了多少,给**人**看,不给主 agent —— 报告里那句"12 次请求 / 8400 tokens"是
         # 纯账目,主 agent 拿它做不了任何决定,却要为它把整段上下文重发一遍。
+        #
+        # **必须用 c.console,不能用 ctx.out()**:这段 finally 在 `with ctx.use(c)` **外面**,
+        # 那时 ctx.current() 已经不是这个子 agent 了 —— ctx.out() 会解析到**真正的终端**,
+        # 于是:① 它的话漏到主终端上(哪怕没被接管);② 一个 daemon 线程在解释器关闭时
+        # 写 stdout,会直接触发 "Fatal Python error: could not acquire lock for
+        # <_io.BufferedWriter name='<stdout>'>"。两条都踩过。
         try:
-            ctx.out().print(f"{t.id} [{t.status}] {_cost_line(t)}",
+            c.console.print(f"{t.id} [{t.status}] {_cost_line(t)}",
                             style="dim", markup=False)
         except Exception:  # noqa: BLE001
             pass
@@ -483,7 +498,7 @@ def tell(tid: str, text: str) -> str:
     if t.status == "running":
         t.messages.append({"role": "user", "content": text})
         return f"已插进 {tid} 的对话,它下一步会看到。"
-    if t.status in ("waiting_input", "interrupted", "done"):
+    if t.status in ("waiting_input", "interrupted", "done", "closed"):
         # 干完了还能接着聊:把话续在结论之后,等于"再让它做一件事"。
         t.resumed.append(text)
         t.ask = ""
@@ -494,6 +509,63 @@ def tell(tid: str, text: str) -> str:
         _start(t)
         return f"{tid} 接着跑了(在它之前那段的后面接着做)。" if t.messages else f"{tid} 跑起来了。"
     return f"{tid} 现在是 {t.status},没法接话。"
+
+
+def finish(tid: str, verdict: str = "accept", note: str = "") -> str:
+    """**验收并处置**一个子 agent —— 它干完之后,由主 agent 决定怎么收场。
+
+    三种结局,对应主 agent 拿到报告之后真正会做的三种判断:
+
+    - `accept` —— 验收通过。标记关闭、从活跃列表里移走(对话和产出**都还在盘上**,
+      用户之后有疑问仍然翻得到),并释放它占的内存(那个输出缓冲区不小)。
+    - `rework` —— 打回重做。把 note 当成新指令续给它,它带着意见接着干。
+    - `stop` —— 不要了。叫停并关闭。
+
+    **为什么关闭不能是自动的**:子 agent 说"干完了"不等于活干好了。中间隔着一层
+    概括,而概括可能漏、可能偏。让它自己消失,等于默认它说的就是真的 —— 那正是
+    这套设计一直在防的事(看着像结论的东西)。
+    """
+    t = get(tid)
+    if t is None:
+        return f"没有 {tid} 这个任务。现有:{listing()}"
+    verdict = (verdict or "accept").strip().lower()
+
+    if verdict in ("accept", "ok", "done"):
+        if t.status == "running":
+            return (f"{tid} 还在跑,没法验收。等它停下来(它每步之间会检查中止信号,"
+                    f"或者你等它跑完),再看 /subtasks {tid}。")
+        t.status = "closed"
+        t.updated = _now()
+        t.ctx = None                  # 缓冲区不小,关了就别留着
+        _save(t)
+        return (f"已验收关闭 {tid}。它的对话和产出都还在"
+                f"({task_dir(tid)}),用户之后有疑问翻得到。")
+
+    if verdict in ("rework", "redo"):
+        if not note.strip():
+            return (f"打回 {tid} 得说清**哪里不行、要它怎么改** —— 空着打回,"
+                    f"它只会把同一件事再做一遍。")
+        if t.status == "running":
+            return f"{tid} 还在跑,等它停下来再打回。"
+        t.resumed.append(f"[主 agent 看过你的结果,打回重做]\n{note.strip()}")
+        t.ask = ""
+        t.notifier = threading.Event()
+        t.awaited = False
+        _start(t)
+        return f"{tid} 已带着你的意见重做。"
+
+    if verdict in ("stop", "kill", "cancel"):
+        if t.status == "running" and t.ctx is not None:
+            t.ctx.cancelled = True
+            return (f"已叫停 {tid} —— 它在当前这一步做完之后停,然后会自动关闭"
+                    f"(正在跑的那次工具调用不会被打断)。")
+        t.status = "closed"
+        t.updated = _now()
+        t.ctx = None
+        _save(t)
+        return f"已关闭 {tid}。"
+
+    return f"不认识的 verdict {verdict!r} —— 只认 accept / rework / stop。"
 
 
 def kill(tid: str) -> str:
@@ -617,18 +689,54 @@ def recover() -> list[str]:
 
 # ========================= 查询 =========================
 
-def listing() -> str:
-    """给人/给主 agent 看的任务清单。"""
+def listing(show_closed: bool = False) -> str:
+    """给人/给主 agent 看的任务清单。
+
+    **已关闭的默认不列**:它们已经验收完了,再列只会把真正需要看的挤下去。
+    但数量告诉你 —— 免得以为它们消失了(对话和产出都还在盘上)。
+    """
     if not _TASKS:
         return "(还没有派过任何子 agent)"
     lines = []
+    closed = 0
     for tid in sorted(_TASKS, key=lambda k: int(k[1:] or 0)):
         t = _TASKS[tid]
+        if t.status == "closed":
+            closed += 1
+            if not show_closed:
+                continue
         line = f"- {t.brief()}"
         if t.status == "waiting_input":
             line += f"\n    在等: {t.ask}"
         lines.append(line)
-    return "\n".join(lines)
+    if closed and not show_closed:
+        lines.append(f"(另有 {closed} 个已验收关闭的,用 /subtasks all 看)")
+    return "\n".join(lines) if lines else "(没有活跃的子 agent)"
+
+
+def shutdown(timeout: float = 3.0) -> str:
+    """退出前把还在跑的子 agent 收拢。
+
+    **为什么非收不可**:它们是 daemon 线程,主线程一退出,解释器就开始关停 —— 那时
+    还有线程在往 stdout 写的话,Python 会直接抛
+    `Fatal Python error: could not acquire lock for <_io.BufferedWriter ...>`,
+    用户看到的是崩溃栈而不是正常退出。
+
+    做法是先叫停、再等一小会儿。等不到也不要紧:下面把**转发关掉**(见 `_Sink`),
+    剩下的线程就算还活着也碰不到 stdout 了 —— 那才是崩溃的根因,等不等得到只是体面问题。
+    """
+    global _SHUTTING_DOWN
+    with _LOCK:
+        live = [t for t in _TASKS.values() if t.status == "running"]
+    for t in live:
+        if t.ctx is not None:
+            t.ctx.cancelled = True
+    for t in live:
+        th = getattr(t, "thread", None)
+        if th is not None and th.is_alive():
+            th.join(timeout / max(1, len(live)))
+    _SHUTTING_DOWN = True
+    return f"退出前收拢了 {len(live)} 个还在跑的子 agent。" if live else ""
 
 
 def get(tid: str) -> Task | None:

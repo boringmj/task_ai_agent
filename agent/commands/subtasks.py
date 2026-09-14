@@ -31,7 +31,9 @@ def cmd_subtasks(ctx: Context) -> str:
         return "\n".join(x for x in (tasks.listing(), head) if x)
 
     tid = args[0]
-    if tid == "off":
+    if tid in ("off", "all"):
+        if tid == "all":
+            return tasks.listing(show_closed=True)
         return tasks.detach()
 
     rest = args[1:]
