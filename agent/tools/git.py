@@ -170,7 +170,13 @@ def _git_clone(repo: Path, *args: str) -> str:
 
 
 @tool(
-    agents=("main", "sub"),
+    # **只给主 agent。** 两个理由,哪个单独都够:
+    #   1. `restore`/`checkout`/`rm`/`mv` 都在允许名单里,它们**改写工作区文件** ——
+    #      子 agent 的写权限是按范围划的,而这些命令一步就能把整个工作区退回某个状态,
+    #      把别的 agent 正在写的东西一起抹掉。授权得覆盖得住,才算授权。
+    #   2. 同一时刻只能有一个 git 在同一个仓库里干活(`index.lock`),几个子 agent
+    #      并排提交是互相锁死。提交这种"给整批改动定一个点"的动作,本来就该由
+    #      协调者做。
     description="执行 git 子命令。默认(不给 repo)操作工作区根仓库,管 workspace 内容自己的版本。"
                 "clone 外部仓库时用 'clone <url> <clones/下的目录>',仓库会落在 clones/ 下,独立于根仓库。"
                 "操作克隆进来的仓库时,把 repo 设成 'clones/xxx'。"

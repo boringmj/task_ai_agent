@@ -13,6 +13,8 @@ from ..core import (
     ROOT,
     clip_text,
 )
+from .. import ctx
+from ..ctx import FS_ANY
 from ..skills import CONTAINER_SKILLS_DIR, SKILLS_DIR
 
 
@@ -20,6 +22,8 @@ from ..skills import CONTAINER_SKILLS_DIR, SKILLS_DIR
 # ---- 容器执行(Docker 沙箱)相关 ----
 # 安全项全部硬编码在 _docker_run 里,不给 agent 配置入口。
 CONTAINER_IMAGE = os.environ.get("DOCKER_IMAGE", "python:3.11-slim")
+# 容器里 pip 的安装目标(相对工作区)。它对**所有** agent 可写,理由见 _workspace_mounts。
+PYLIBS_REL = ".pylibs"
 # 容器内命令的硬超时:用 GNU timeout 在容器内部自我了断。
 # 即使 agent 进程崩溃,容器也能到点自毁并被 --rm 清掉,不会无限残留。
 CONTAINER_CMD_TIMEOUT = int(os.environ.get("DOCKER_CMD_TIMEOUT", "60"))
@@ -104,6 +108,40 @@ def _docker_image_present() -> bool:
     return r.returncode == 0
 
 
+def _workspace_mounts() -> list[str]:
+    """按当前 agent 的写权限,决定工作区**怎么挂进容器**。
+
+    **为什么非这么做不可**:文件工具的读写检查(`safe_path`)只管得住走它的那些调用。
+    容器里跑的是**任意代码**,而工作区是挂进去的 —— 只要挂的是可写的,一句
+    `open("/workspace/x","w")` 就绕过去了。那不是"检查被绕过",是**那条路上根本没有检查**。
+    而要说一句"请你不要这么做"就能拦住模型,这套东西的其余部分也就不用做了。
+
+    所以把授权做进**挂载**里:底**只读**,允许写的那些地方再用更长的路径盖上去
+    (重叠挂载时 Docker 取最具体的那条)。容器在操作系统层面就写不动别处 ——
+    不依赖模型配合,也没有"换个法子绕过去"的余地。
+
+    副作用要说清楚:受限的子 agent 在容器里**创建不了新文件到未授权的地方**,
+    `/tmp` 是 tmpfs 所以临时文件照常。`.pylibs` 单独开一个可写口子 —— 那是 pip 的
+    安装目标,skills 里到处写着 `pip install --target /workspace/.pylibs`,堵了就没法装包了。
+    它是个包目录,不是用户的工作成果,拿它当例外是划算的。
+    """
+    fs = ctx.current().fs
+    if FS_ANY in fs.write:
+        return ["-v", f"{ROOT}:/workspace"]
+    out = ["-v", f"{ROOT}:/workspace:ro"]
+    writable = list(fs.write)
+    if PYLIBS_REL not in writable:
+        writable.append(PYLIBS_REL)
+    for rel in writable:
+        p = (ROOT / rel).resolve()
+        if not p.is_relative_to(ROOT):
+            continue                      # 越界的范围直接忽略,绝不放宽
+        if not p.exists():
+            p.mkdir(parents=True, exist_ok=True)
+        out += ["-v", f"{p}:/workspace/{rel}"]
+    return out
+
+
 def _docker_run(inner: list[str]) -> str:
     """在容器里执行,安全项硬编码。inner 是镜像之后的命令(如 ['python','-c','...'])。"""
     ok, err = docker_health()
@@ -125,7 +163,7 @@ def _docker_run(inner: list[str]) -> str:
         # PYTHONPATH 指向 workspace/.pylibs:agent 用 `pip install --target /workspace/.pylibs`
         # 装一次就永久保留(workspace 是宿主盘,不随容器销毁),之后每次 run_python 都能 import。
         "-e", "PYTHONPATH=/workspace/.pylibs",
-        "-v", f"{ROOT}:/workspace", "-w", "/workspace",  # 唯一可写的:只有 workspace
+        *_workspace_mounts(), "-w", "/workspace",   # 挂法跟着授权走,见 _workspace_mounts
         # 技能目录**只读**挂进来:`:ro` 保证容器改不了它 —— 技能是项目里的事实来源,
         # 不该被跑在里面的代码篡改。技能自带的脚本因此能在容器里跑:
         #   skills/<名>/scripts/x.py  ->  /skills/<名>/scripts/x.py
