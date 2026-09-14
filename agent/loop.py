@@ -6,7 +6,6 @@ from .core import (
     MAX_STEPS,
     MODEL,
     client,
-    console,
 )
 from .llm import stream_model, context_ratio, begin_turn
 from .tools.media import inject_pending_images

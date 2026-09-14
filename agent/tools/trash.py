@@ -10,9 +10,6 @@ from datetime import datetime
 from pathlib import Path
 
 from ..core import (
-    CLONES_DIR,
-    GIT_DIR,
-    MEMORY_FILE,
     ROOT,
     TRASH_DIR,
     is_system_dir,

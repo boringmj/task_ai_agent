@@ -31,7 +31,6 @@ from pathlib import Path
 
 from . import ctx, prompts
 from .ctx import FS_ANY, FsGrant
-from .core import MAX_STEPS
 from . import session as _session
 
 # 子 agent 的步数上限。比主 agent 小一些,但它要跑完一件**完整**的活 —— 实测一次真仓库的

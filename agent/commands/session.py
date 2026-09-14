@@ -5,6 +5,7 @@ from . import Context, command
 
 
 from .. import prompts
+from ..tools.vm import VM_AUTOSTART
 
 
 @command(

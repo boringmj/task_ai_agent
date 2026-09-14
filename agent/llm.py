@@ -7,7 +7,6 @@ from .core import (
     MODEL,
     MAX_CONTEXT_TOKENS,
     client,
-    console,
 )
 from .tools.registry import TOOLS
 

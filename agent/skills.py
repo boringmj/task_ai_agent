@@ -317,7 +317,7 @@ def _dep_lines(deps: list[dict], field: str, role: str = "main") -> list[str]:
             # 一遍为什么,白烧一轮。
             others = _agents_of(d["name"])
             if others and role not in others:
-                head += f" —— 注意:它的**正文你加载不了**(只给子 agent),只能用它的文件"
+                head += " —— 注意:它的**正文你加载不了**(只给子 agent),只能用它的文件"
         elif state == "missing" and d["kind"] == "pip":
             # 说清**查的是什么**,而不是断言"没装"。宿主只能看见 .pylibs,像基础镜像自带的
             # 包它就看不见 —— 写成"没有"是把话说过了头,而模型据此去告诉用户"做不了"。

@@ -22,7 +22,6 @@
 同一套规则 —— 它跑在容器里,能读到只读挂载的技能目录。**改这里的规则时别忘了改那份。**
 """
 import re
-import sys
 import pathlib
 
 # MD013(行太长)曾经在这里按 80 字符卡,而且故意卡得比 markdownlint 还严。关掉的理由:

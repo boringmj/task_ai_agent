@@ -8,7 +8,6 @@ import atexit
 import json
 import socket
 import secrets
-import shutil
 import subprocess
 import threading
 import time
