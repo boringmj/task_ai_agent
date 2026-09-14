@@ -8,11 +8,11 @@ grep 一定漏**,尤其是"技能引用自己"那种(改自己的名字时,眼�
 
 只依赖标准库,因为它要能在容器里直接跑(技能目录是只读挂载的,只能读、不能改)。
 
-用法:
-    python3 /skills/writing-skills/scripts/check_skill.py              # 查全部技能
-    python3 /skills/writing-skills/scripts/check_skill.py <技能目录>   # 查一个
-    python3 /skills/writing-skills/scripts/check_skill.py <SKILL.md>   # 查单个文件
-    python3 /skills/writing-skills/scripts/check_skill.py --graph      # 列技能间的引用关系
+用法(路径相对技能目录;在容器里的实际位置见加载技能时给的资源清单):
+    python3 scripts/check_skill.py              # 查全部技能
+    python3 scripts/check_skill.py <技能目录>   # 查一个
+    python3 scripts/check_skill.py <SKILL.md>   # 查单个文件
+    python3 scripts/check_skill.py --graph      # 列技能间的引用关系
 
 --graph 不给"图"、给**清单**:谁引用了谁(分"资源依赖"与"仅提及"两档,强度差很多)、
 改某个技能要同步哪些地方,以及三类值得看一眼的情况 —— 互相引用(可能是在推诿)、
@@ -24,14 +24,25 @@ import pathlib
 import re
 import sys
 
+# PyYAML 是**可选**的:装了就能完整读 frontmatter(嵌套、列表都对),没装就只能读
+# 平铺的 `键: 值`,而依赖字段恰恰是列表 —— 那时会明说读不了,不装作读懂了。
+try:
+    import yaml
+except ImportError:                                          # noqa: SIM105
+    yaml = None
+
 # 技能正文里的路径引用:行内代码里的 scripts/xxx、references/xxx、assets/xxx。
 # 只取到空白或占位符为止 —— 否则 `scripts/foo.py <目标路径>` 这种会被整句抓进来。
 RES_REF = re.compile(r"`((?:scripts|references|assets)/[^\s`<*]+)")
-# 容器里的绝对路径引用:/skills/<名>/<路径>
-CONTAINER_REF = re.compile(r"/skills/([A-Za-z0-9_-]+)/([^\s`\"')\]）,。;:]+)")
+# **用别的技能的资源**时的写法:`技能名/scripts/x.py` —— 相对,但带了域名,一眼看得出
+# 是谁的。比"同一行里提到某个技能名"那种猜测可靠得多,也能直接拿去对文件在不在。
+CROSS_REF = re.compile(r"`([a-z][a-z0-9-]*)/((?:scripts|references|assets)/[^\s`<*]+)")
+# 写死的容器绝对路径:`/skills/<名>/...`。**这是要被禁掉的东西**(理由见 check_skill)。
+# 带 `<`、`…`、`*` 的是示例占位写法,不算。
+HARD_PATH = re.compile(r"/skills/([A-Za-z0-9_<>…*-]+)/([^\s`\"')\]）,。;:]+)")
 # 反引号里的连字符词(候选技能名)
 BACKTICK_WORD = re.compile(r"`([a-z][a-z0-9]*(?:-[a-z0-9]+)+)`")
-# frontmatter 的 key: value
+# frontmatter 的 key: value(只在没有 PyYAML 的降级解析器里用)
 FM_KEY = re.compile(r"^([A-Za-z_][\w-]*)\s*:\s*(.*)$")
 # 边界声明:description 里出现这些词,说明作者交代了适用范围。
 # 宁可收宽一点 —— 这一条是"提醒"不是"报错",漏报比误报更烦人。
@@ -39,10 +50,19 @@ BOUNDARY_HINTS = (
     "不适用", "不覆盖", "不在其中", "不提供", "不涉及", "不负责", "不支持", "不含",
     "只管", "只做", "只覆盖", "仅覆盖", "限于", "限定", "覆盖",
 )
-# 举例用的占位名,不当成真实引用
-PLACEHOLDERS = {"foo", "bar", "baz", "xxx", "yyy", "name", "foo.py", "bar.py"}
+# 依赖项的规矩 —— 和 agent/skills.py 的 parse_deps 是**同一套**。
+DEP_KINDS = ("skill", "package")
+DEP_FIELDS = set(DEP_KINDS) | {"why", "if_missing"}
+# 举例用的占位名,不当成真实引用 —— 按**主名**判,不看扩展名(foo.py / foo.md 都算)
+PLACEHOLDERS = {"foo", "bar", "baz", "qux", "xxx", "yyy", "name"}
 # 单字母文件名(x.py / y.md)也是写说明时常用的举例写法
 SINGLE_LETTER = re.compile(r"^[a-z]\.\w+$")
+
+
+def _is_placeholder(rel: str) -> bool:
+    """这个是"举个例子"的文件名,还是真的引用?"""
+    base = pathlib.Path(rel).name
+    return (pathlib.Path(base).stem in PLACEHOLDERS or SINGLE_LETTER.match(base) is not None)
 # 技能里可能写着路径引用的文件类型 —— 正文、参考资料、脚本**都算**。
 # 脚本尤其不能漏:改名的时候 md 里的引用肉眼还能扫到,而脚本里那行 print("见 /skills/<名>/…")
 # 藏在几百行代码中间,同样会断、而且要到运行时才报出来。
@@ -65,24 +85,112 @@ def _default_skills_dir() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parent.parent.parent
 
 
-def _split_frontmatter(text: str) -> tuple[dict, str, int]:
-    """拆出 frontmatter,返回 (字段表, 正文, 正文起始行号)。没有 frontmatter 就返回空表。"""
+def _split_frontmatter(text: str) -> tuple[str, str, int]:
+    """拆出 frontmatter,**返回原文**(解析交给 _load_meta)。
+
+    返回 (frontmatter 原文, 正文, 正文起始行号)。没有 frontmatter 就返回空串。
+    """
     if not text.startswith("---\n"):
-        return {}, text, 0
+        return "", text, 0
     end = text.find("\n---", 4)
     if end < 0:
-        return {}, text, 0
-    meta: dict[str, str] = {}
-    for line in text[4:end].splitlines():
+        return "", text, 0
+    body_start = text[: end + 4].count("\n") + 1
+    return text[4:end], text[end + 4:], body_start
+
+
+def _load_meta(raw: str) -> tuple[dict, list[str]]:
+    """解析 frontmatter,返回 (字段表, 问题列表)。
+
+    优先用 PyYAML —— 技能格式是标准 YAML,依赖字段又是列表,只有真解析器读得准。
+    没装 PyYAML 时退到内置的平铺解析器,**并且明说它读不了什么** —— 降级可以,装作
+    没降级不行:那会让人以为依赖字段检查过了。
+    """
+    if yaml is not None:
+        try:
+            meta = yaml.safe_load(raw)
+        except yaml.YAMLError as exc:
+            return {}, [f"frontmatter 不是合法的 YAML:{exc}"]
+        if meta is None:
+            return {}, []
+        if not isinstance(meta, dict):
+            return {}, ["frontmatter 要是一组 `键: 值`,现在解析出来不是"]
+        return meta, []
+
+    # ---- 降级:只有平铺的 `键: 值` ----
+    meta: dict = {}
+    nested = False
+    for line in raw.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
         m = FM_KEY.match(line)
         if m:
+            if not m.group(2).strip():
+                # `requires:` 后面挂着列表 —— 读不了。**这个键干脆不放进去**:留个空串的话,
+                # 校验会把它当成"值写错了"再报一次,平白多出两条假错误。读不懂就别装作读过。
+                nested = True
+                continue
             meta[m.group(1)] = m.group(2).strip()
+        elif line.lstrip().startswith("-"):
+            nested = True
         elif line[:1].isspace() and meta:
             # YAML 折行续行:接到上一个 key 后面
             last = next(reversed(meta))
             meta[last] = (meta[last] + " " + line.strip()).strip()
-    body_start = text[: end + 4].count("\n") + 1
-    return meta, text[end + 4:], body_start
+    note = []
+    if nested:
+        note.append(
+            "没装 PyYAML,内置解析器读不了嵌套结构 —— **requires / optional 这两个字段"
+            "这次没被检查**(它们都是列表)。确认依赖写对没,要么装一下 PyYAML,"
+            "要么自己肉眼过一遍"
+        )
+    return meta, note
+
+
+def check_deps(meta: dict, known: set[str], field: str) -> list[str]:
+    """查 requires / optional 写得对不对,外加引用的技能在不在。
+
+    规矩和 agent/skills.py 的 parse_deps 一致(那边是运行时的把关,这边是交出去之前的)。
+    **两边都要有**:这边能在装进 agent 之前就报出来,那边管的是"技能坏了也得让人看见"。
+    """
+    raw = meta.get(field)
+    if raw is None or raw == []:
+        return []
+    if not isinstance(raw, list):
+        return [f"{field} 要是一个列表,每项写成 `- package: 包名` 这样"]
+
+    problems: list[str] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            problems.append(f"{field} 里的每一项都要写成 `- package: 包名` 这样的键值对")
+            continue
+        unknown = set(item) - DEP_FIELDS
+        if unknown:
+            problems.append(
+                f"{field} 里有不认识的字段 {'、'.join(sorted(unknown))} —— "
+                f"只认 {'、'.join(sorted(DEP_FIELDS))}"
+            )
+            continue
+        kinds = [k for k in DEP_KINDS if item.get(k)]
+        if len(kinds) != 1:
+            problems.append(
+                f"{field} 里每一项要**恰好**声明 skill / package 中的一个,现在有 {len(kinds)} 个:{item}"
+            )
+            continue
+        kind, name = kinds[0], str(item[kinds[0]]).strip()
+        if not item.get("why"):
+            problems.append(
+                f"{field} 里的 `{kind}: {name}` 没写 why —— "
+                f"不写清为什么需要它,读的人没法判断它能不能少"
+            )
+        if field == "optional" and not item.get("if_missing"):
+            problems.append(
+                f"{field} 里的 `{kind}: {name}` 没写 if_missing —— "
+                f"**可选依赖的缺失代价必须写出来**,写不出一个能接受的下场,它就该是 requires"
+            )
+        if kind == "skill" and name not in known:
+            problems.append(f"{field} 里的 `skill: {name}` 没有这个技能(名字写错了?改名了?)")
+    return problems
 
 
 def _strip_fences(body: str) -> list[tuple[int, str]]:
@@ -238,6 +346,33 @@ def check_markdown_file(path: pathlib.Path) -> list[str]:
     return issues
 
 
+def _hard_path_notes(where: str, line: str, skill_dir: pathlib.Path) -> list[str]:
+    """这一行里有没有**写死的容器路径**(`/skills/<名>/...`)。
+
+    这是要禁掉的东西。技能是要**移植**的,而 `/skills` 只是当前这个宿主的挂载点 ——
+    换个宿主、换个挂载方式,写死的路径就全是错的。更阴的是它**不会报错**:加载技能时
+    照样把正文给你,你照着跑,容器说找不到文件,你以为是文件没了,其实是那句路径只在
+    这个项目里成立。
+
+    正确写法是只写**相对路径**(`scripts/x.py`)—— 真实位置由加载技能时一并给出。
+    因此这里不再做"路径还在不在"的检查了:**路径根本不出现,就没有过期一说。**
+    """
+    out = []
+    for m in HARD_PATH.finditer(line):
+        other, sub = m.group(1), m.group(2).rstrip(".,)")
+        if any(ch in other or ch in sub for ch in "<>…*"):
+            continue                      # 占位/通配是示例写法,不是真路径
+        hint = (f"若这是 `{other}` 的资源,在 requires / optional 里声明 `skill: {other}`,"
+                f"加载时会告诉你它在哪") if other != skill_dir.name else \
+               "它自己的资源直接写相对路径就行"
+        out.append(
+            f"{where}: 写死了容器路径 `/skills/{other}/{sub}` —— 技能是可移植的,"
+            f"`/skills` 只是当前宿主的挂载点,换个环境这句话就是错的。"
+            f"改成相对路径 `{sub}`;{hint}"
+        )
+    return out
+
+
 def check_skill(skill_dir: pathlib.Path, known: set[str]) -> list[str]:
     """检查一个技能目录,返回问题列表(空 = 没问题)。"""
     problems: list[str] = []
@@ -246,9 +381,11 @@ def check_skill(skill_dir: pathlib.Path, known: set[str]) -> list[str]:
         return [f"{skill_dir.name}: 没有 SKILL.md"]
 
     text = skill_md.read_text(encoding="utf-8")
-    meta, body, body_start = _split_frontmatter(text)
-    name = meta.get("name", "")
-    desc = meta.get("description", "")
+    raw_fm, body, body_start = _split_frontmatter(text)
+    meta, fm_notes = _load_meta(raw_fm)
+    problems.extend(fm_notes)
+    name = str(meta.get("name") or "")
+    desc = str(meta.get("description") or "")
 
     # ---- frontmatter ----
     if not name:
@@ -264,32 +401,49 @@ def check_skill(skill_dir: pathlib.Path, known: set[str]) -> list[str]:
             "建议写明(如「不适用于…」「只覆盖…」),否则模型会拿它硬答"
         )
 
+    # ---- 依赖字段 ----
+    problems.extend(check_deps(meta, known, "requires"))
+    problems.extend(check_deps(meta, known, "optional"))
+    declared = {
+        str(d[k]).strip() for f in ("requires", "optional")
+        for d in (meta.get(f) or []) if isinstance(d, dict) for k in DEP_KINDS if d.get(k)
+    }
+    used_other: set[str] = set()        # 正文/脚本里实际用到了谁的资源
+
+    # ---- 正文 ----
+    # 写死的路径**连代码块一起查** —— 别处的检查要跳过围栏(示例里全是示意路径),
+    # 但这条不用:它的豁免靠"带占位符"(<名>、…、*),不靠"在不在围栏里"。而**围栏里
+    # 恰恰是最容易写死路径的地方** —— 一行 `python3 /skills/...` 抄进正文时,谁都不会
+    # 觉得它有问题。跳过围栏就正好把最该查的地方放过去了。
+    for i, raw_line in enumerate(body.splitlines(), 1):
+        problems.extend(_hard_path_notes(f"{body_start + i}", raw_line, skill_dir))
+
     lines = _strip_fences(body)
     for i, line in lines:
         n = body_start + i
 
-        # ---- 容器路径引用:/skills/<名>/<路径> ----
-        for m in CONTAINER_REF.finditer(line):
-            other, sub = m.group(1), m.group(2).rstrip(".,)")
-            if "…" in sub or "*" in sub:        # 省略号和通配符是示意写法,不是具体文件
+        # ---- 用别的技能的资源:`技能名/scripts/x.py` ----
+        for m in CROSS_REF.finditer(line):
+            other, rel = m.group(1), m.group(2).rstrip(".,)")
+            if other == skill_dir.name or other not in known:
+                continue                      # 自己家的按下面那条查;不存在的技能名不当资源引用报
+            if "*" in rel:
                 continue
-            if other not in known:
-                problems.append(f"{n}: /skills/{other}/… 里的技能 `{other}` 不存在")
-            elif not (skill_dir.parent / other / sub).exists():
-                problems.append(f"{n}: /skills/{other}/{sub} 不存在(改名或挪文件后没同步?)")
+            if not (skill_dir.parent / other / rel).exists():
+                problems.append(f"{n}: 提到 `{other}/{rel}`,但 `{other}` 里没有这个文件")
+            else:
+                used_other.add(other)
 
-        # ---- 资源引用:`scripts/x.py` 这类 ----
-        # 同一行里提到别的技能名时,那个 `scripts/xxx` 多半是**人家的**资源
-        # (如"结构分析复用 X 的 `scripts/scan_repo.py`"),不该拿本技能目录去对。
-        mentions_other = any(w != skill_dir.name for w in BACKTICK_WORD.findall(line) if w in known)
+        # ---- 自己的资源:`scripts/x.py` 这类(相对本技能目录) ----
         for m in RES_REF.finditer(line):
             rel = m.group(1).rstrip(".,)")
-            base = pathlib.Path(rel).name
-            if ("*" in rel or mentions_other or base in PLACEHOLDERS
-                    or SINGLE_LETTER.match(base)):
+            if "*" in rel or _is_placeholder(rel):
                 continue
-            if not (skill_dir / rel).exists():
-                problems.append(f"{n}: 正文提到 `{rel}`,但技能目录里没有这个文件")
+            if (skill_dir / rel).exists():
+                continue
+            # 没带技能名 = 说的是自己家的。别去猜"是不是别人的" —— 要引用别人的就写
+            # 全名(上面那条),猜出来的东西没法校验,还容易把错误指到别人头上。
+            problems.append(f"{n}: 正文提到 `{rel}`,但本技能目录里没有这个文件")
 
         # ---- 技能名引用:`某技能名` ----
         for m in BACKTICK_WORD.finditer(line):
@@ -299,6 +453,15 @@ def check_skill(skill_dir: pathlib.Path, known: set[str]) -> list[str]:
             # 只在"首段像某个已知技能"时报,免得把 apt-get / try-except 全抓进来
             if word.split("-")[0] in {k.split("-")[0] for k in known}:
                 problems.append(f"{n}: 提到 `{word}`,但没有这个技能(是不是改名了?)")
+
+    # ---- 用了别人的资源,却没在 requires / optional 里声明 ----
+    # 声明了才会在加载时告诉你对方的位置;不声明的话,正文里那个相对路径就没有着落
+    # (而且对方改名、被卸载,你这边悄无声息)。
+    for other in sorted(used_other - declared):
+        problems.append(
+            f"用到了 `{other}` 的资源,但没在 requires / optional 里声明 `skill: {other}` —— "
+            f"声明了才拿得到它的实际位置,也才算把依赖摆到明面上"
+        )
 
     # ---- 正文长度 ----
     n_body = len(body.splitlines())
@@ -315,10 +478,10 @@ def check_skill(skill_dir: pathlib.Path, known: set[str]) -> list[str]:
         for issue in check_markdown_file(md_file):
             problems.append(f"{md_file.relative_to(skill_dir)} {issue}")
 
-    # ---- 脚本里的容器路径引用 ----
+    # ---- 脚本里的写死路径 ----
     # md 那部分上面按行查过了(带围栏剔除),这里补非 md 的:脚本里那句
-    # `print("见 /skills/<名>/…")` 最容易被改名漏掉 —— 它藏在几百行代码中间,
-    # 而且断了不报错、要等运行时才看得出来。
+    # `print("见 /skills/<名>/…")` 藏在几百行代码中间,最容易被改名漏掉 —— 而且断了
+    # 不报错、要等运行时才看得出来。脚本要引用自己的资源,一律用 `__file__` 推。
     for f in _scannable_files(skill_dir):
         if f.suffix.lower() == ".md":
             continue
@@ -326,15 +489,9 @@ def check_skill(skill_dir: pathlib.Path, known: set[str]) -> list[str]:
             text = f.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        rel_f = f.relative_to(skill_dir)
-        for m in CONTAINER_REF.finditer(text):
-            other, sub = m.group(1), m.group(2).rstrip(".,)")
-            if "…" in sub or "*" in sub:
-                continue
-            if other not in known:
-                problems.append(f"{rel_f}: 引用的技能 `{other}` 不存在")
-            elif not (skill_dir.parent / other / sub).exists():
-                problems.append(f"{rel_f}: /skills/{other}/{sub} 不存在(改名或挪文件后没同步?)")
+        rel_f = str(f.relative_to(skill_dir))
+        for i, line in enumerate(text.splitlines(), 1):
+            problems.extend(_hard_path_notes(f"{rel_f}:{i}", line, skill_dir))
 
     # ---- 附带脚本的语法 ----
     for py in sorted((skill_dir / "scripts").glob("*.py")) if (skill_dir / "scripts").is_dir() else []:
@@ -347,14 +504,25 @@ def check_skill(skill_dir: pathlib.Path, known: set[str]) -> list[str]:
 
 
 def _refs_to_others(skill_dir: pathlib.Path, known: set[str]) -> dict[str, set[str]]:
-    """这个技能引用了谁。分两档,因为强度差得远:
+    """这个技能引用了谁。分三档,因为强度差得远:
 
-    - **资源引用**:`/skills/<名>/<路径>` 或"复用 X 的 `scripts/y.py`" —— 对方的文件被
-      真的用着,它一改/一挪就坏。这是**依赖**。
+    - **声明**:frontmatter 的 requires / optional 里写了 `skill: X` —— 最硬的一档,
+      是作者明说的依赖,卸载对方就该有人告诉用户。
+    - **资源引用**:正文里"复用 X 的 `scripts/y.py`" —— 对方的文件被真的用着,它一改
+      就坏。(写死绝对路径的旧写法也算一档,但那种写法本身就会被 `_hard_path_notes` 拦下。)
     - **文字提及**:正文里出现 `某技能名` —— 只是"细节见那边"的指路,对方改名会失效,
       但内容上并不耦合。
     """
-    out: dict[str, set[str]] = {"资源": set(), "提及": set()}
+    out: dict[str, set[str]] = {"声明": set(), "资源": set(), "提及": set()}
+    # 声明在 frontmatter 里的依赖:那是**明说的**依赖,比任何从正文里猜出来的都硬
+    raw_fm, _, _ = _split_frontmatter((skill_dir / "SKILL.md").read_text(encoding="utf-8"))
+    meta, _ = _load_meta(raw_fm)
+    for field in ("requires", "optional"):
+        for d in (meta.get(field) or []):
+            if isinstance(d, dict) and d.get("skill") and str(d["skill"]) in known:
+                out["资源"].add(str(d["skill"]).strip())
+                out["声明"].add(str(d["skill"]).strip())
+
     for f in _scannable_files(skill_dir):
         try:
             text = f.read_text(encoding="utf-8")
@@ -363,17 +531,16 @@ def _refs_to_others(skill_dir: pathlib.Path, known: set[str]) -> dict[str, set[s
         is_md = f.suffix.lower() == ".md"
         lines = _strip_fences(text) if is_md else list(enumerate(text.splitlines(), 1))
         for _, content in lines:
-            for m in CONTAINER_REF.finditer(content):
+            for m in HARD_PATH.finditer(content):
                 if m.group(1) in known and m.group(1) != skill_dir.name:
-                    out["资源"].add(m.group(1))
+                    out["资源"].add(m.group(1))       # 这是要禁的写法,但先如实记下来
+            for m in CROSS_REF.finditer(content):
+                if m.group(1) in known and m.group(1) != skill_dir.name:
+                    out["资源"].add(m.group(1))       # `技能名/scripts/x.py` —— 正规写法
             if not is_md:
-                continue      # 脚本里只认容器路径;再去猜"技能名提及"误报太多
-            # "复用 X 的 `scripts/y.py`" 这种:同一行的资源引用算在 X 头上
-            words = [w for w in BACKTICK_WORD.findall(content) if w in known and w != skill_dir.name]
-            if words and RES_REF.search(content):
-                out["资源"].update(words)
-            else:
-                out["提及"].update(words)
+                continue      # 脚本里只认路径;再去猜"技能名提及"误报太多
+            out["提及"].update(w for w in BACKTICK_WORD.findall(content)
+                               if w in known and w != skill_dir.name)
     return out
 
 
@@ -390,18 +557,25 @@ def print_graph(root: pathlib.Path, known: set[str]) -> None:
              if d.is_dir() and (d / "SKILL.md").exists()}
     incoming: dict[str, set[str]] = {k: set() for k in graph}
     for src, refs in graph.items():
-        for dst in refs["资源"] | refs["提及"]:
+        for dst in refs["声明"] | refs["资源"] | refs["提及"]:
             incoming.setdefault(dst, set()).add(src)
+
+    def _all(n: str) -> set[str]:
+        return graph.get(n, {}).get("声明", set()) | graph[n]["资源"] | graph[n]["提及"] \
+            if n in graph else set()
 
     print("=== 引用关系(改了对方要改这里的,是「引用方」) ===")
     for name in sorted(graph):
         refs = graph[name]
-        if not (refs["资源"] or refs["提及"]):
+        if not (refs["声明"] or refs["资源"] or refs["提及"]):
             print(f"  {name}: (不引用任何技能)")
             continue
         parts = []
-        if refs["资源"]:
-            parts.append("资源依赖 → " + ", ".join(sorted(refs["资源"])))
+        if refs["声明"]:
+            parts.append("声明依赖 → " + ", ".join(sorted(refs["声明"])))
+        undeclared = sorted(refs["资源"] - refs["声明"])
+        if undeclared:
+            parts.append("!用了但没声明 → " + ", ".join(undeclared))
         if refs["提及"]:
             parts.append("仅提及 → " + ", ".join(sorted(refs["提及"])))
         print(f"  {name}: " + " ; ".join(parts))
@@ -412,11 +586,14 @@ def print_graph(root: pathlib.Path, known: set[str]) -> None:
         back = incoming.get(name, set())
         if not back:
             continue
-        by_res = sorted(b for b in back if name in graph[b]["资源"])
+        by_dep = sorted(b for b in back if name in graph[b]["声明"])
+        by_res = sorted(b for b in back if name in graph[b]["资源"] and name not in graph[b]["声明"])
         by_men = sorted(b for b in back if name in graph[b]["提及"] and name not in graph[b]["资源"])
         parts = []
+        if by_dep:
+            parts.append("声明依赖 ← " + ", ".join(by_dep))
         if by_res:
-            parts.append("资源依赖 ← " + ", ".join(by_res))
+            parts.append("!用了但没声明 ← " + ", ".join(by_res))
         if by_men:
             parts.append("仅提及 ← " + ", ".join(by_men))
         print(f"  {name}: " + " ; ".join(parts))
@@ -425,8 +602,8 @@ def print_graph(root: pathlib.Path, known: set[str]) -> None:
     print("=== 值得看一眼的 ===")
     flagged = False
     for a in sorted(graph):
-        for b in sorted(graph[a]["资源"] | graph[a]["提及"]):
-            if a < b and a in (graph.get(b, {}).get("资源", set()) | graph.get(b, {}).get("提及", set())):
+        for b in sorted(_all(a)):
+            if a < b and a in _all(b):
                 print(f"  ! {a} 与 {b} 互相引用 —— 检查是不是在互相推诿(都说是对方的事)")
                 flagged = True
     for name in sorted(graph):
@@ -435,9 +612,14 @@ def print_graph(root: pathlib.Path, known: set[str]) -> None:
             print(f"  ! {name} 被 {len(back)} 个技能引用(枢纽)—— 改它影响面大,先看上面那份清单")
             flagged = True
     for name in sorted(graph):
-        if not incoming.get(name) and not (graph[name]["资源"] or graph[name]["提及"]):
+        if not incoming.get(name) and not _all(name):
             print(f"  . {name} 与其它技能没有往来(孤岛)—— 独立也正常,确认一下不是漏了引用")
             flagged = True
+    undeclared_any = sorted(n for n in graph if graph[n]["资源"] - graph[n]["声明"])
+    if undeclared_any:
+        print(f"  ! 用了别的技能的资源却没声明依赖:{', '.join(undeclared_any)}"
+              f" —— 在 requires / optional 里补 `skill: …`")
+        flagged = True
     if not flagged:
         print("  (没有需要特别留意的)")
 

@@ -1,6 +1,16 @@
 ---
 name: repo-security-audit
 description: 当用户要求对某个仓库或项目做安全审计、漏洞扫描、排查安全隐患或分析潜在利用链时使用,例如「扫一下这个仓库有没有安全问题」「审计一下这个项目的安全性」「看看这些代码有没有能被利用的漏洞」「帮我找找利用链」。语言特定规则覆盖 Python / JavaScript / Java / Go / PHP;其它语言只有通用 Web 模式,覆盖会薄很多,报告里要说明这一点。
+requires:
+  - package: pyyaml
+    why: 全部扫描规则都写在 `scripts/rules/*.yaml` 里;读不出来就一条规则都用不上,整个静态扫描无从谈起
+optional:
+  - package: dulwich
+    why: "`scripts/scan_git.py` 靠它直接读 git 对象库(容器里没有 git 命令),历史泄露那一步要用"
+    if_missing: git 历史那步跳过,其余照常;在报告结尾的「未覆盖范围」里写明「git 历史未扫」
+  - package: bandit
+    why: "`scan.py` 的 bandit 子命令用 `python -m bandit` 做 Python 深度扫描,能多出一路结果"
+    if_missing: 脚本自己会跳过并在摘要里注明;报告「未覆盖范围」里补一句 Python 深度扫描未跑
 ---
 
 # 仓库安全审计
@@ -27,12 +37,12 @@ description: 当用户要求对某个仓库或项目做安全审计、漏洞扫�
 
 ### 2. 跑快扫脚本
 
-脚本在容器里跑,**路径要换算**成 `/workspace/...` 或 `/skills/...`(宿主路径 `D:\...` 在容器里不存在)。
+脚本在容器里跑。`scripts/...` 是**相对技能目录**的写法(实际位置见加载本技能时给出的资源
+清单);目标仓库和工作区文件则要写成 `/workspace/...`(宿主路径 `D:\...` 在容器里不存在)。
 
 ```bash
 # 依赖 pyyaml —— **装之前先问用户**(装包动的是用户环境);bandit 缺失会自动跳过
-python /skills/repo-security-audit/scripts/scan.py \
-    /workspace/clones/<仓库> --out /workspace/findings-<仓库>.json
+python scripts/scan.py /workspace/clones/<仓库> --out /workspace/findings-<仓库>.json
 ```
 
 **缺 pyyaml 要先问用户再装** —— 装法是 `pip install --target /workspace/.pylibs pyyaml`
@@ -63,7 +73,7 @@ python /skills/repo-security-audit/scripts/scan.py \
 当前分支看不到的问题,可能只是被"删掉"了 —— 内容仍在 `.git` 对象库里,攻击者拿到仓库就能翻出来。被删的 `.env`、旧版硬编码口令、force-push 丢弃的提交,都在这里现形。
 
 ```bash
-python /skills/repo-security-audit/scripts/scan_git.py \
+python scripts/scan_git.py \
     /workspace/clones/<仓库> --out /workspace/git-findings-<仓库>.json
 ```
 

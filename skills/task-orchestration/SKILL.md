@@ -162,4 +162,5 @@ plans/<任务名>/
 - `assets/plan-template.md` —— 计划文件模板,复制后填空。
 - `references/patterns.md` —— 常见任务类型的分解套路:数据管道、重构、迁移、批量整改。
 
-这些资源在容器里是只读挂载的,路径要换算 —— `skills/task-orchestration/scripts/validate_plan.py` 在容器里是 `/skills/task-orchestration/scripts/validate_plan.py`,而计划文件在工作区里,是 `/workspace/plans/...`。
+上面这些路径都**相对技能目录**(技能在容器里只读挂载,实际位置见加载时给的资源清单);
+而计划文件在**工作区**里,是 `/workspace/plans/...` —— 两者不是一回事,别混。

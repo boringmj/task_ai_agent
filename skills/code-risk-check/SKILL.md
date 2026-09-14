@@ -36,8 +36,10 @@ description: 当用户要求判断一段代码、脚本、安装包或仓库是�
 跑扫描脚本拿到候选点:
 
 ```bash
-python3 /skills/code-risk-check/scripts/risk_scan.py <目标路径> --json findings-risk.json
+python3 scripts/risk_scan.py <目标路径> --json findings-risk.json
 ```
+
+(路径相对技能目录;容器里的实际位置见加载本技能时给的资源清单。)
 
 它按「行为维度 × 语言」匹配危险 API 与敏感路径,输出每条命中的文件、行号、代码片段、所属维度,以及**潜在等级上界**。
 

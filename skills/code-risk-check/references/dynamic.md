@@ -9,8 +9,9 @@
 虚拟机看不到技能目录(`skills/` 只挂载进容器),所以先把脚本经容器拷进工作区,再推进 VM:
 
 ```bash
-# 容器里执行:把脚本拷到工作区(/skills 只读,/workspace 可写)
-mkdir -p /workspace/.risktool && cp /skills/code-risk-check/scripts/*.py /workspace/.risktool/
+# 容器里执行:把脚本拷到工作区(技能目录只读,/workspace 可写)
+#   <本技能目录> 用加载时给出的实际位置,比如 /skills/code-risk-check/scripts
+mkdir -p /workspace/.risktool && cp <本技能目录>/*.py /workspace/.risktool/
 ```
 
 然后用 `vm_push` 把 `.risktool/fs_snapshot.py`、`.risktool/probe_http.py` 推到 guest 的 `/root/tools/`。

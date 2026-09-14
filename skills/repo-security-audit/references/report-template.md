@@ -74,7 +74,7 @@
 - 扫描命令:
 
   ```bash
-  python /skills/repo-security-audit/scripts/scan.py /workspace/clones/<仓库> \
+  python scripts/scan.py /workspace/clones/<仓库> \
       --out /workspace/findings-<仓库>.json
   ```
 

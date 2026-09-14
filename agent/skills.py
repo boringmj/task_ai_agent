@@ -3,7 +3,7 @@
 一个技能 = 一个目录 + 一份 `SKILL.md`:
 
     skills/<技能名>/
-        SKILL.md            必需。YAML frontmatter(name/description)+ 正文
+        SKILL.md            必需。YAML frontmatter(name/description/依赖)+ 正文
         scripts/            可选。可执行脚本 —— **可以跑而不读进上下文**
         references/         可选。按需读进上下文的参考资料
         assets/             可选。产出里要用的文件(模板、图标等)
@@ -19,13 +19,37 @@
 
 与工具的区别(别混):**工具是模型调用的可执行函数,必须有代码;技能是一份说明书,
 改变的是"怎么做这件事"。** 两者可以配合 —— 技能正文里可以讲"遇到 X 就用 Y 工具"。
+
+frontmatter 用**标准 YAML**(`yaml.safe_load`),不是自己糊的简版解析器 —— 技能是要
+**移植**的东西,格式得按通用规矩来。现在支持:
+
+    name         必需。和目录名一致
+    description  必需。写"什么时候该用"
+    requires     可选。**硬依赖**:缺一个这个技能就干不了活
+    optional     可选。**可选依赖**:缺了只是降级,代价可接受
+
+依赖项里 `skill` / `package` **二选一**,加上 `why`(为什么需要它);可选依赖还要
+`if_missing`(缺了怎么办)。**这两样怎么用、写不写得出 `if_missing` 意味着什么,
+见 `skills/writing-skills/SKILL.md`** —— 那是给人看的规矩,这里只负责机械地执行。
+
+**为什么只有这两种依赖**:因为只有它们能被**确切**回答"装没装" —— `skill` 看技能目录
+在不在,`package` 看容器包仓库里有没有。像「VM 里得有 node」「系统里得有 ffmpeg」这类
+外部命令,宿主查不到;与其猜一个"应该有吧",不如不设这个字段,让它写在正文里。
+**给不出确定答案的检查,比没有检查更危险。**
 """
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
-from .core import PROJECT_DIR
+try:
+    import yaml
+except ImportError:                     # pragma: no cover - 只有在环境没装齐时才会走到
+    raise RuntimeError(
+        "缺少 PyYAML —— 技能的 frontmatter 是标准 YAML,读它必须要这个库。\n"
+        "装一下就好:pip install -r requirements.txt"
+    ) from None
+
+from .core import PROJECT_DIR, ROOT
 
 SKILLS_DIR = PROJECT_DIR / "skills"
 # 技能目录在容器里的挂载点(只读;见 agent/tools/container.py)。技能脚本要从容器跑,
@@ -35,20 +59,27 @@ _SKILL_FILE = "SKILL.md"
 # 正文里附带的资源目录,加载时一并告诉模型"还有这些可看"
 _RESOURCE_DIRS = ("scripts", "references", "assets")
 
+# 容器里第三方包的落地位置:agent 用 `pip install --target /workspace/.pylibs <包>` 装,
+# 容器再把它挂进 PYTHONPATH(见 agent/tools/container.py)。所以**宿主这边扫一眼这个目录**,
+# 就知道容器里装没装 —— 不必真起一个容器去问。
+PYLIBS = ROOT / ".pylibs"
+
+# 一个依赖项能声明的东西。二选一 —— 一个 dep 只说一件事,别混着写。
+# 只有"宿主能确切回答"的两种才配进来,理由见模块开头。
+DEP_KINDS = ("skill", "package")
+_DEP_FIELDS = set(DEP_KINDS) | {"why", "if_missing"}
+
 
 class SkillError(RuntimeError):
-    """技能有问题(找不到、frontmatter 缺失等)。"""
+    """技能有问题(找不到、frontmatter 缺失或不是合法 YAML 等)。"""
 
 
-def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    """解析开头的 YAML frontmatter,返回 (元数据, 正文)。
+# ========================= frontmatter =========================
 
-    只认最简单的 `键: 值`,不引入 yaml 依赖 —— 技能元数据本来就只有 name 和
-    description 两个字段。值可以折行(YAML 的普通标量规则):后续**缩进**的行
-    属于上一个键,一直读到下一个顶格的 `键:` 或结束标记为止。
-    """
+def _split_frontmatter(text: str) -> tuple[str, str]:
+    """把文件切成 (frontmatter 原文, 正文)。没有 frontmatter 就返回 ("", 全文)。"""
     if not text.startswith("---"):
-        return {}, text
+        return "", text
     lines = text.splitlines()
     end = None
     for i in range(1, len(lines)):
@@ -56,23 +87,79 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
             end = i
             break
     if end is None:
-        return {}, text                      # 没有结束标记:当它没有 frontmatter
+        return "", text                      # 没有结束标记:当它没有 frontmatter
+    return "\n".join(lines[1:end]), "\n".join(lines[end + 1:]).strip()
 
-    meta: dict[str, str] = {}
-    key = None
-    for raw in lines[1:end]:
-        if not raw.strip():
-            continue
-        if raw[:1].isspace() and key:        # 折行的续行
-            meta[key] = (meta[key] + " " + raw.strip()).strip()
-            continue
-        k, sep, v = raw.partition(":")
-        if not sep:
-            continue
-        key = k.strip()
-        meta[key] = v.strip()
-    return meta, "\n".join(lines[end + 1:]).strip()
 
+def _parse_frontmatter(text: str) -> tuple[dict, str]:
+    """解析开头的 YAML frontmatter,返回 (元数据, 正文)。
+
+    用 `yaml.safe_load` —— 不再自己写解析器。技能是要**移植**出去的解决方案,格式必须
+    按 YAML 的通用规矩来(嵌套、列表、引号、多行块都是标准行为),而不是"恰好我们这套
+    能读懂"的方言。宿主和容器都装了 PyYAML(见 requirements.txt)。
+    """
+    raw, body = _split_frontmatter(text)
+    if not raw.strip():
+        return {}, body
+    try:
+        meta = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise SkillError(f"frontmatter 不是合法的 YAML:{exc}") from None
+    if meta is None:
+        return {}, body
+    if not isinstance(meta, dict):
+        raise SkillError("frontmatter 要是一组 `键: 值`,现在解析出来不是")
+    return meta, body
+
+
+def parse_deps(meta: dict, field: str) -> list[dict]:
+    """把一个依赖字段(requires / optional)规整成 [{'kind','name','why',...}]。
+
+    这里**只做机械校验**(结构对不对、字段全不全),不判断依赖本身存不存在 ——
+    那是 `resolve_dep` 的事。分两步是因为"写得对不对"是作者的问题(该在自检时就报),
+    而"装没装"是环境的问题(该在加载时才说)。
+    """
+    raw = meta.get(field)
+    if raw is None or raw == []:
+        return []
+    if not isinstance(raw, list):
+        raise SkillError(f"{field} 要是一个列表,每项写成 `- package: 包名` 这样")
+
+    out: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise SkillError(f"{field} 里的每一项都要写成 `- package: 包名` 这样的键值对")
+        unknown = set(item) - _DEP_FIELDS
+        if unknown:
+            raise SkillError(
+                f"{field} 里有不认识的字段 {'、'.join(sorted(unknown))} —— "
+                f"只认 {'、'.join(sorted(_DEP_FIELDS))}"
+            )
+        kinds = [k for k in DEP_KINDS if item.get(k)]
+        if len(kinds) != 1:
+            raise SkillError(
+                f"{field} 里每一项要**恰好**声明 skill / package / command 中的一个,"
+                f"现在有 {len(kinds)} 个:{item}"
+            )
+        kind = kinds[0]
+        if not item.get("why"):
+            raise SkillError(
+                f"{field} 里的 `{kind}: {item[kind]}` 没写 why —— "
+                f"不写清为什么需要它,读的人没法判断它到底能不能少(也判断不了它该不该是可选依赖)"
+            )
+        if field == "optional" and not item.get("if_missing"):
+            raise SkillError(
+                f"{field} 里的 `{kind}: {item[kind]}` 没写 if_missing —— "
+                f"**可选依赖的缺失代价必须写出来**,否则没法证明这个代价是可以接受的;"
+                f"要是写不出一个能接受的下场,它就该是 requires(硬依赖)"
+            )
+        out.append({"kind": kind, "name": str(item[kind]).strip(),
+                    "why": str(item["why"]).strip(),
+                    "if_missing": str(item.get("if_missing") or "").strip()})
+    return out
+
+
+# ========================= 发现与读取 =========================
 
 def _skill_paths() -> list[Path]:
     if not SKILLS_DIR.exists():
@@ -81,34 +168,174 @@ def _skill_paths() -> list[Path]:
                   if p.is_dir() and (p / _SKILL_FILE).is_file())
 
 
+def _read_skill(path: Path) -> tuple[dict, str]:
+    """读一个技能,返回 (元数据, 正文)。有问题抛 SkillError。"""
+    try:
+        text = (path / _SKILL_FILE).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SkillError(f"读不出 {_SKILL_FILE}:{exc}") from None
+    meta, body = _parse_frontmatter(text)
+    # 依赖字段这里就校验,别拖到加载时才炸 —— 技能坏在元数据上,清单里就该看得出来。
+    # (只校验"写得对不对";能不能满足是加载时的事。)
+    parse_deps(meta, "requires")
+    parse_deps(meta, "optional")
+    return meta, body
+
+
 def discover() -> list[dict]:
-    """列出全部技能,按名字排序。每项含 name/description/目录/附带资源。
+    """列出全部技能,按名字排序。每项含 name/description/目录/附带资源/依赖/错误。
 
     目录名就是技能名(和 frontmatter 里的 name 一致时以目录名为准)——
     这样"技能叫什么"看目录就知道,不必打开文件。
+
+    **坏掉的技能不藏起来**:frontmatter 读不了(比如 YAML 写错)也照样列出来,只是把
+    错误写在 `error` 里。静默消失才是最糟的 —— 作者会以为技能装上了,而模型从来没见过它。
     """
     out = []
     for path in _skill_paths():
+        entry = {"name": path.name, "description": "", "dir": path,
+                 "resources": [], "requires": [], "optional": [], "error": ""}
         try:
-            text = (path / _SKILL_FILE).read_text(encoding="utf-8")
-        except OSError:
-            continue
-        meta, _ = _parse_frontmatter(text)
-        resources = [d for d in _RESOURCE_DIRS if (path / d).is_dir()]
-        out.append({
-            "name": path.name,
-            "description": (meta.get("description") or "").strip(),
-            "dir": path,
-            "resources": resources,
-        })
+            meta, _ = _read_skill(path)
+            entry["description"] = str(meta.get("description") or "").strip()
+            entry["requires"] = parse_deps(meta, "requires")
+            entry["optional"] = parse_deps(meta, "optional")
+            entry["resources"] = [d for d in _RESOURCE_DIRS if (path / d).is_dir()]
+        except SkillError as exc:
+            entry["error"] = str(exc)
+        out.append(entry)
     return out
 
+
+def names() -> list[str]:
+    return [s["name"] for s in discover()]
+
+
+# ========================= 依赖 =========================
+
+def _installed_packages() -> set[str]:
+    """扫 `.pylibs`,返回装了哪些包(名字归一化过)。
+
+    `.pylibs` 是**容器**的包仓库(`pip install --target` 落在这儿),不是宿主环境的 ——
+    技能脚本跑在容器里,所以该看的是它。两边各有一套 Python,别混。
+
+    名字有两个来源,都得算:`*.dist-info` 目录给的是**发行名**(`pyyaml-6.0.3.dist-info`),
+    而顶层目录给的是**导入名**(`yaml`)。技能里两种写法都可能出现,所以两个都收。
+    """
+    pkgs: set[str] = set()
+    if not PYLIBS.is_dir():
+        return pkgs
+    for p in PYLIBS.iterdir():
+        n = p.name
+        if n == "__pycache__":
+            continue
+        for suffix in (".dist-info", ".egg-info"):
+            if n.endswith(suffix):
+                # `pyyaml-6.0.3.dist-info` → `pyyaml`(版本号在最后,去掉)
+                pkgs.add(_norm_pkg(n[: -len(suffix)].rsplit("-", 1)[0]))
+                break
+        else:
+            if p.suffix == ".py":                       # 单文件模块
+                pkgs.add(_norm_pkg(p.stem))
+            elif (p / "__init__.py").is_file():         # 常规包目录
+                pkgs.add(_norm_pkg(n))
+    return pkgs
+
+
+def _norm_pkg(name: str) -> str:
+    """包名归一化 —— 大小写不敏感、`-`/`_`/`.` 等价(PEP 503 的规矩)。"""
+    return name.lower().replace("-", "_").replace(".", "_")
+
+
+def resolve_dep(dep: dict) -> str:
+    """这个依赖现在满不满足?返回 `have` 或 `missing`。
+
+    **只给两种答案,不给"大概是吧"。** 不认识的包 = 当它没有 —— 这个方向的错(把有的
+    说成没有)只是让人多确认一句,反过来的错(把没有的说成有)会让人**直接动手**,然后
+    在用到它的那一刻才发现跑不起来。
+    """
+    kind, name = dep["kind"], dep["name"]
+    if kind == "skill":
+        return "have" if (SKILLS_DIR / name / _SKILL_FILE).is_file() else "missing"
+    return "have" if _norm_pkg(name) in _installed_packages() else "missing"
+
+
+# 两种状态在提示里长什么样。用 `[+]` / `[!]` 而不是图形符号 —— 那种在老控制台上会显示成
+# 乱码甚至把输出截断(踩过)。
+_MARK = {"have": "[+]", "missing": "[!]"}
+
+
+def _dep_lines(deps: list[dict], field: str) -> list[str]:
+    out = []
+    for d in deps:
+        state = resolve_dep(d)
+        head = f"- {_MARK[state]} {d['kind']} `{d['name']}` —— {d['why']}"
+        if state == "have" and d["kind"] == "skill":
+            head += f"(在容器里是 {CONTAINER_SKILLS_DIR}/{d['name']}/,可以用它的资源)"
+        elif state == "missing" and field == "optional":
+            head += f";缺了怎么办:{d['if_missing']}"
+        out.append(head)
+    return out
+
+
+def _dependency_note(meta: dict) -> str:
+    """把依赖状况渲染成给模型看的一段话。
+
+    这里的态度很关键,分两种:
+
+    **硬依赖** —— 缺了就是干不了活。要说清三件事:缺了什么、**不许换个法子硬做**、
+    老老实实停下来告诉用户哪一部分做不了。模型的本能是"绕过去",绕出来的东西用户
+    看不出来是残的,那是**看着像结论的猜测**,比明说做不了糟糕得多。
+
+    **可选依赖** —— 缺了**不提醒**(它的缺失代价本该是可接受的,不值得占注意力);
+    但在场时要**主动说**:它能补上哪块、资源在哪,让模型知道手里的牌比想象中多。
+    """
+    try:
+        requires = parse_deps(meta, "requires")
+        optional = parse_deps(meta, "optional")
+    except SkillError:
+        return ""
+    if not requires and not optional:
+        return ""
+
+    parts: list[str] = []
+    if requires:
+        lines = _dep_lines(requires, "requires")
+        if any(resolve_dep(d) != "have" for d in requires):
+            parts.append("这个技能声明了**硬依赖**,下面标 `[!]` 的还没有:")
+            parts.append("\n".join(lines))
+            parts.append(
+                "**缺硬依赖时不要换别的方法硬做,也不要用别的工具凑一个结果出来** —— "
+                "那样产出的东西看着完整、实际是残的。正确做法:停下来,把这个技能里"
+                "**做不了的是哪一部分**如实告诉用户,由他决定装依赖还是算了。"
+            )
+        else:
+            parts.append("硬依赖都满足了:")
+            parts.append("\n".join(lines))
+    if optional:
+        have = [d for d in optional if resolve_dep(d) == "have"]
+        if have:
+            parts.append("还带了几个**可选**能力,当前环境里是有的 —— 用得上就用:")
+            parts.append("\n".join(_dep_lines(have, "optional")))
+    # 一个字都没得说就别出声 —— 可选依赖全缺时正是这种情况,而那时候本来就该**静默**,
+    # 留一个光秃秃的 "### 依赖" 标题纯属占地方(还容易让人以为下面漏印了东西)。
+    if not parts:
+        return ""
+    return "### 依赖\n\n" + "\n\n".join(parts)
+
+
+# ========================= 加载 =========================
 
 def load(name: str) -> str:
     """读一个技能的**正文**(不含 frontmatter),供模型按需加载。
 
-    正文之外还附一句"这个技能还带了哪些资源",让模型知道可以进一步去看 ——
-    但那些文件不会自动读进来,要它自己决定(三级加载的第三级)。
+    正文之外还附两段说明:能补上什么(依赖)和到哪去找(附带资源)。那些文件**不会**
+    自动读进来,要模型自己决定(三级加载的第三级)。
+
+    **这里也是"路径"唯一被写出来的地方。** 技能正文里只写相对路径(`scripts/x.py`),
+    绝不该写死 `/skills/<名>/...` —— 技能是可移植的,`/skills` 只是**我们这个项目**的
+    挂载点,换个宿主就不成立了;而且写死的路径会随改名、挪文件悄悄失效。所以由这里
+    在加载时把真实位置告诉模型,正文只需要说"跑 `scripts/x.py`"。
     """
     path = SKILLS_DIR / name
     skill_file = path / _SKILL_FILE
@@ -116,8 +343,7 @@ def load(name: str) -> str:
         available = "、".join(s["name"] for s in discover()) or "(还没有任何技能)"
         raise SkillError(f"没有名为 {name} 的技能。现有:{available}")
 
-    text = skill_file.read_text(encoding="utf-8")
-    _meta, body = _parse_frontmatter(text)
+    meta, body = _read_skill(path)
 
     # 附带资源不进上下文,但要说清"在哪、怎么用" —— 尤其脚本:技能目录在工作区**之外**,
     # 你的文件工具够不到;它是**只读**挂载在容器里的 /skills 下(见 container.py 的挂载),
@@ -133,11 +359,11 @@ def load(name: str) -> str:
             f"所以要用 `run_command` / `run_python` 走容器那条路:\n{listing}\n"
             f"(只读:能跑能读,改不了。VM 里看不到这些文件。)"
         )
+
+    dep = _dependency_note(meta)
+    if dep:
+        body += f"\n\n---\n{dep}"
     return body
-
-
-def names() -> list[str]:
-    return [s["name"] for s in discover()]
 
 
 def prompt_section() -> str:
@@ -145,6 +371,9 @@ def prompt_section() -> str:
     from . import prompts
     lines = []
     for s in discover():
+        if s["error"]:
+            lines.append(f"- `{s['name']}` —— !(这个技能有错,加载会失败:{s['error']})")
+            continue
         desc = s["description"] or "(没有写 description —— 模型将无从判断何时该用它)"
         lines.append(f"- `{s['name']}` —— {desc}")
     body = "\n".join(lines) if lines else "(目前没有任何技能)"

@@ -1,6 +1,10 @@
 ---
 name: architecture-migration
-description: 当用户要求把现有项目从一个架构形态、技术栈或部署方式迁移到另一个时使用 —— 例如单体拆微服务、Django 迁移到 FastAPI、虚拟机迁移到容器或 K8s、自建服务迁移到托管服务、SQLite 迁移到 PostgreSQL、跨大版本升级。产出 Go/No-Go 评估、迁移策略选择、数据迁移与回滚方案、分阶段计划。不适用于:同一技术栈内的结构调整(见 repo-architecture-design)、试验性技术预研、以及没有现存系统的从零新建。
+description: 当用户要求把现有项目从一个架构形态、技术栈或部署方式迁移到另一个时使用 —— 例如单体拆微服务、Django 迁移到 FastAPI、虚拟机迁移到容器或 K8s、自建服务迁移到托管服务、SQLite 迁移到 PostgreSQL、跨大版本升级。产出 Go/No-Go 评估、迁移策略选择、数据迁移与回滚方案、分阶段计划。不适用于:同一技术栈内的结构调整、试验性技术预研、以及没有现存系统的从零新建。
+optional:
+  - skill: repo-architecture-design
+    why: "它的 `references/interview.md` 是现成的背景访谈清单,迁移可以直接拿来问"
+    if_missing: 用下面第 1 步自己列的那几个问题问,够用;只是没那份清单系统
 ---
 
 # 架构迁移
@@ -31,7 +35,7 @@ description: 当用户要求把现有项目从一个架构形态、技术栈或�
 
 ### 第 1 步:背景
 
-背景访谈复用 `repo-architecture-design` 的清单(容器路径 `/skills/repo-architecture-design/references/interview.md`),但关注点不同 —— 迁移要额外问清:
+背景访谈复用 `repo-architecture-design/references/interview.md`,但关注点不同 —— 迁移要额外问清:
 
 - 迁移的**动因**是什么(成本、性能、合规、供应商锁定、团队技能)?
 - 有没有**硬期限**(合同、审计、旧系统下线日期)?
@@ -105,4 +109,6 @@ description: 当用户要求把现有项目从一个架构形态、技术栈或�
 - `references/rollback.md` —— 回滚点设计与不可逆操作识别。
 - `references/report-template.md` —— 迁移方案报告骨架。
 
-引用其它技能的路径时,统一写容器内的绝对路径(如 `/skills/repo-architecture-design/references/interview.md`)。
+用别的技能的资源,写法是 **`技能名/相对路径`**(像上面第 1 步那句),**同时在 frontmatter 的
+`optional` / `requires` 里声明** `skill: 对方` —— 加载时会一并告诉你对方在哪。别写死绝对路径:
+技能是要能搬到别的环境去的。

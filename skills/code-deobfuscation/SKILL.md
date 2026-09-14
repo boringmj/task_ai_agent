@@ -118,4 +118,5 @@ sed -i 's|^#\(.*community\)|\1|' /etc/apk/repositories && apk update
 | `scripts/decode_lua_static.py` | Lua:`string.char`/异或/hex/base64 | 容器 / VM |
 | `scripts/lua_hook.lua` | Lua:覆盖 `load`/`dofile` 等截 chunk | VM(lua5.4) |
 
-容器里这些脚本的路径是 `/skills/code-deobfuscation/scripts/…`(技能目录只读挂载);VM 里则需先 `vm_push`。
+这些路径都相对技能目录(技能目录在容器里**只读**挂载着,实际位置见加载本技能时给的资源清单);
+要进 VM 得先 `vm_push`。

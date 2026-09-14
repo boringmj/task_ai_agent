@@ -8,8 +8,8 @@
 
 容器里没有 git 二进制,所以这里用纯 Python 的 dulwich 直接读对象库。
 
-用法:
-    python /skills/repo-security-audit/scripts/scan_git.py <仓库路径> [选项]
+用法(路径相对技能目录;在容器里的实际位置见加载技能时给的资源清单):
+    python scripts/scan_git.py <仓库路径> [选项]
 
 选项:
     --out FILE        输出 JSON(默认 git-findings.json)

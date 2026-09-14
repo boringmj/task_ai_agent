@@ -46,8 +46,10 @@ description: 当用户明确要求分析某个仓库或项目的**结构**时使
 ### 2. 跑扫描脚本,拿到全局图景
 
 ```bash
-python /skills/repo-structure-analysis/scripts/scan_repo.py /workspace/clones/<名字>
+python scripts/scan_repo.py /workspace/clones/<名字>
 ```
+
+(路径相对技能目录;容器里的实际位置见加载本技能时给的资源清单。)
 
 输出一份 JSON:目录树、语言统计、构建/依赖清单文件、入口候选、最大的文件与目录、近似依赖边。
 **先只看这份汇总**,这一步不要读源码。

@@ -9,7 +9,7 @@
 这个技能要求按下面那个模板写报告:
 
 ```bash
-python /skills/<技能名>/scripts/x.py
+python scripts/x.py
 ```
 
 模板结束。

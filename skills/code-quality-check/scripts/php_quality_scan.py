@@ -276,7 +276,7 @@ def main():
     if len(shown) > args.top:
         print(f"  … 另有 {len(shown) - args.top} 条")
 
-    print("\n以上为候选,必须读上下文复核后再写进报告(见 /skills/code-quality-check/SKILL.md)。")
+    print("\n以上为候选,必须读上下文复核后再写进报告(办法见本技能的 SKILL.md)。")
 
     if args.json:
         payload = {

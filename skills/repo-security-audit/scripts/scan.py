@@ -5,8 +5,8 @@
 在容器里对工作区的目标仓库做一次静态快扫,产出 findings.json + 人读摘要。
 规则是数据驱动的,放在 scripts/rules/*.yaml,不加代码就能扩规则。
 
-用法:
-    python /skills/repo-security-audit/scripts/scan.py <仓库路径> [子命令 ...] [选项]
+用法(路径相对技能目录;在容器里的实际位置见加载技能时给的资源清单):
+    python scripts/scan.py <仓库路径> [子命令 ...] [选项]
 
 子命令(一个都不写 = all):
     secrets   硬编码凭据 / 密钥 / 高熵串

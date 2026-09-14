@@ -18,7 +18,7 @@
 ## 怎么扫
 
 ```bash
-python /skills/repo-security-audit/scripts/scan_git.py \
+python scripts/scan_git.py \
     /workspace/clones/<仓库> --out /workspace/git-findings-<仓库>.json
 ```
 

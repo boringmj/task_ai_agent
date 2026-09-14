@@ -1,6 +1,13 @@
 ---
 name: code-quality-check
 description: 当用户要求审阅代码质量、判断一个仓库或若干文件/函数"写得好不好"时使用 —— 例如「这段代码质量怎么样」「有没有坏味道」「哪里写得不好」「帮我看看可维护性」「这些函数是不是太长了」。覆盖微观代码质量:函数复杂度与长度、嵌套深度、命名与可读性、错误处理(吞异常/捕获过宽)、资源管理、重复代码、类型安全、测试覆盖缺口。**只管"单个文件/函数写得怎么样"** —— 不查漏洞与利用链、不查恶意行为、不看模块与目录结构、不出重构方案;也不做性能剖析、不评测第三方依赖、不代写测试。
+optional:
+  - package: tree_sitter
+    why: "`scripts/php_quality_scan.py` 用它解析 PHP 的 AST,才量得出函数规模与嵌套深度"
+    if_missing: PHP 退回通用扫描器,只能查空 catch 与重复块;报告里写明「PHP 的函数规模与类型标注没能自动度量」
+  - package: tree_sitter_php
+    why: 同上 —— tree_sitter 的 PHP 语法定义,少它就解析不了 PHP
+    if_missing: 同上,退回通用扫描器并在报告里写明覆盖缺口
 ---
 
 # 代码质量检查
@@ -79,11 +86,14 @@ description: 当用户要求审阅代码质量、判断一个仓库或若干文�
 
 ```bash
 # 通用 —— Python 及其它语言
-python3 /skills/code-quality-check/scripts/quality_scan.py <目标路径> --json quality-<目标名>.json
+python3 scripts/quality_scan.py <目标路径> --json quality-<目标名>.json
 
 # PHP 项目必须用这条(见下)
-python3 /skills/code-quality-check/scripts/php_quality_scan.py <目标路径> --json quality-<目标名>.json
+python3 scripts/php_quality_scan.py <目标路径> --json quality-<目标名>.json
 ```
+
+(路径都**相对技能目录** —— 技能在容器里是只读挂载的,实际位置在加载本技能时给出的
+资源清单里,照着那个来。)
 
 **先看清目标是什么语言,再选脚本。** Python 用第一条;其它语言也先用第一条兜底。**PHP 必须用
 第二条** —— 通用脚本的 AST 度量只支持 Python,对 PHP 只能认出空 catch 与重复块;而那个 PHP
