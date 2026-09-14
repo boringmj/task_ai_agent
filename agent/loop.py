@@ -45,11 +45,19 @@ def compact(messages: list[dict], keep_recent: int = 0) -> str:
     if not summary:
         return "压缩失败: 模型没有返回摘要。"
 
+    # 以 user 身份进对话,但**打上系统前缀** —— 否则重放时屏幕上会冒出一行
+    # "你 > (以上对话已压缩…",像是用户自己说了这句话(见 session.SYSTEM_TAG)。
     messages[head_start:] = [{
         "role": "user",
-        "content": prompts.load("compact_summary", summary=summary),
+        "content": session_tag() + " " + prompts.load("compact_summary", summary=summary),
     }] + tail
     return f"已压缩上下文: {len(head)} 条消息 → 1 条摘要({len(summary)} 字)"
+
+
+def session_tag() -> str:
+    """程序插进对话的消息统一带的那个前缀(定义在 session 层,别各写各的)。"""
+    from . import session
+    return session.SYSTEM_TAG
 
 
 def _persist(msg: dict) -> None:
@@ -110,12 +118,13 @@ def _inject_notices(messages: list[dict]) -> None:
         t.delivered = True
         messages.append({
             "role": "user",
-            "content": "（系统消息,不是用户打的字:你之前派出去的后台子 agent 有结果了。\n\n"
+            "content": session_tag() +
+                       " 你之前派出去的后台子 agent 有结果了(**这不是用户打的字**)。\n\n"
                        + tasks.report(t)["message"] +
                        "\n\n**你自己判断怎么接**:手头这件事正做到一半、或者现在处理它会打断"
                        "你的思路 —— 那就先不管它,把手上的做完再说。手头正好告一段落、"
                        "或者它的结果恰好是你下一步要用的,就现在处理。别为了「及时」"
-                       "硬把正在做的事切断。)",
+                       "硬把正在做的事切断。",
         })
         _persist(messages[-1])
 

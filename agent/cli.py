@@ -20,6 +20,7 @@ from .commands import all_commands, dispatch as dispatch_command
 from .commands import system_message as commands_system_message
 from . import skills
 from . import ctx
+from . import session
 from . import tasks
 from .llm import usage_line
 from .loop import load_system_prompt, run
@@ -85,8 +86,17 @@ def _replay_history(history: list[dict], source: str = "上次会话") -> None:
         text = (content or "").strip()
 
         if m.get("role") == "user":
-            console.print("你 > ", style="bold cyan", end="")
-            console.print(text, markup=False)
+            # 程序自己插进对话的那些(压缩摘要、子 agent 通报)**不是用户打的字**。
+            # 它们以 user 身份进对话是必要的(否则模型不当回事),但重放时按 `你 >`
+            # 打出来就成了"用户说过这句话" —— 实测屏幕上会冒出一行
+            # 「你 > (以上对话已压缩…」。所以按前缀分开渲染(见 session.SYSTEM_TAG)。
+            if session.is_system_message(m):
+                body = text[len(session.SYSTEM_TAG):].strip()
+                console.print("系统 > ", style="bold magenta", end="")
+                console.print(body, style="dim", markup=False)
+            else:
+                console.print("你 > ", style="bold cyan", end="")
+                console.print(text, markup=False)
             continue
 
         # ---- assistant:思考 → 工具调用 → 回答,顺序与实时一致 ----

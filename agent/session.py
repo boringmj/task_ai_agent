@@ -63,6 +63,27 @@ def _persistable(messages: list[dict]) -> list[dict]:
     return messages[start:]
 
 
+# **程序自己插进对话的 user 消息,一律带这个前缀。**
+#
+# 为什么需要它:有些东西必须以 user 身份进对话(压缩摘要、子 agent 的通报)—— 用别的
+# 角色模型要么不重视、要么当成背景资料。可一旦是 user,**重放的时候就和用户亲手打的字
+# 长得一模一样**,屏幕上冒出一行"你 > (以上对话已压缩…",像是用户自己说了这句话。
+#
+# 所以给它们一个**统一的前缀**:既能让人一眼看出"这不是我打的",也让程序有个**可判的
+# 标记**(见 is_system_message)去分别对待 —— 而不是靠人去比对措辞。
+#
+# 用纯文本前缀而不是消息里的额外字段:那个字段要发给 API,多半会被拒;而前缀在内容里,
+# 存盘、重放、发给模型都天然跟着走。
+SYSTEM_TAG = "[系统]"
+
+
+def is_system_message(m: dict) -> bool:
+    """这条 user 消息是不是程序插进去的(而不是用户打的)。"""
+    return (m.get("role") == "user"
+            and isinstance(m.get("content"), str)
+            and m["content"].startswith(SYSTEM_TAG))
+
+
 def repair_dangling(messages: list[dict]) -> int:
     """把**悬空的工具调用**补上一条结果(原地改),返回补了几条。
 
