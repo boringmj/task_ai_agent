@@ -90,6 +90,139 @@ def _strip_fences(body: str) -> list[tuple[int, str]]:
     return out
 
 
+# ======================= markdown 结构检查 =======================
+# 这一段和 agent/markdown.py 里的规则是**同一套**,只是那份跑在宿主、这份跑在容器。
+# 为什么非要有两份:技能目录对宿主是"工作区之外",agent 的文件工具够不到它(那是硬性
+# 安全边界,不该为这个松掉),所以只能让容器里这个脚本代劳。**改一边记得改另一边。**
+LIST_RE = re.compile(r"^(\s*)([-*+]|\d+[.)])\s")
+HEADING_RE = re.compile(r"^(#{1,6})\s")
+FENCE_RE = re.compile(r"^(\s*)(```+|~~~+)\s*(\S*)")
+
+
+def _emphasis_only(s: str) -> bool:
+    """整行只由一个强调元素构成吗(`**粗体**` / `*斜体*`)。
+
+    MD036 判的是"拿强调当标题"(`**第一步**` 顶替 `### 第一步`),但只有它**自成一段**时
+    才算数,所以调用方还得确认这行前后都空着。
+    """
+    for mark in ("**", "__", "*", "_"):
+        if len(s) > 2 * len(mark) and s.startswith(mark) and s.endswith(mark):
+            inner = s[len(mark):-len(mark)]
+            if inner and mark[0] not in inner:
+                return True
+    return False
+
+
+def check_markdown(lines: list[str], offset: int) -> list[str]:
+    """查 markdown 结构问题。offset 是正文首行在全文件里的行号(用于报行号)。"""
+    out: list[str] = []
+    in_fence, fence_marker = False, ""
+    prev_blank, prev_kind = True, ""      # 文件开头视为空行
+    h1_seen: list[int] = []
+    markers: set[str] = set()
+
+    for i, raw in enumerate(lines):
+        n = offset + i + 1
+        fence = FENCE_RE.match(raw)
+        if fence:
+            marker = fence.group(2)                 # 可能是 ``` 也可能更长
+            if not in_fence:
+                if not prev_blank:
+                    out.append(f"{n}: MD031 代码块上方要空一行")
+                if not fence.group(3):
+                    out.append(f"{n}: MD040 代码块要标明语言(```python / ```bash / ```text)")
+                in_fence, fence_marker = True, marker
+            elif (raw.strip().startswith(fence_marker[0])
+                  and len(raw.strip()) >= len(fence_marker)
+                  and set(raw.strip()) == {fence_marker[0]}):
+                # 闭合围栏要**不短于**开启的那个(CommonMark 的规矩)。这条很关键:
+                # 要示范"本身含代码块"的 markdown 时,外层得用更长的围栏,否则内层会
+                # 把外层提前闭合,后面全乱。
+                in_fence = False
+                if i + 1 < len(lines) and lines[i + 1].strip():
+                    out.append(f"{n}: MD031 代码块下方要空一行")
+            prev_blank, prev_kind = False, "fence"
+            continue
+
+        if in_fence:
+            continue                                # 代码块内部不管
+
+        blank = not raw.strip()
+        head = HEADING_RE.match(raw)
+        item = LIST_RE.match(raw) and not raw.lstrip().startswith(("|", ">"))
+
+        if head:
+            if len(head.group(1)) == 1:
+                h1_seen.append(n)
+            if not prev_blank:
+                out.append(f"{n}: MD022 标题上方要空一行")
+            if i + 1 < len(lines) and lines[i + 1].strip():
+                out.append(f"{n}: MD022 标题下方要空一行(下一行不能紧跟内容)")
+        elif item:
+            if not prev_blank and prev_kind != "list":
+                out.append(f"{n}: MD032 列表上方要空一行")
+            m_u = re.match(r"^\s*([-*+])", raw)     # MD004 只管无序列表的符号
+            if m_u:
+                markers.add(m_u.group(1))
+            if i + 1 < len(lines) and lines[i + 1].strip() and not LIST_RE.match(lines[i + 1]):
+                nxt = lines[i + 1]
+                if not nxt.startswith((" ", "\t")) and not HEADING_RE.match(nxt):
+                    out.append(f"{n}: MD032 列表下方要空一行")
+
+        # MD036:整行加粗/斜体、前后都空着 = 自成一段,是拿强调当标题用。
+        # 紧跟正文的 `**重点**:` 只是段内强调,不报。
+        if (not blank and not head and not item and prev_blank
+                and not raw[:1].isspace()
+                and (i + 1 >= len(lines) or not lines[i + 1].strip())
+                and _emphasis_only(raw.strip())):
+            out.append(f"{n}: MD036 别用加粗当标题(标题请用 #,整行加粗只会被当成强调)")
+
+        if blank:
+            if prev_blank and i > 0:
+                out.append(f"{n}: MD012 连续空行")
+        elif raw != raw.rstrip():
+            out.append(f"{n}: MD009 行尾有多余空格")
+        # MD013(行太长)刻意不查 —— 和 agent/markdown.py 口径一致,理由见那边。
+
+        if item:
+            kind = "list"
+        elif prev_kind == "list" and raw[:1].isspace():
+            kind = "list"                # 列表项的缩进续行仍属于这个列表
+        else:
+            kind = "text"
+        prev_blank, prev_kind = blank, kind
+
+    if not in_fence:
+        first = next((k for k, ln in enumerate(lines) if ln.strip()), None)
+        if first is None:
+            out.append("MD041 文件是空的")
+        elif not HEADING_RE.match(lines[first]):
+            out.append(f"{offset + first + 1}: MD041 正文第一行要是一级标题(如 # 标题)")
+    if len(h1_seen) > 1:
+        out.append(f"MD025 有多个一级标题(第 {', '.join(map(str, h1_seen))} 行)—— 一份文档只该有一个")
+    if len(markers) > 1:
+        out.append(f"MD004 无序列表符号不统一:{' '.join(sorted(markers))}")
+    return out
+
+
+def check_markdown_file(path: pathlib.Path) -> list[str]:
+    """查一个 .md 文件的结构(frontmatter 归 check_skill 自己管,这里只查正文)。"""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    _, _, body_start = _split_frontmatter(text)
+    lines = text.split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    issues = check_markdown(lines[body_start:] if body_start else lines, body_start)
+    if text and not text.endswith("\n"):
+        issues.append("MD047 文件结尾要有换行")
+    elif text.endswith("\n\n"):
+        issues.append("MD047 文件结尾只能有一个换行")
+    return issues
+
+
 def check_skill(skill_dir: pathlib.Path, known: set[str]) -> list[str]:
     """检查一个技能目录,返回问题列表(空 = 没问题)。"""
     problems: list[str] = []
@@ -159,6 +292,13 @@ def check_skill(skill_dir: pathlib.Path, known: set[str]) -> list[str]:
             f"正文 {n_body} 行(超过 {MAX_BODY_LINES})—— 技能正文是按需加载的,"
             f"太长会把上下文吃掉;大段参考资料放 references/ 里按需读"
         )
+
+    # ---- markdown 结构(技能里的**所有** .md,不只 SKILL.md —— references 用户也会打开)----
+    for md_file in sorted(skill_dir.rglob("*.md")):
+        if "__pycache__" in md_file.parts:
+            continue
+        for issue in check_markdown_file(md_file):
+            problems.append(f"{md_file.relative_to(skill_dir)} {issue}")
 
     # ---- 附带脚本的语法 ----
     for py in sorted((skill_dir / "scripts").glob("*.py")) if (skill_dir / "scripts").is_dir() else []:
