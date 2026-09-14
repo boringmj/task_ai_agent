@@ -212,7 +212,9 @@ def list_sessions() -> list[dict]:
         out.append({
             "id": sid,
             "created": (meta or {}).get("created", "?"),
-            "last_used": (meta or {}).get("last_used", "?"),
+            # 给人看的,把 ISO 的 "T" 换成空格(如 2026-09-14 16:29:19)。
+            # 换的是同一个字符位,字典序不变 —— 下面按它排序仍然是对的。
+            "last_used": ((meta or {}).get("last_used") or "?").replace("T", " "),
             "active": sid == _current_session,
             "missing": not exists,      # 目录被手工删了,但索引还记着
             # 被**别的活着的 agent** 占着 —— 列表里要标出来,不然用户会以为能切过去。

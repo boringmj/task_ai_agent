@@ -87,7 +87,7 @@ def cmd_switch(ctx: Context) -> str:
                 state = "(目录已丢失)"
             else:
                 state = "空闲"
-            lines.append(f"  {s['id']}  {state}")
+            lines.append(f"  {s['id']}  最后使用 {s['last_used']}  {state}")
         return "\n".join(lines)
 
     creating = target.lower() in ("new", "新")
