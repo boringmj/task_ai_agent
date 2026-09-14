@@ -43,6 +43,16 @@ BOUNDARY_HINTS = (
 PLACEHOLDERS = {"foo", "bar", "baz", "xxx", "yyy", "name", "foo.py", "bar.py"}
 # 单字母文件名(x.py / y.md)也是写说明时常用的举例写法
 SINGLE_LETTER = re.compile(r"^[a-z]\.\w+$")
+# 技能里可能写着路径引用的文件类型 —— 正文、参考资料、脚本**都算**。
+# 脚本尤其不能漏:改名的时候 md 里的引用肉眼还能扫到,而脚本里那行 print("见 /skills/<名>/…")
+# 藏在几百行代码中间,同样会断、而且要到运行时才报出来。
+SCAN_EXT = {".md", ".py", ".sh", ".js", ".lua", ".yaml", ".yml"}
+
+
+def _scannable_files(skill_dir: pathlib.Path) -> list[pathlib.Path]:
+    """技能里所有可能写着路径引用的文件。"""
+    return [p for p in sorted(skill_dir.rglob("*"))
+            if p.is_file() and p.suffix.lower() in SCAN_EXT and "__pycache__" not in p.parts]
 
 MAX_BODY_LINES = 200       # 正文超过这个行数就提示(SKILL.md 太长会把上下文吃掉)
 
@@ -305,6 +315,27 @@ def check_skill(skill_dir: pathlib.Path, known: set[str]) -> list[str]:
         for issue in check_markdown_file(md_file):
             problems.append(f"{md_file.relative_to(skill_dir)} {issue}")
 
+    # ---- 脚本里的容器路径引用 ----
+    # md 那部分上面按行查过了(带围栏剔除),这里补非 md 的:脚本里那句
+    # `print("见 /skills/<名>/…")` 最容易被改名漏掉 —— 它藏在几百行代码中间,
+    # 而且断了不报错、要等运行时才看得出来。
+    for f in _scannable_files(skill_dir):
+        if f.suffix.lower() == ".md":
+            continue
+        try:
+            text = f.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        rel_f = f.relative_to(skill_dir)
+        for m in CONTAINER_REF.finditer(text):
+            other, sub = m.group(1), m.group(2).rstrip(".,)")
+            if "…" in sub or "*" in sub:
+                continue
+            if other not in known:
+                problems.append(f"{rel_f}: 引用的技能 `{other}` 不存在")
+            elif not (skill_dir.parent / other / sub).exists():
+                problems.append(f"{rel_f}: /skills/{other}/{sub} 不存在(改名或挪文件后没同步?)")
+
     # ---- 附带脚本的语法 ----
     for py in sorted((skill_dir / "scripts").glob("*.py")) if (skill_dir / "scripts").is_dir() else []:
         try:
@@ -324,18 +355,19 @@ def _refs_to_others(skill_dir: pathlib.Path, known: set[str]) -> dict[str, set[s
       但内容上并不耦合。
     """
     out: dict[str, set[str]] = {"资源": set(), "提及": set()}
-    md_files = [skill_dir / "SKILL.md"] if (skill_dir / "SKILL.md").exists() else []
-    md_files += list(skill_dir.rglob("references/*.md"))
-    for f in md_files:
+    for f in _scannable_files(skill_dir):
         try:
             text = f.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        for line in _strip_fences(text):
-            _, content = line
+        is_md = f.suffix.lower() == ".md"
+        lines = _strip_fences(text) if is_md else list(enumerate(text.splitlines(), 1))
+        for _, content in lines:
             for m in CONTAINER_REF.finditer(content):
                 if m.group(1) in known and m.group(1) != skill_dir.name:
                     out["资源"].add(m.group(1))
+            if not is_md:
+                continue      # 脚本里只认容器路径;再去猜"技能名提及"误报太多
             # "复用 X 的 `scripts/y.py`" 这种:同一行的资源引用算在 X 头上
             words = [w for w in BACKTICK_WORD.findall(content) if w in known and w != skill_dir.name]
             if words and RES_REF.search(content):

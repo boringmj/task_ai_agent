@@ -83,7 +83,11 @@ python3 /skills/code-quality-check/scripts/quality_scan.py <目标路径> --json
 
 输出 JSON:按维度和预估等级分组的候选命中,每条带文件、行号、代码片段与度量值。**先只看汇总**,不要在这一步读源码。
 
-脚本用 AST 对 **Python** 精确度量函数规模与吞异常;其它语言目前只覆盖空 catch、重复块与少数通用信号 —— 函数规模一类的度量要人工看,或借助该语言现成的工具(`radon` / `eslint` / `gocyclo`)。
+脚本用 AST 对 **Python** 精确度量函数规模与吞异常。**PHP 项目改跑
+`/skills/code-quality-check/scripts/php_quality_scan.py`**(同样参数,见下面「参考与脚本」)——
+通用脚本对 PHP 只能认出空 catch 与重复块,那个用 tree-sitter 补齐了函数规模、类型标注与
+catch 处理。其它语言目前只覆盖空 catch、重复块与少数通用信号:函数规模一类的度量要人工看,
+或借助该语言现成的工具(`radon` / `eslint` / `gocyclo`)。
 
 ### 3. 复核每一条候选
 
@@ -118,3 +122,7 @@ python3 /skills/code-quality-check/scripts/quality_scan.py <目标路径> --json
 - `references/dimensions.md` —— 七个维度的判据、各语言典型信号、什么情况**不算**问题
 - `references/report-template.md` —— 报告结构与 quality JSON 字段
 - `scripts/quality_scan.py` —— 静态扫描器:函数度量、坏味道候选、近似重复,输出 JSON
+- `scripts/php_quality_scan.py` —— **PHP 项目用这个**。通用扫描器的 AST 度量只支持 Python,
+  对 PHP 只能认空 catch 与重复块;这个用 tree-sitter 补齐函数规模(行数 / 嵌套 / 圈复杂度 /
+  参数数)、类型标注、catch 处理。依赖 `tree_sitter` 与 `tree_sitter_php`,容器里装一次
+  持久保留:`pip install --target /workspace/.pylibs tree_sitter tree_sitter_php`
