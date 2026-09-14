@@ -23,6 +23,7 @@ import io
 import json
 import os
 import threading
+import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -42,6 +43,14 @@ MAX_CONCURRENT = int(os.environ.get("SUBAGENT_MAX_CONCURRENT", "10"))
 RESULT_MAX_CHARS = int(os.environ.get("SUBAGENT_RESULT_MAX", "4000"))
 # 输出缓冲区保留多少字符(给 /subtasks 看和排错用,不进上下文)
 BUFFER_MAX_CHARS = int(os.environ.get("SUBAGENT_BUFFER_MAX", "200000"))
+# 等子 agent 时的轮询间隔。**必须带超时** —— 见 _wait_for 里那段说明(不可中断的
+# 阻塞锁会让 Ctrl+C 失效,用户以为程序死了)。
+WAIT_POLL = 0.25
+# 等的时候每隔这么久出一声,让人知道它还活着
+WAIT_HEARTBEAT = float(os.environ.get("SUBAGENT_HEARTBEAT", "10"))
+# 单次等待的硬上限:再久也先不等了,让它转后台,免得主 agent 被一个卡住的子 agent
+# 无限期拖住。跑完照样会通报。
+WAIT_MAX = float(os.environ.get("SUBAGENT_WAIT_MAX", "1800"))
 
 
 # 用户当前"接管"着哪个子 agent(见 attach)。**只有一个** —— 一次看一个才看得清。
@@ -378,13 +387,62 @@ def loop_run(t: Task, c: ctx.AgentCtx) -> str:
 
 
 def _wait_for(t: Task, timeout: float | None) -> dict:
-    """等它跑完(或者停下来等回话)。"""
-    ok = t.notifier.wait(timeout)
-    if not ok:
-        t.awaited = False      # 不接着等了 —— 它跑完时按"没人等"处理,发通报
-        return {"status": "timeout", "task_id": t.id,
-                "message": f"{t.id} 还没回来。用 task_status('{t.id}') 看进展。"}
-    return report(t)
+    """等它跑完(或者停下来等回话)。
+
+    **绝对不能写成 `notifier.wait()` 无超时那种等法。** 那在 Windows 上是一把**不可中断**
+    的阻塞锁:主线程卡在 C 里,Ctrl+C 送不进去,用户看到的就是"整个程序死了、连打断都
+    做不到"。所以这里改成**带超时的轮询**:每 0.25 秒回到一次 Python 字节码,信号才有机会
+    被处理 —— 这是 Ctrl+C 能生效的前提。
+
+    等的时候还要**出声**:子 agent 的输出默认一行都不打(那是对的),但"什么都不打"和
+    "卡死了"在用户眼里长得一模一样。每 10 秒打一句"还在跑、第几步",人就知道该等还是该停。
+    """
+    limit = timeout if timeout is not None else WAIT_MAX
+    started = time.monotonic()
+    deadline = started + limit
+    next_beat = started + WAIT_HEARTBEAT
+    first = True
+    try:
+        while True:
+            if t.notifier.wait(WAIT_POLL):
+                return report(t)
+            now = time.monotonic()
+            if now >= deadline:
+                t.awaited = False       # 不等了 —— 它跑完时按"没人等"处理,发通报
+                return {"status": "timeout", "task_id": t.id, "message": (
+                    f"{t.id} 跑了 {_dur(now - started)} 还没回来,先不等了 —— "
+                    f"它在后台继续,干完会通知你。要看它在忙什么:task_status('{t.id}')。")}
+            if now >= next_beat:
+                next_beat = now + WAIT_HEARTBEAT
+                hint = ("(Ctrl+C 可以不再等它 —— 它会在后台继续跑,用 /subtasks 看)"
+                        if first else "")
+                first = False
+                _beat(t, now - started, hint)
+    except BaseException:
+        # 被 Ctrl+C 打断(或别的什么掀了):**不再算"有人等"** —— 它跑完照常通报,
+        # 否则用户放弃等待之后,那份结果就再也没人告诉他了。
+        t.awaited = False
+        raise
+
+
+def _dur(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s} 秒" if s < 60 else f"{s // 60} 分 {s % 60} 秒"
+
+
+def _beat(t: Task, elapsed: float, hint: str = "") -> None:
+    """等的时候定期出一声。只打终端,不进任何上下文。
+
+    步数取"它说了几句话" —— 第一步没走完时是 0,那会儿只报时间就够了(写"第 0 步"
+    看着像出错)。
+    """
+    steps = sum(1 for m in t.messages if m.get("role") == "assistant")
+    where = f",第 {steps} 步" if steps else ""
+    try:
+        ctx.out().print(f"  … {t.id} 还在跑({_dur(elapsed)}{where}) {hint}",
+                        style="dim", markup=False)
+    except Exception:  # noqa: BLE001 - 打不出来不该影响等待
+        pass
 
 
 def _notify(t: Task) -> None:
