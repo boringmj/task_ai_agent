@@ -357,10 +357,20 @@ def load(name: str) -> str:
     # 附带资源不进上下文,但要说清"在哪、怎么用" —— 尤其脚本:技能目录在工作区**之外**,
     # 你的文件工具够不到;它是**只读**挂载在容器里的 /skills 下(见 container.py 的挂载),
     # 所以跑脚本要用 run_command / run_python 走容器那条路。
+    # **一个都不能少。** 这里以前截过 40 个,那是错的:没列出来的文件模型根本不知道它存在,
+    # 也就永远不会去用 —— 而它**不会报错、不会被察觉**,只表现为"这个技能能干的活比实际少"。
+    # 真嫌长就该去精简技能的附带资源,不该在这儿悄悄砍掉一截(而且砍了数量还对不上,
+    # 那一行会说"带了 40 个")。
+    #
+    # 但**编译产物要排除**:`__pycache__/*.pyc` 是跑脚本时掉出来的垃圾,列出来纯属占地方 ——
+    # 模型既不会去读它(源码就在旁边),那行绝对路径也没有任何用。这是"少列几个"的反面:
+    # 不是漏了真东西,是把不是东西的列进来了。
     files = [f for d in _RESOURCE_DIRS if (path / d).is_dir()
-             for f in sorted((path / d).rglob("*")) if f.is_file()]
+             for f in sorted((path / d).rglob("*"))
+             if f.is_file() and "__pycache__" not in f.parts
+             and f.suffix not in (".pyc", ".pyo")]
     if files:
-        rel = [f.relative_to(path).as_posix() for f in files][:40]
+        rel = [f.relative_to(path).as_posix() for f in files]
         listing = "\n".join(f"- {r}  →  容器里:{CONTAINER_SKILLS_DIR}/{name}/{r}" for r in rel)
         body += (
             f"\n\n---\n这个技能还带了 {len(rel)} 个附带资源(不会自动进上下文,需要时自己去取)。"
