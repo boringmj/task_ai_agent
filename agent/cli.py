@@ -28,6 +28,7 @@ from .session import (
     release_owner,
     session_note as session_note_text,
     rewrite_session,
+    touch_session,
 )
 from .tools.container import docker_cleanup_stale, docker_health
 from .tools.memory import memory_text
@@ -209,6 +210,21 @@ def _make_stdio_forgiving() -> None:
             pass
 
 
+def _on_exit() -> None:
+    """退出收尾:把 last 指向当前会话,再摘掉自己的占用标记。
+
+    两个都要现取会话 id,**别用启动时那个 session_id** —— /switch 会换掉它,而局部变量
+    切完就过期了:拿旧的会把 last 指回上一个会话,还会摘错占用标记(新会话的摘不掉,
+    下次启动就以为它还被占着)。这和 rewrite_session 那处是同一个坑。
+
+    last 只在**正常退出**时这样更新;被强杀、崩溃时 atexit 不跑,那种情况靠下次启动时
+    的 register_session 兜底 —— 两处都要有,不能只留一个。
+    """
+    sid = current_session_id()
+    touch_session(sid)
+    release_owner(sid)
+
+
 def main() -> None:
     _make_stdio_forgiving()
     messages: list[dict] = [{"role": "system", "content": load_system_prompt()}]
@@ -233,7 +249,7 @@ def main() -> None:
     if history:
         # 接回历史后追加一条提示(追加在末尾以保住前缀缓存,详见 _restore_notice)
         messages.append(_restore_notice(len(history)))
-    atexit.register(release_owner, session_id)   # 正常退出时摘掉占用者标记
+    atexit.register(_on_exit)
     _cleanup_trash_on_start()
     # 预处理 Docker 健康状态(非阻断):可用则做残留清理,不可用仅警告,agent 照常启动
     ok, msg = docker_health()

@@ -435,6 +435,21 @@ def claim_owner(sid: str) -> bool:
     return try_claim(sid)
 
 
+def touch_session(sid: str) -> None:
+    """把索引里的 last 与 last_used 指向这个会话(退出时调)。
+
+    为什么"关闭时"还要更新一次:`last` 原本只在**启动**和**切换**时设,于是它记的是
+    "最后启动或切换的那个",不一定是"用户最后关掉的那个"。正常退出时再点一次才名副其实。
+
+    但这**不能替代启动时的更新** —— 被强杀、崩溃时 atexit 根本不跑,那种情况只能靠下次
+    启动兜底。两处都要有。
+    """
+    try:
+        register_session(sid)
+    except Exception:  # noqa: BLE001 - 退出路径上的失败不该挡住退出
+        pass
+
+
 def release_owner(sid: str, instance: str | None = None) -> None:
     """退出时摘掉占用者标记 —— 只摘自己那个,别把别人的顺手删了。"""
     try:
