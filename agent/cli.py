@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import atexit
+import queue
 import sys
+import threading
 from datetime import datetime
 
 from rich.markdown import Markdown
@@ -126,6 +128,17 @@ def _replay_history(history: list[dict], source: str = "上次会话") -> None:
     console.print("─" * 46, style="dim")
 
 
+def _render_reply(reply: str) -> None:
+    """把模型这一轮的答复渲染出来(用户发起的轮次和被子 agent 叫醒的轮次共用)。"""
+    console.print("AI >", style="bold green")
+    # Markdown 要拿到完整文本才能正确解析,所以是等模型说完再一次性渲染
+    console.print(Markdown(reply) if reply.strip() else "(模型没有返回内容)")
+    line = usage_line()
+    if line:
+        console.print(line, style="dim")
+    console.print()
+
+
 def _restore_notice(restored_count: int) -> dict:
     """会话恢复时追加的那条提示(**追加在历史末尾**,不是开头)。
 
@@ -163,9 +176,63 @@ def _cleanup_trash_on_start() -> None:
 
 
 _EXIT_WORDS = {"exit", "quit"}      # 裸敲也等价于 /exit,两处用法见下
+# 等输入时的轮询间隔:每这么久醒一次,看有没有子 agent 的事要处理。
+# 别调太小(白烧 CPU),也别太大(叫醒不及时)。
+_IDLE_POLL = 0.4
 
 
-def _read_multiline(prompt: str = "你 > ") -> str:
+def _has_pending_work() -> bool:
+    """有没有"不用等用户、现在就能处理"的事(后台子 agent 出结果了)。"""
+    try:
+        return bool(tasks.needs_attention())
+    except Exception:  # noqa: BLE001 - 判断失败不该拦住读输入
+        return False
+
+
+class _Idle:
+    """哨兵:没读到输入,但该先回去看看子 agent 有没有事。"""
+
+    def __repr__(self) -> str:      # pragma: no cover - 只为调试好看
+        return "_IDLE"
+
+
+_IDLE = _Idle()
+_INPUT: "queue.Queue" = queue.Queue()
+
+
+def _start_input_reader() -> None:
+    """把 stdin 的读取挪进一条后台线程。
+
+    **为什么非得这样**:主 agent 空闲时要能被子 agent 叫醒。而在这之前,主线程是**阻塞
+    在 `sys.stdin.readline()` 里的** —— 卡在系统调用上,子 agent 干完了也叫不动它,只能
+    干等用户下次敲键盘。把读取挪到线程里,主线程就能"等输入,但每隔一会儿醒一次,
+    看看有没有子 agent 的事要处理"。
+
+    读取线程只负责把整行塞进队列,**不打印任何东西**,也不做任何解析 —— 提示符、
+    多行规则、Ctrl+C 全留在主线程(不然两条线程都会碰终端)。
+    """
+    def run() -> None:
+        while True:
+            try:
+                line = sys.stdin.readline()
+            except Exception:  # noqa: BLE001 - 读崩了就当作 EOF
+                line = ""
+            _INPUT.put(None if line == "" else line)
+            if line == "":
+                return
+
+    threading.Thread(target=run, daemon=True, name="stdin-reader").start()
+
+
+def _take_line(timeout: float):
+    """等一行输入,超时返回 _IDLE(表示"可以先去看看别的事")。"""
+    try:
+        return _INPUT.get(timeout=timeout)
+    except queue.Empty:
+        return _IDLE
+
+
+def _read_multiline(prompt: str = "你 > "):
     """读取一段输入,空行提交 —— 支持粘贴多行并保留换行。
 
     console.input() 只读单行,没法粘贴多行代码/文本。改为逐行读取,
@@ -173,14 +240,29 @@ def _read_multiline(prompt: str = "你 > ") -> str:
 
     例外:**第一行本身就是终端指令**(以 / 开头)或裸的 exit/quit 时,回车即执行,
     不必再敲空行 —— 指令天生是单行的,逼人多按一次回车只会烦人。
+
+    返回:输入文本 / `None`(该退出)/ `_IDLE`(先别等了,回去处理子 agent 的事)。
     """
     lines: list[str] = []
     try:
         console.print(prompt, style="bold cyan", end="")
         while True:
-            line = sys.stdin.readline()
-            if line == "":  # EOF(Ctrl+D / Ctrl+Z),停止
-                break
+            line = _take_line(_IDLE_POLL)
+            if line is _IDLE:
+                # 等输入的时候定期醒一次,有子 agent 的事就让它插进来。
+                #
+                # **判断的是"有没有已经按过回车的完整行",不是"用户是不是正在打字"。**
+                # 读取线程用的是 readline(),字符在回车之前缓冲在 C 层 —— 这里根本看不见。
+                # 所以真正的保护是:用户已经提交过一行(多行输入的续行)时不让位,免得把
+                # 话截断。他**正在敲、还没回车**的那几个字盖不住,那条通报的输出会插进
+                # 他的输入行里 —— 这是这套做法的固有粗糙处,要根治得自己实现行编辑
+                # (逐字符读 + 退格/方向键/粘贴),为这点收益不值得。
+                if not lines and _has_pending_work():
+                    return _IDLE
+                continue
+            if line is None:        # EOF(Ctrl+D / Ctrl+Z)
+                sys.stdout.write("\n")
+                return None
             if line in {"\n", "\r\n"}:  # 空行 = 提交
                 break
             lines.append(line.rstrip("\r\n"))
@@ -197,8 +279,6 @@ def _read_multiline(prompt: str = "你 > ") -> str:
         # 恢复打印用裸 write(不走 Rich),避免 get_terminal_size 又被中断引发二次异常。
         sys.stdout.write("\n")
         return None
-    except EOFError:
-        pass
     return "\n".join(lines)
 
 
@@ -257,6 +337,9 @@ def main() -> None:
 
 def _session_loop() -> None:
     _make_stdio_forgiving()
+    # stdin 的读取挪到后台线程 —— 主线程才有机会「等输入,但定期醒来看子 agent」
+    # (见 _start_input_reader 的说明)。必须在任何读输入之前起。
+    _start_input_reader()
     messages: list[dict] = [{"role": "system", "content": load_system_prompt()}]
     memory = memory_text().strip()  # 跨会话记住的关键事实最先注入,始终在场
     if memory:
@@ -323,8 +406,23 @@ def _session_loop() -> None:
         try:
             # 接管着某个子 agent 时,提示符换成它 —— 一眼能看出"现在敲的话是说给谁听的"
             watched = tasks.attached()
+            # **闲置时被子 agent 叫醒** —— 不用等用户敲键盘。
+            # 在等输入的过程中,`_read_multiline` 每隔一会儿回来看一眼:有子 agent
+            # 出结果了就返回 _IDLE,那儿我们直接把这一轮跑掉。用户什么都没说,
+            # 主 agent 自己就把通报处理了。
+            if _has_pending_work():
+                # 提示符后面可能已经有用户打了一半的字 —— 先换行,让这一块自成一段,
+                # 免得我们的输出和他的输入糊在同一行上。
+                console.print()
+                console.print("(后台子 agent 有结果,主 agent 主动处理)", style="dim")
+                reply = run(None, messages)
+                _render_reply(reply)
+                continue
+
             user_input = _read_multiline(f"[{watched}] > " if watched else "你 > ")
-            if user_input is None:  # 空闲时 Ctrl+C = 退出
+            if user_input is _IDLE:
+                continue                # 回去处理子 agent 的事
+            if user_input is None:      # 空闲时 Ctrl+C / EOF = 退出
                 console.print("再见。", style="dim")
                 break
             text = user_input.rstrip()  # 去掉粘贴时多带的结尾空行,保留行内缩进
@@ -400,13 +498,7 @@ def _session_loop() -> None:
             # 中途被打断时,已经发生过的那些已经在盘上了。**只有历史被改写过的情况**
             # (自动压缩)才需要整体重写,那个由 loop 自己在压缩之后做掉。
 
-            console.print("AI >", style="bold green")
-            # Markdown 要拿到完整文本才能正确解析,所以是等模型说完再一次性渲染
-            console.print(Markdown(reply) if reply.strip() else "(模型没有返回内容)")
-            line = usage_line()
-            if line:
-                console.print(line, style="dim")
-            console.print()
+            _render_reply(reply)
         except KeyboardInterrupt:
             # 兜底:任何没被上面捕获的 Ctrl+C(例如渲染 Markdown 那一下),
             # 一律干净退出,而不是抛栈崩掉。

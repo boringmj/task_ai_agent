@@ -157,7 +157,33 @@ def _forget_announced(messages: list[dict]) -> None:
         pass
 
 
-def run(user_input: str, messages: list[dict], max_steps: int | None = None) -> str:
+def run_pending(messages: list[dict], max_steps: int | None = None) -> str | None:
+    """**没有用户输入、但有子 agent 的事要处理时,替主 agent 起一轮。**
+
+    这是"主 agent 闲置时被叫醒"的实现:用户没说话,但后台子 agent 出结果了 ——
+    那就直接让它处理,不用干等用户下次敲键盘。
+
+    和 `run()` 的唯一区别:**不追加 user 消息**。触发这一轮的是系统插进来的通报
+    (由 `_inject_notices` 在第一步开头放进对话),不是谁说了句话 —— 凭空追加一条空的
+    用户消息,模型会以为用户说了什么。
+
+    没有待办就返回 None(什么都不做,调用方继续等输入)。
+    """
+    if not _has_notices():
+        return None
+    return run(None, messages, max_steps=max_steps)
+
+
+def _has_notices() -> bool:
+    """有没有等着主 agent 处理的子 agent。"""
+    try:
+        from . import tasks
+        return bool(tasks.needs_attention())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def run(user_input: str | None, messages: list[dict], max_steps: int | None = None) -> str:
     """跑一轮:把 user_input 加进对话,循环"模型 → 工具 → 模型"直到它不再要工具。
 
     主 agent 和子 agent 用的是**同一个循环** —— 差别只在步数上限和各自的上下文
@@ -171,8 +197,11 @@ def run(user_input: str, messages: list[dict], max_steps: int | None = None) -> 
     begin_turn()           # 记下用量起点 —— 一轮里每调一次工具就多发一次请求,
                            # 结尾那行统计要把这一轮的全部算进来,不能只看最后一次
 
-    messages.append({"role": "user", "content": user_input})
-    _persist(messages[-1])
+    if user_input is not None:
+        # None = 这一轮不是用户发起的(见 run_pending),别凭空塞一条空的用户消息 ——
+        # 那会让模型以为用户说了句空话。
+        messages.append({"role": "user", "content": user_input})
+        _persist(messages[-1])
 
     auto_compressed = False
     for _ in range(steps):
