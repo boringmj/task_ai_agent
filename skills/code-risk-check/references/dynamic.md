@@ -10,8 +10,8 @@
 
 ```bash
 # 容器里执行:把脚本拷到工作区(技能目录只读,/workspace 可写)
-#   <本技能目录> 用加载时给出的实际位置,比如 /skills/code-risk-check/scripts
-mkdir -p /workspace/.risktool && cp <本技能目录>/*.py /workspace/.risktool/
+#   <本技能目录> 用加载本技能时给出的实际位置(它会随资源清单一并列出)
+mkdir -p .risktool && cp <本技能目录>/*.py .risktool/
 ```
 
 然后用 `vm_push` 把 `.risktool/fs_snapshot.py`、`.risktool/probe_http.py` 推到 guest 的 `/root/tools/`。

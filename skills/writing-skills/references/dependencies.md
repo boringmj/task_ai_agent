@@ -46,18 +46,18 @@ optional:
 
 因为它们能被**确切**回答"装没装":
 
-- `pip` —— 看容器的包仓库(`/workspace/.pylibs`)里有没有它。技能脚本跑在容器里,
+- `pip` —— 看容器的包仓库(`.pylibs`)里有没有它。技能脚本跑在容器里,
   所以看的是那一份,不是宿主的 Python。
 - `skill` —— 看技能目录在不在。
 
 ### `pip` 管到哪儿为止
 
-它查的是**「有没有用 `pip --target` 装进 `/workspace/.pylibs`」**这一件事,仅此而已。
+它查的是**「有没有用 `pip --target` 装进 `.pylibs`」**这一件事,仅此而已。
 范围外的**一律不要声明**:
 
 | 什么 | 查得到吗 | 怎么办 |
 | --- | --- | --- |
-| `pip install --target /workspace/.pylibs X` 装的包 | 查得到 | 用 `pip:` 声明 |
+| `pip install --target .pylibs X` 装的包 | 查得到 | 用 `pip:` 声明 |
 | 标准库(`json`、`os`…) | 查不到,永远报缺 | **不用声明** —— 本来就不必装 |
 | 基础镜像自带的(`pip`、`setuptools`…) | 查不到,永远报缺 | **不用声明** —— 本来就在 |
 | npm / composer / gem / apk | 查不到,永远报缺 | 写进**正文**,别设成字段 |
@@ -108,7 +108,7 @@ optional:
 
 装包是**在动用户的环境**,不在"看代码"这个授权范围内。把三件事讲清楚,由用户决定:
 
-1. 要装什么、怎么装 —— `pip install --target /workspace/.pylibs <包>`(装一次持久保留)
+1. 要装什么、怎么装 —— `pip install --target .pylibs <包>`(装一次持久保留)
 2. 装它做什么
 3. **不装的后果是什么** —— 正是上面那个 `fallback`
 

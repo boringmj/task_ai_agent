@@ -424,6 +424,27 @@ def check_markdown_file(path: pathlib.Path) -> list[str]:
     return issues
 
 
+# 工作区在容器里的挂载点。和 /skills 是同一类东西:**本宿主的挂载点**,不是技能的一部分。
+# 容器的工作目录本来就是工作区根,所以相对路径直接就对,加前缀纯属多余。
+WORKSPACE_PREFIX = re.compile(r"/workspace/([A-Za-z0-9_<>…*./-]+)")
+
+
+def _workspace_path_notes(where: str, line: str) -> list[str]:
+    """这条有没有写 `/workspace/...`。"""
+    out = []
+    for m in WORKSPACE_PREFIX.finditer(line):
+        rel = m.group(1).rstrip(".,)")
+        if any(ch in rel for ch in "<>…*"):
+            continue                      # 占位/通配是示例写法
+        if not rel.strip("./"):
+            continue                      # `/workspace/...` 这种省略号,是"等等"不是路径
+        out.append(
+            f"{where}: 写死了 `/workspace/{rel}` —— 工作区挂在哪儿是本宿主的事,技能不该知道。"
+            f"改成**相对路径** `{rel}` 就行:容器的当前目录就是工作区根。"
+        )
+    return out
+
+
 def _hard_path_notes(where: str, line: str, skill_dir: pathlib.Path) -> list[str]:
     """这一行里有没有**写死的容器路径**(`/skills/<名>/...`)。
 
@@ -497,6 +518,7 @@ def check_skill(skill_dir: pathlib.Path, known: set[str]) -> list[str]:
     # 觉得它有问题。跳过围栏就正好把最该查的地方放过去了。
     for i, raw_line in enumerate(body.splitlines(), 1):
         problems.extend(_hard_path_notes(f"{body_start + i}", raw_line, skill_dir))
+        problems.extend(_workspace_path_notes(f"{body_start + i}", raw_line))
 
     lines = _strip_fences(body)
     for i, line in lines:
@@ -572,6 +594,7 @@ def check_skill(skill_dir: pathlib.Path, known: set[str]) -> list[str]:
         rel_f = str(f.relative_to(skill_dir))
         for i, line in enumerate(text.splitlines(), 1):
             problems.extend(_hard_path_notes(f"{rel_f}:{i}", line, skill_dir))
+            problems.extend(_workspace_path_notes(f"{rel_f}:{i}", line))
 
     # ---- 附带脚本的语法 ----
     for py in sorted((skill_dir / "scripts").glob("*.py")) if (skill_dir / "scripts").is_dir() else []:

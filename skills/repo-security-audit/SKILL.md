@@ -39,14 +39,14 @@ optional:
 ### 2. 跑快扫脚本
 
 脚本在容器里跑。`scripts/...` 是**相对技能目录**的写法(实际位置见加载本技能时给出的资源
-清单);目标仓库和工作区文件则要写成 `/workspace/...`(宿主路径 `D:\...` 在容器里不存在)。
+清单);目标仓库这些路径就写**相对工作区**的(见系统提示词里容器的路径一节)。
 
 ```bash
 # 依赖 pyyaml —— **装之前先问用户**(装包动的是用户环境);bandit 缺失会自动跳过
-python scripts/scan.py /workspace/clones/<仓库> --out /workspace/findings-<仓库>.json
+python scripts/scan.py clones/<仓库> --out reports/<仓库>/findings.json
 ```
 
-**缺 pyyaml 要先问用户再装** —— 装法是 `pip install --target /workspace/.pylibs pyyaml`
+**缺 pyyaml 要先问用户再装** —— 装法是 `pip install --target .pylibs pyyaml`
 (装一次持久保留),但**装包是在动用户的环境**,不该自作主张。把「要装什么、装它做什么」讲清楚,
 由用户决定。**用户不同意时**:没有 pyyaml 规则根本读不出来,**第 2 步的静态扫描整个做不了** ——
 如实说明,不要为了"跑出点东西"去硬凑。
@@ -75,7 +75,7 @@ python scripts/scan.py /workspace/clones/<仓库> --out /workspace/findings-<仓
 
 ```bash
 python scripts/scan_git.py \
-    /workspace/clones/<仓库> --out /workspace/git-findings-<仓库>.json
+    clones/<仓库> --out reports/<仓库>/git-findings.json
 ```
 
 脚本遍历所有提交与分支(加 `--dangling` 还能覆盖 rebase / force-push 遗留的不可达对象),把**历史版本的密钥**和**已删除的敏感文件**挖出来,并标注当前分支是否还有这份内容。
@@ -120,7 +120,7 @@ python scripts/scan_git.py \
 
 ### 7. 出报告
 
-按 `references/report-template.md` 的结构写,存到工作区,文件名 `<仓库名>-security-audit.md`。要求:
+按 `references/report-template.md` 的结构写,存到 `reports/<仓库名>/audit.md`。要求:
 
 - 每条问题都带**证据**(`文件:行`)和**修复建议**;结论要与证据对得上。
 - 利用链单列一节,写清每跳的依据和未验证的假设。
@@ -128,7 +128,7 @@ python scripts/scan_git.py \
 
 ## 常见坑
 
-- **路径换算。** 文件工具返回宿主路径,脚本要的是 `/workspace/...`;照抄会 `FileNotFoundError`。
+- **路径别照抄。** 文件工具给你的是**宿主路径**,脚本要的是**相对工作区**的(见系统提示词里容器的路径一节);照抄会 `FileNotFoundError`。
 - **同一行被多条规则命中**属正常(通用规则 + 语言规则 + bandit 交叉覆盖),报告里合并成一条,不要当成多个问题。
 - **正则只认文本。** 动态导入、反射、字符串拼接出来的调用、跨文件的类型流,脚本都抓不到 —— 这些正是你读代码时要补的。
 - **别只信摘要。** 摘要按严重度取样,低危里也可能藏着串链要用的关键点(比如一个能读配置的路径穿越)。串链阶段可以回头翻 JSON。

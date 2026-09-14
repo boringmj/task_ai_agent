@@ -18,7 +18,7 @@
 
 依赖(容器里一次性安装,之后持久保留):
 
-    pip install --target /workspace/.pylibs tree_sitter tree_sitter_php
+    pip install --target .pylibs tree_sitter tree_sitter_php
 """
 
 import argparse
@@ -27,7 +27,7 @@ import json
 import os
 import sys
 
-sys.path.insert(0, "/workspace/.pylibs")  # 容器内第三方库的持久位置
+sys.path.insert(0, ".pylibs")  # 容器内第三方库的持久位置
 
 try:
     from tree_sitter import Language, Parser
@@ -35,7 +35,7 @@ try:
 except ImportError:
     sys.exit(
         "缺少依赖。请先运行:\n"
-        "  pip install --target /workspace/.pylibs tree_sitter tree_sitter_php"
+        "  pip install --target .pylibs tree_sitter tree_sitter_php"
     )
 
 PHP = Language(tsp.language_php())

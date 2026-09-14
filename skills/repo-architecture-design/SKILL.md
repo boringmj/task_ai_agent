@@ -36,7 +36,7 @@ optional:
 
 ### 第 1 步:定稿《重构纲领》
 
-用 `references/charter-template.md` 落成文件,写进工作区(建议 `reports/<项目名>/<项目名>-重构纲领.md`),让用户过一遍。纲领至少含:
+用 `references/charter-template.md` 落成文件,写进 `reports/<项目名>/charter.md`,让用户过一遍。纲领至少含:
 
 - 背景摘要(七组的结论)
 - 重构方向与**本次不做什么**

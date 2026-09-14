@@ -368,7 +368,7 @@ def find_duplicates(files_lines, window, min_lines):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="代码质量候选扫描器(只圈候选,不下结论)")
-    ap.add_argument("target", help="目标路径(容器里用 /workspace/...)")
+    ap.add_argument("target", help="目标路径(相对工作区,如 clones/x/...)")
     ap.add_argument("--json", dest="json_out", help="把结果写成 JSON")
     ap.add_argument("--min-level", default="L1", choices=["L1", "L2", "L3", "L4"],
                     help="低于此等级的候选不输出")

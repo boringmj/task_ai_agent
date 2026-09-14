@@ -37,7 +37,7 @@ agents: [sub]
 跑扫描脚本拿到候选点:
 
 ```bash
-python3 scripts/risk_scan.py <目标路径> --json findings-risk.json
+python3 scripts/risk_scan.py <目标路径> --json reports/<目标名>/risk-findings.json
 ```
 
 (路径相对技能目录;容器里的实际位置见加载本技能时给的资源清单。)
@@ -74,7 +74,7 @@ python3 scripts/risk_scan.py <目标路径> --json findings-risk.json
 
 ### 6. 出报告
 
-用 `references/report-template.md` 的结构写报告(用户指定文件名时从命,否则 `<目标名>-风险检查.md`),并保留扫描 JSON 作为证据。
+用 `references/report-template.md` 的结构写报告(存 `reports/<目标名>/risk.md`;用户另外指定了文件名时从命),并保留扫描 JSON 作为证据。
 
 **副作用清单**和**运行时依赖**是必备章节:前者给"产生什么 / 写到哪里 / 退出后是否残留",后者给"语言与版本 / 第三方库 / 必须存在的系统命令 / 环境变量与凭据 / 平台限制"。报告要能让没读过代码的人一眼看懂结论和依据。
 

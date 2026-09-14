@@ -19,7 +19,7 @@
 
 ```bash
 python scripts/scan_git.py \
-    /workspace/clones/<仓库> --out /workspace/git-findings-<仓库>.json
+    clones/<仓库> --out reports/<仓库>/git-findings.json
 ```
 
 容器里没有 `git` 命令,脚本用纯 Python 的 `dulwich` 直接读 `.git` 对象库。

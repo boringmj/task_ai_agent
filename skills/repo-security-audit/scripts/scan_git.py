@@ -20,7 +20,7 @@
     --top N           摘要里列前 N 条(默认 25)
 
 依赖 dulwich(不是 git 命令):
-    pip install --target /workspace/.pylibs dulwich \
+    pip install --target .pylibs dulwich \
         -i https://pypi.tuna.tsinghua.edu.cn/simple
 """
 
@@ -189,12 +189,12 @@ def main(argv=None) -> int:
         from dulwich.repo import Repo
     except ImportError:
         eprint("[!] 缺少 dulwich(容器里没有 git 命令,靠它读对象库):")
-        eprint("    pip install --target /workspace/.pylibs dulwich "
+        eprint("    pip install --target .pylibs dulwich "
                "-i https://pypi.tuna.tsinghua.edu.cn/simple")
         return 3
 
     ap = argparse.ArgumentParser(description="git 历史安全扫描")
-    ap.add_argument("repo", help="仓库路径,如 /workspace/clones/foo")
+    ap.add_argument("repo", help="仓库路径,如 clones/foo")
     ap.add_argument("--out", default="git-findings.json")
     ap.add_argument("--max-blobs", type=int, default=5000)
     ap.add_argument("--max-size", type=int, default=2 * 1024 * 1024)

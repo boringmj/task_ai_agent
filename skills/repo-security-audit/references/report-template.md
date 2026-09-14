@@ -74,8 +74,8 @@
 - 扫描命令:
 
   ```bash
-  python scripts/scan.py /workspace/clones/<仓库> \
-      --out /workspace/findings-<仓库>.json
+  python scripts/scan.py clones/<仓库> \
+      --out reports/<仓库>/findings.json
   ```
 
 - 规则未人工确认的原始命中:<列出条数与分布>

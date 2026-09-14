@@ -33,7 +33,7 @@ agents: [sub]
 1. **不要通读仓库。** 先用脚本扫出全局结构,再按需读少数关键文件。把整个仓库读进上下文既慢又容易撑爆。
 2. **重活交给脚本。** 统计和依赖抽取用 `scripts/scan_repo.py` 在容器里跑,它只回汇总结果。
 3. **注意路径换算。** 文件工具返回的是宿主路径(`D:\...\workspace\clones\foo`),
-   容器里必须写成 `/workspace/clones/foo`;照抄宿主路径会 `FileNotFoundError`。
+   要写成**相对工作区**的 `clones/foo`;照抄宿主路径会 `FileNotFoundError`。
 
 ## 步骤
 
@@ -47,7 +47,7 @@ agents: [sub]
 ### 2. 跑扫描脚本,拿到全局图景
 
 ```bash
-python scripts/scan_repo.py /workspace/clones/<名字>
+python scripts/scan_repo.py clones/<名字>
 ```
 
 (路径相对技能目录;容器里的实际位置见加载本技能时给的资源清单。)
@@ -78,7 +78,7 @@ python scripts/scan_repo.py /workspace/clones/<名字>
 
 ### 6. 产出报告
 
-按 `references/report-template.md` 的结构写,存到工作区,文件名 `<仓库名>-architecture.md`。
+按 `references/report-template.md` 的结构写,存到 `reports/<仓库名>/structure.md`。
 
 - **每个结论都要有依据**(点明哪个文件、哪一行或哪段代码),不要空泛断言。
 - 依赖关系用 mermaid 图表达,直接在报告里放代码块。

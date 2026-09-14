@@ -87,10 +87,10 @@ optional:
 
 ```bash
 # 通用 —— Python 及其它语言
-python3 scripts/quality_scan.py <目标路径> --json quality-<目标名>.json
+python3 scripts/quality_scan.py <目标路径> --json reports/<目标名>/quality.json
 
 # PHP 项目必须用这条(见下)
-python3 scripts/php_quality_scan.py <目标路径> --json quality-<目标名>.json
+python3 scripts/php_quality_scan.py <目标路径> --json reports/<目标名>/quality.json
 ```
 
 (路径都**相对技能目录** —— 技能在容器里是只读挂载的,实际位置在加载本技能时给出的
@@ -105,7 +105,7 @@ python3 scripts/php_quality_scan.py <目标路径> --json quality-<目标名>.js
 **装包是在动用户的环境**,不该自作主张:
 
 - **先停下来问**:把「要装哪两个包、装它做什么」讲清楚,由用户决定 ——
-  装法是 `pip install --target /workspace/.pylibs tree_sitter tree_sitter_php`(装一次持久保留)。
+  装法是 `pip install --target .pylibs tree_sitter tree_sitter_php`(装一次持久保留)。
 - **用户不同意,就回退到第一条通用脚本**,别硬来。代价是 PHP 只能查到空 catch 与重复块 ——
   **这一点要写进报告**(「PHP 的函数规模与类型标注没能自动度量,只覆盖了错误处理与重复块」),
   别让用户以为"PHP 那部分没问题"。
@@ -132,7 +132,7 @@ python3 scripts/php_quality_scan.py <目标路径> --json quality-<目标名>.js
 
 ### 5. 出报告
 
-按 `references/report-template.md` 的结构写,存到工作区,默认文件名 `<目标名>-代码质量.md`。
+按 `references/report-template.md` 的结构写,存到 `reports/<目标名>/quality.md`。
 
 - 每条结论**都要能落到具体位置**,不要写「整体可读性一般」这类无法行动的判断。
 - 报告开头给一页「结论摘要」:一共几处、几处 L3 及以上、最该先动的两三处。
@@ -155,6 +155,6 @@ python3 scripts/php_quality_scan.py <目标路径> --json quality-<目标名>.js
 - `scripts/php_quality_scan.py` —— **PHP 项目用这个**,也是本技能里**唯一需要装依赖**的一个。
   通用扫描器的 AST 度量只支持 Python,对 PHP 只能认空 catch 与重复块;这个用 tree-sitter 补齐
   函数规模(行数 / 嵌套 / 圈复杂度 / 参数数)、类型标注、catch 处理。依赖 `tree_sitter` 与
-  `tree_sitter_php`,装法:`pip install --target /workspace/.pylibs tree_sitter tree_sitter_php`
+  `tree_sitter_php`,装法:`pip install --target .pylibs tree_sitter tree_sitter_php`
   —— **装之前先问用户**(见上面第 2 步);用户不同意就用通用脚本,并在报告里写明 PHP 的函数
   规模与类型标注没能覆盖

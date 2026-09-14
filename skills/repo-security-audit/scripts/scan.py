@@ -25,7 +25,7 @@
     --top N           摘要里列出前 N 条(默认 25)
 
 规则文件需要 pyyaml,缺失时:
-    pip install --target /workspace/.pylibs pyyaml \
+    pip install --target .pylibs pyyaml \
         -i https://pypi.tuna.tsinghua.edu.cn/simple
 """
 
@@ -109,7 +109,7 @@ def _load_yaml(path: str) -> dict:
         import yaml  # type: ignore
     except ImportError:
         eprint("[!] 缺少 pyyaml,规则读不了。先装:")
-        eprint("    pip install --target /workspace/.pylibs pyyaml "
+        eprint("    pip install --target .pylibs pyyaml "
                "-i https://pypi.tuna.tsinghua.edu.cn/simple")
         sys.exit(3)
     with open(path, "r", encoding="utf-8") as fh:
@@ -638,7 +638,7 @@ def summarize(findings: list[dict], stats: dict, notes: list[str],
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="repo-security-audit 快扫器(命中=待确认候选,不是确认漏洞)")
-    ap.add_argument("root", help="目标仓库路径(容器内,如 /workspace/clones/foo)")
+    ap.add_argument("root", help="目标仓库路径(相对工作区,如 clones/x/clones/foo)")
     ap.add_argument("commands", nargs="*", default=[],
                     help="secrets patterns config deps bandit all")
     ap.add_argument("--out", default="findings.json")

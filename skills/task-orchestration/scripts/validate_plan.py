@@ -240,7 +240,7 @@ def render(r: dict) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="校验任务编排的计划文件")
-    ap.add_argument("plan", help="plan.md 的路径(在容器里是 /workspace/plans/...)")
+    ap.add_argument("plan", help="plan.md 的路径(相对工作区,如 plans/<任务名>/plan.md)")
     ap.add_argument("--json", action="store_true", help="输出 JSON,便于程序处理")
     args = ap.parse_args()
 

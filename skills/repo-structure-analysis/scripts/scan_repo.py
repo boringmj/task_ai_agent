@@ -8,8 +8,8 @@
 用法:
     python scan_repo.py <仓库路径> [--depth 2] [--top 15]
 
-路径注意:在容器里跑时,工作区要写成 /workspace/... (如 /workspace/clones/foo),
-不要用宿主路径。
+路径注意:在容器里跑时写成**相对工作区**的(如 `clones/foo`),不要用宿主路径 ——
+容器的当前目录就是工作区根。
 """
 
 import argparse
@@ -494,7 +494,7 @@ def scan(root, depth, top_n):
 
 def main():
     ap = argparse.ArgumentParser(description="扫描代码仓库,输出架构分析所需的全局图景")
-    ap.add_argument("root", help="仓库根目录(容器里用 /workspace/...)")
+    ap.add_argument("root", help="仓库根目录(相对工作区,如 clones/x/...)")
     ap.add_argument("--depth", type=int, default=2, help="目录树展示层数,默认 2")
     ap.add_argument("--top", type=int, default=15, help="各项榜单取前 N 条,默认 15")
     args = ap.parse_args()
