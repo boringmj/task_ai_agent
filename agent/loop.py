@@ -131,15 +131,19 @@ def _forget_announced(messages: list[dict]) -> None:
     """
     try:
         from . import tasks
+        wanting = tasks.needs_attention()
+        if not wanting:
+            return
+        marks = {t.id: f"[子 agent {t.id}" for t in wanting}
         alive = set()
         for m in messages:
             c = m.get("content")
             if not isinstance(c, str):
                 continue
-            for t in tasks.needs_attention():
-                if f"[子 agent {t.id}" in c:
-                    alive.add(t.id)
-        for t in tasks.needs_attention():
+            for tid, mark in marks.items():
+                if mark in c:
+                    alive.add(tid)
+        for t in wanting:
             t.delivered = t.id in alive
     except Exception:  # noqa: BLE001
         pass

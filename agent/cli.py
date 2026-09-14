@@ -297,10 +297,15 @@ def _session_loop() -> None:
                   style="dim")
     console.print(f"工作区:{ROOT}", style="dim")
     console.print(f"会话:{session_id} — {session_note};{resume_note}", style="dim")
-    # 上次进程退出时没跑完的子 agent:标成「中断」并告诉主 agent —— **不自动续跑**,
-    # 中断那一步的副作用是未知的,由它决定接着干还是重派。
-    for note in tasks.recover():
-        messages.append({"role": "system", "content": note})
+    # 上次进程退出时没跑完的子 agent:标成「中断」。**不自动续跑** —— 中断那一步的
+    # 副作用是未知的,由主 agent 决定接着干还是重派。
+    #
+    # 通报**不在这里塞进对话**:它由 loop 在每一步开头统一注入(见 _inject_notices)。
+    # 两边都发就重复了 —— 而 "中断" 的任务同样属于 needs_attention,走那条路自然会被
+    # 报上去。这里只打一行给**人**看(启动时就知道有这么回事,不用等敲第一句话)。
+    interrupted = tasks.recover()
+    for note in interrupted:
+        console.print(f"! {note.splitlines()[0]}", style="yellow")
     _replay_history(history)   # 把上次对话按原样重放一遍，接着聊
     console.print()
 
