@@ -78,16 +78,23 @@ description: 当用户要求审阅代码质量、判断一个仓库或若干文�
 ### 2. 跑扫描脚本,拿到候选
 
 ```bash
+# 通用 —— Python 及其它语言
 python3 /skills/code-quality-check/scripts/quality_scan.py <目标路径> --json quality-<目标名>.json
+
+# PHP 项目必须用这条(见下)
+python3 /skills/code-quality-check/scripts/php_quality_scan.py <目标路径> --json quality-<目标名>.json
 ```
 
-输出 JSON:按维度和预估等级分组的候选命中,每条带文件、行号、代码片段与度量值。**先只看汇总**,不要在这一步读源码。
+**先看清目标是什么语言,再选脚本。** Python 用第一条;其它语言也先用第一条兜底。**PHP 必须用
+第二条** —— 通用脚本的 AST 度量只支持 Python,对 PHP 只能认出空 catch 与重复块;而那个 PHP
+专用的用 tree-sitter 补齐了函数规模(行数 / 嵌套 / 圈复杂度 / 参数数)、类型标注与 catch 处理。
+选错了不会报错,只是**候选少一大截**,你会以为这个项目很干净。
 
-脚本用 AST 对 **Python** 精确度量函数规模与吞异常。**PHP 项目改跑
-`/skills/code-quality-check/scripts/php_quality_scan.py`**(同样参数,见下面「参考与脚本」)——
-通用脚本对 PHP 只能认出空 catch 与重复块,那个用 tree-sitter 补齐了函数规模、类型标注与
-catch 处理。其它语言目前只覆盖空 catch、重复块与少数通用信号:函数规模一类的度量要人工看,
-或借助该语言现成的工具(`radon` / `eslint` / `gocyclo`)。
+输出 JSON:按维度和预估等级分组的候选命中,每条带文件、行号、代码片段与度量值。**先只看汇总**,
+不要在这一步读源码。
+
+其它语言目前只覆盖空 catch、重复块与少数通用信号:函数规模一类的度量要人工看,或借助该语言
+现成的工具(`radon` / `eslint` / `gocyclo`)。
 
 ### 3. 复核每一条候选
 
