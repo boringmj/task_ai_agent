@@ -133,6 +133,9 @@ def run(user_input: str, messages: list[dict], max_steps: int | None = None) -> 
         if ctx.current().suspend:
             return content
 
+    # **别让这个字符串自己承担语义**。它会被当成 body 交给调用方,而调用方看正文
+    # 猜不出这是"干完了"还是"被砍了" —— 所以另外立个旗子说清楚。
+    ctx.current().truncated = True
     return f"[强制终止] 已达到最大步数 {steps},对话强制中止"
 
 

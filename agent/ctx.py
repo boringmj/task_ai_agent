@@ -154,6 +154,10 @@ class AgentCtx:
     # 叫停旗子(见 tasks.kill)。线程没法从外面强杀,所以只能每步之间 check 一次 ——
     # 它**不打断正在跑的那一次工具调用**,但不会再多走一步。
     cancelled: bool = False
+    # 撞上步数上限被强制中止了(见 loop.run)。**和"说完了"是两回事**:它交回来的
+    # 东西是半截的,调用方必须区别对待 —— 否则状态行写着"完成"、正文写着"强制中止",
+    # 而看的人只会记住状态行。实测就是这么翻车的。
+    truncated: bool = False
 
     @property
     def is_sub(self) -> bool:

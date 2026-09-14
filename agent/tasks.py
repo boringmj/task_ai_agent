@@ -34,9 +34,11 @@ from .ctx import FS_ANY, FsGrant
 from .core import MAX_STEPS
 from . import session as _session
 
-# 子 agent 的步数上限:比主 agent 小。它只干一件事,不该跑到 50 步 —— 真跑到那么多,
-# 多半是跑偏了,早停早省。
-SUB_MAX_STEPS = int(os.environ.get("SUBAGENT_MAX_STEPS", "40"))
+# 子 agent 的步数上限。比主 agent 小一些,但它要跑完一件**完整**的活 —— 实测一次真仓库的
+# 安全审计(扫 + 分诊 + 写报告)40 步不够,刚好卡在写报告那一步,等于 95% 的活白做。
+# 现在的口径是:撞上限不算完成(见 ctx.truncated),报给主 agent 时明说没干完、可以
+# resume 接着做。60 是个折中 —— 还是能被 SUBAGENT_MAX_STEPS 覆盖。
+SUB_MAX_STEPS = int(os.environ.get("SUBAGENT_MAX_STEPS", "60"))
 # 同时能跑几个。每个都是独立的 API 流 + 独立的知识上下文,不是越多越好。
 MAX_CONCURRENT = int(os.environ.get("SUBAGENT_MAX_CONCURRENT", "10"))
 # 交回给主 agent 的报告上限(字符)。子 agent 的报告要是比它干的活还长,那这个设计就白搭了。
@@ -339,7 +341,12 @@ def _run(t: Task) -> None:
     try:
         with ctx.use(c):
             t.result = loop_run(t, c)
-        if c.cancelled:
+        if c.truncated:
+            # **不算完成。** 它是被步数上限砍断的 —— 已经做完的部分都在对话和产出里,
+            # 但"交回来的报告"根本没写成。报给主 agent 时必须是这个口径,否则它会
+            # 拿一份半截的东西去验收。
+            outcome = "truncated"
+        elif c.cancelled:
             # 叫停(用户 /subtasks kill,或主 agent finish_task stop)。
             # **直接落到 closed**:它没有"结果"可验收,再要一次确认只是多一步。
             outcome = "closed"
@@ -487,6 +494,26 @@ def report(t: Task) -> dict:
             f"它已经做完的部分在它的对话里,没丢。你答完用 "
             f"resume_task('{t.id}', answer='...') 让它接着干。"
         )}
+    if t.status == "running":
+        # **没有这一支的话会掉到下面那个"完成"分支上去** —— 问一个正在跑的活,回一句
+        # "[子 agent t1 完成]"。实测就是这么把主 agent 绕晕的(它以为已经完事了)。
+        asked = sum(1 for m in t.messages if m.get("role") == "assistant")
+        return {"status": "running", "task_id": t.id, "message": (
+            f"[子 agent {t.id} 正在跑,还没结果]已经走了约 {asked} 步。\n"
+            f"要看它在忙什么:/subtasks {t.id} enter(接管过去实时看)。\n"
+            f"不等它就等通报;要停它用 finish_task('{t.id}', 'stop')。"
+        )}
+    if t.status == "truncated":
+        return {"status": "truncated", "task_id": t.id, "message": (
+            f"[子 agent {t.id} **没干完** —— 撞上步数上限被砍断了]\n\n"
+            f"它做的那些**都在**(对话和产出文件都在盘上),但**报告没写完** —— "
+            f"别把上面那段话当结论。\n\n"
+            f"**接着让它干**(推荐):`resume_task('{t.id}', answer='接着把没做完的做完')` "
+            f"—— 它带着已有的成果继续,而且会**再拿到一份完整的步数预算**。"
+            f"这样它的上下文(读了那么多文件才攒出来的)不浪费。\n"
+            f"**别自己接手** —— 那等于把它读过的东西在你的上下文里再读一遍,"
+            f"正好把这套设计省下来的东西又花回去(实测发生过)。"
+        )}
     if t.status == "failed":
         return {"status": "failed", "task_id": t.id, "message": (
             f"[子 agent {t.id} 失败] {t.error}\n\n"
@@ -500,8 +527,15 @@ def report(t: Task) -> dict:
             f"你决定:resume_task('{t.id}') 让它从断点接着干(中断那步会重做),"
             f"还是自己接手、或者放弃。"
         )}
-    return {"status": "done", "task_id": t.id, "message": (
-        f"[子 agent {t.id} 完成]\n\n{_clip(t.result, t)}"
+    if t.status == "done":
+        return {"status": "done", "task_id": t.id, "message": (
+            f"[子 agent {t.id} 完成]\n\n{_clip(t.result, t)}"
+        )}
+    # 剩下的(closed 之类)是已经收场的。**必须显式写出来** —— 原来这里是无条件兜底,
+    # 于是新加的状态会**悄悄掉进"完成"那一支**:问一个正在跑的活,回一句"已完成"
+    # (实测把主 agent 绕晕过)。状态多起来之后,"兜底"就是个陷阱。
+    return {"status": t.status, "task_id": t.id, "message": (
+        f"{t.id} 现在处于 {t.status},已经收场了。/subtasks all 能翻到它。"
     )}
 
 
@@ -524,7 +558,7 @@ def resume(tid: str, answer: str = "", wait: bool = True,
     t = _TASKS.get(tid) or _load(tid)
     if t is None:
         return {"status": "error", "message": f"没有 {tid} 这个任务。"}
-    if t.status not in ("waiting_input", "interrupted"):
+    if t.status not in ("waiting_input", "interrupted", "truncated"):
         return {"status": "error",
                 "message": f"{tid} 现在的状态是 {t.status},不在等回话 —— 没什么可接着干的。"}
     t.awaited = bool(wait)
@@ -556,7 +590,7 @@ def tell(tid: str, text: str) -> str:
     if t.status == "running":
         t.messages.append({"role": "user", "content": text})
         return f"已插进 {tid} 的对话,它下一步会看到。"
-    if t.status in ("waiting_input", "interrupted", "done", "closed"):
+    if t.status in ("waiting_input", "interrupted", "done", "closed", "truncated"):
         # 干完了还能接着聊:把话续在结论之后,等于"再让它做一件事"。
         t.resumed.append(text)
         t.ask = ""
