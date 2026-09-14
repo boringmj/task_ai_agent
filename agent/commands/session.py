@@ -71,6 +71,7 @@ def cmd_switch(ctx: Context) -> str:
     from ..session import (current_session_id, list_sessions, load_session,
                            new_session_id, release_owner, session_dir,
                            set_current_session, try_claim)
+    from .. import tasks
     from ..tools.vm import vm_switch_session
 
     target = ctx.args.strip()
@@ -120,6 +121,14 @@ def cmd_switch(ctx: Context) -> str:
                                 note="(新建的)" if creating else ""),
     })
 
+    # **先把旧会话的子 agent 停掉。** 它们是在那段对话的上下文里派的活,结果也只通报给
+    # 那边;更重要的是 —— 下面 vm_switch_session 会把虚拟机停掉(每会话一块盘),
+    # 一个 vm=true 的子 agent 继续跑下去只会撞一堵墙,还把 token 烧在一段你已经离开的
+    # 对话上。
+    #
+    # **标成"中断"而不是"关闭"**:它是能接着干的,只是现在不该干 —— 之后切回这个会话,
+    # 主 agent 会被问到这件事,可以 resume 让它继续。切走 ≠ 丢弃。
+    stopped = tasks.stop_for_switch(cur)
     vm_switch_session()          # 每会话一块盘,换会话就得换 VM(收掉旧的、清转发)
     # 请终端把刚切到的这段历史重放出来。指令的返回值只是一行文本,打不了对话,
     # 所以照旧只声明事实、由 cli 那层去重放(和 session_reset 一个套路)。
@@ -128,7 +137,12 @@ def cmd_switch(ctx: Context) -> str:
     # 别再说"虚拟机正在重启" —— 它默认根本不自动启动(见 VM_AUTOSTART),那样说是骗人。
     vm_note = ("虚拟机正在按该会话的磁盘重启。"
                if VM_AUTOSTART else "虚拟机未自动启动(要用时 vm_start)。")
-    return f"{kind}会话 {target}({note}),{vm_note}"
+    # 说法要和实际对得上:**叫停是商量式的**,它会在当前这一步做完之后才停
+    # (正在跑的那次工具调用不打断),然后落到「中断」。别写成"已经停了"。
+    stop_note = (f"原会话还有 {stopped} 个子 agent 在跑,已经通知它们停 —— "
+                 f"它们会在**当前这一步做完之后**停下(标成「中断」,切回去可以接着做)。"
+                 if stopped else "")
+    return f"{kind}会话 {target}({note}),{vm_note}" + (f" {stop_note}" if stop_note else "")
 
 
 @command(

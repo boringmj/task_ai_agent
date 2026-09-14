@@ -168,6 +168,9 @@ class Task:
     # 拿到的(wait=true)不该回头再收一遍自己的通报。只活在内存里:重启之后重新通报
     # 一次是对的(那会儿主 agent 确实不知道)。
     delivered: bool = False
+    # 被叫停时算哪种结局。默认 closed(不要了);换会话时改成 interrupted ——
+    # 那是**暂停**不是丢弃(切回去还能接着做),两者在报告里说的话完全不同。
+    cancel_status: str = "closed"
 
     def meta(self) -> dict:
         """落盘的元信息(不含 messages —— 那个单独一行行追加)。"""
@@ -387,9 +390,11 @@ def _run(t: Task) -> None:
             # 拿一份半截的东西去验收。
             outcome = "truncated"
         elif c.cancelled:
-            # 叫停(用户 /subtasks kill,或主 agent finish_task stop)。
-            # **直接落到 closed**:它没有"结果"可验收,再要一次确认只是多一步。
-            outcome = "closed"
+            # 叫停。**落到哪种结局取决于"为什么叫停"**(见 Task.cancel_status):
+            #   · 用户 /subtasks kill、主 agent finish_task(stop) → closed(不要了)
+            #   · /switch 换会话 → interrupted(**暂停**,切回去还能接着做)
+            # 两者在报告里说的话完全不同,不能混成一种。
+            outcome = t.cancel_status or "closed"
         elif c.suspend:
             outcome, t.ask = "waiting_input", str(c.suspend.get("ask") or "")
     except Exception as exc:  # noqa: BLE001 - 子 agent 崩溃不能带走主 agent
@@ -706,6 +711,26 @@ def finish(tid: str, verdict: str = "accept", note: str = "") -> str:
         return f"已关闭 {tid}。"
 
     return f"不认识的 verdict {verdict!r} —— 只认 accept / rework / stop。"
+
+
+def stop_for_switch(sid: str) -> int:
+    """把一个会话里所有还在跑的子 agent 叫停,返回叫停了几个。
+
+    用在 `/switch` 上。叫停是**商量式的**(和 kill 一样:线程没法从外面强杀,只能设个
+    旗子让它每步之间自己停)—— 所以返回的是"已经叫停",不是"已经停了";它们会在当前
+    那一步做完之后落到 interrupted。
+
+    标 interrupted 而不是 closed:这些活没做完、也不该被丢掉,只是**不该在一个你已经
+    离开的会话里继续烧 token**。切回去时主 agent 会被问到,可以 resume。
+    """
+    with _LOCK:
+        live = [t for t in _TASKS.values()
+                if t.status == "running" and t.session == sid]
+    for t in live:
+        t.cancel_status = "interrupted"
+        if t.ctx is not None:
+            t.ctx.cancelled = True
+    return len(live)
 
 
 def kill(tid: str) -> str:
