@@ -108,6 +108,59 @@ def _docker_image_present() -> bool:
     return r.returncode == 0
 
 
+def _scope_kind(rel: str) -> str:
+    """这个写范围**还不存在**时,按目录还是按文件建。
+
+    权限判断那边根本不需要问这个问题(见 ctx.FsGrant.allows —— 纯文本前缀匹配,是目录
+    还是文件都判得对)。**只有挂载需要**:docker 的 bind mount 要求宿主路径存在,不存在
+    就得造一个出来,而造错了是实打实的坏事 —— 想要文件却建出目录,容器里写它就失败,
+    工作区还多一个没人要的空目录。
+
+    能拿来判断的只有名字本身,所以规则必须简单到能用一句话说清:
+
+    - 结尾带 `/` → 目录(显式声明,最可靠)
+    - 最后一段带 `.` 且不在开头 → 文件(`notes/plan.md`)
+    - 其余 → 目录(`reports`、`Makefile` 这种没后缀的当目录,毕竟范围**多半**是目录)
+
+    猜错不要紧 —— **要紧的是别说都不说**(见 prepare_scopes 的返回)。
+    """
+    if rel.endswith("/"):
+        return "dir"
+    last = rel.rstrip("/").rsplit("/", 1)[-1]
+    return "file" if "." in last.lstrip(".") else "dir"
+
+
+def prepare_scopes(write: tuple) -> list[str]:
+    """把写范围准备好(不存在就按 _scope_kind 建),返回**给人看的说明**。
+
+    在派活时就调用一次:范围是主 agent 定的,建错了该当场告诉它,而不是等子 agent
+    在容器里撞上 Read-only 再说 —— 那时候主 agent 已经不在等了,中间隔着一层报告。
+    """
+    notes: list[str] = []
+    for rel in write:
+        if rel == FS_ANY:
+            continue
+        p = (ROOT / rel).resolve()
+        if not p.is_relative_to(ROOT):
+            notes.append(f"范围 `{rel}` 跑出工作区了,已忽略")
+            continue
+        if p.exists():
+            continue
+        kind = _scope_kind(rel)
+        try:
+            if kind == "file":
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.touch()
+                notes.append(f"范围 `{rel}` 原来不存在,按**文件**建了一个空的")
+            else:
+                p.mkdir(parents=True, exist_ok=True)
+                notes.append(f"范围 `{rel}` 原来不存在,按**目录**建了"
+                             f"(要的是文件的话,写成 `{rel}/文件名` 或在末尾加个文件后缀)")
+        except OSError as exc:
+            notes.append(f"范围 `{rel}` 建不出来:{exc}")
+    return notes
+
+
 def _workspace_mounts() -> list[str]:
     """按当前 agent 的写权限,决定工作区**怎么挂进容器**。
 
@@ -132,12 +185,11 @@ def _workspace_mounts() -> list[str]:
     writable = list(fs.write)
     if PYLIBS_REL not in writable:
         writable.append(PYLIBS_REL)
+    prepare_scopes(tuple(writable))       # 不该由挂载来"顺手建",但漏了也得兜住
     for rel in writable:
         p = (ROOT / rel).resolve()
-        if not p.is_relative_to(ROOT):
-            continue                      # 越界的范围直接忽略,绝不放宽
-        if not p.exists():
-            p.mkdir(parents=True, exist_ok=True)
+        if not p.is_relative_to(ROOT) or not p.exists():
+            continue                      # 越界的、建不出来的:直接跳过,绝不放宽
         out += ["-v", f"{p}:/workspace/{rel}"]
     return out
 

@@ -40,8 +40,10 @@ from .registry import tool
             "write": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "允许它**写**哪些路径(相对工作区),可以是文件也可以是目录,"
-                               "如 [\"reports\"、\"notes/a.md\"]。**不填就等于不许写任何文件**。"
+                "description": "允许它**写**哪些路径(相对工作区)。**不填就等于不许写任何文件**。"
+                               "一般是写目录(如 [\"reports\"]);要精确到单个文件就写文件名"
+                               "([\"notes/plan.md\"])。路径不存在时会被建出来 ——"
+                               "**有文件后缀的当文件建,其余当目录建**,建了什么会告诉你。"
                                "写范围必须给窄:并排派好几个时,两个范围撞上会被直接拒掉 ——"
                                "同时改一处,改完不报错、只是结果对不上,事后查不出是谁改的。",
             },
@@ -65,12 +67,17 @@ def dispatch_task(task: str, vm: bool = False, wait: bool = True,
                   allow_delete: bool = False) -> str:
     from .. import tasks
     from ..ctx import FS_ANY, FsGrant
+    from .container import prepare_scopes
     fs = FsGrant(read=tuple(read) if read else (FS_ANY,),
                  write=tuple(write or ()),
                  delete=bool(allow_delete))
+    # 范围不存在的话先建出来 —— 顺手把"按什么建的"回报给主 agent。
+    # 建早了才能早发现:等子 agent 在容器里撞上 Read-only 再说,中间已经隔着一层报告了。
+    notes = prepare_scopes(fs.write) if fs.write else []
     r = tasks.dispatch(task, vm=vm, wait=wait, fs=fs)
-    return r.get("message") or (f"已派给 {r['task_id']},它在后台跑。"
-                                f"用 task_status 看进展;干完我会告诉你。")
+    tail = ("\n\n另外:" + ";".join(notes)) if notes else ""
+    return (r.get("message") or (f"已派给 {r['task_id']},它在后台跑。"
+                                 f"用 task_status 看进展;干完我会告诉你。")) + tail
 
 
 @tool(
