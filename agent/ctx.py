@@ -151,6 +151,9 @@ class AgentCtx:
     console: object = None
     # 挂起时的交接内容(见 tasks.py)。工具把它填上,循环看到就停下来。
     suspend: dict = field(default_factory=dict)
+    # 叫停旗子(见 tasks.kill)。线程没法从外面强杀,所以只能每步之间 check 一次 ——
+    # 它**不打断正在跑的那一次工具调用**,但不会再多走一步。
+    cancelled: bool = False
 
     @property
     def is_sub(self) -> bool:

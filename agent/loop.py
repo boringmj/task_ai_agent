@@ -121,6 +121,11 @@ def run(user_input: str, messages: list[dict], max_steps: int | None = None) -> 
         # 这一轮若调用了 img,把登记好的图片作为 image_url 注入,给下一轮模型看
         inject_pending_images(messages)
 
+        # 被叫停了(见 tasks.kill)。**放在工具跑完之后 check** —— 正在执行的那次
+        # 工具调用不打断,否则可能把它做到一半的文件留在那儿;但不会再走下一步。
+        if ctx.current().cancelled:
+            return "（已按用户要求中止。之前做完的部分都在对话里,没有被撤销。）"
+
         # 子 agent 交了问题上来(申请权限、要问用户)→ 停在这儿,别接着往下跑。
         # 接手的是 tasks.py:它把状态记成"等回话",把问题交给主 agent。
         # **停在这儿而不是抛出异常**:对话历史是完整的(最后一条是 tool 结果),

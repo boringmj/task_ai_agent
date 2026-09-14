@@ -295,12 +295,19 @@ def _session_loop() -> None:
 
     while True:
         try:
-            user_input = _read_multiline()  # 多行读取,空行提交
+            # 接管着某个子 agent 时,提示符换成它 —— 一眼能看出"现在敲的话是说给谁听的"
+            watched = tasks.attached()
+            user_input = _read_multiline(f"[{watched}] > " if watched else "你 > ")
             if user_input is None:  # 空闲时 Ctrl+C = 退出
                 console.print("再见。", style="dim")
                 break
             text = user_input.rstrip()  # 去掉粘贴时多带的结尾空行,保留行内缩进
             if not text.strip():
+                continue
+            # 接管状态下,**不带头斜杠的话就是说给那个子 agent 的**(而不是主 agent)。
+            # 带斜杠仍然是指令 —— 否则用户被困在里面,连 /subtasks off 都敲不出来。
+            if watched and not text.lstrip().startswith("/"):
+                console.print(tasks.tell(watched, text), style="dim")
                 continue
             # 裸敲的 exit / quit 当成 /exit:老习惯要接住,但退出只留一个入口 ——
             # 否则"纯字符退出"和"指令退出"两套逻辑各走各的,早晚对不上。

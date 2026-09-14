@@ -44,18 +44,50 @@ RESULT_MAX_CHARS = int(os.environ.get("SUBAGENT_RESULT_MAX", "4000"))
 BUFFER_MAX_CHARS = int(os.environ.get("SUBAGENT_BUFFER_MAX", "200000"))
 
 
+# 用户当前"接管"着哪个子 agent(见 attach)。**只有一个** —— 一次看一个才看得清。
+_ATTACHED: str | None = None
+_ATTACH_LOCK = threading.RLock()
+
+
+def attached() -> str | None:
+    return _ATTACHED
+
+
+def attach(tid: str) -> str:
+    """接管:它的输出实时打到终端,你敲的字进它的对话。"""
+    global _ATTACHED
+    t = get(tid)
+    if t is None:
+        return f"没有 {tid} 这个任务。"
+    with _ATTACH_LOCK:
+        _ATTACHED = tid
+    return (f"已接管 {tid}({t.status})。它说的话会带 [{tid}] 前缀打到这儿;"
+            f"你敲的会进它的对话。回去用 /subtasks off。")
+
+
+def detach() -> str:
+    global _ATTACHED
+    with _ATTACH_LOCK:
+        was, _ATTACHED = _ATTACHED, None
+    return f"已从 {was} 退出来。" if was else "本来就没接管谁。"
+
+
 class _Sink(io.TextIOBase):
     """子 agent 的输出落进这里,而不是终端。
 
     主终端是用户跟**主 agent** 对话的地方。子 agent 往那儿刷几百行,用户就看不见主 agent
     在说什么了 —— 这正是当初要解决的问题的一部分,不能从这个门再放回来。
-    留一个环形缓冲:够事后查(和以后"切进去看"),又不会无限涨。
+
+    但**接管之后**(`/subtasks <id> enter`)例外:那时用户明确说了"我要看这个",就实时
+    转出去。留一个环形缓冲,一是给接管用(接管的瞬间先补上已经说过的),二是事后可查。
     """
 
-    def __init__(self, limit: int = BUFFER_MAX_CHARS):
+    def __init__(self, tid: str = "", limit: int = BUFFER_MAX_CHARS):
+        self.tid = tid
         self.limit = limit
         self.parts: list[str] = []
         self.size = 0
+        self._bol = True          # 上一个片段是不是停在行首(决定要不要加前缀)
 
     def write(self, s: str) -> int:      # noqa: D102 - TextIOBase 的接口
         if not s:
@@ -64,6 +96,17 @@ class _Sink(io.TextIOBase):
         self.size += len(s)
         while self.size > self.limit and len(self.parts) > 1:
             self.size -= len(self.parts.pop(0))
+        if self.tid and _ATTACHED == self.tid:
+            # 直接用 sys.stdout,不走 rich:这些片段本来就是 rich 排版好的,
+            # 再过一遍渲染只会把格式弄乱。打不出来也不该影响子 agent 干活。
+            try:
+                import sys
+                text = f"[{self.tid}] {s}" if self._bol else s
+                self._bol = text.endswith("\n")
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            except Exception:  # noqa: BLE001
+                pass
         return len(s)
 
     def text(self) -> str:
@@ -74,10 +117,10 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _buffer_console():
-    """给子 agent 的输出出口:写进缓冲区,不碰终端。"""
+def _buffer_console(tid: str):
+    """给子 agent 的输出出口:写进缓冲区(被接管时才转到终端)。"""
     from rich.console import Console
-    return Console(file=_Sink(), width=110, highlight=False, soft_wrap=True)
+    return Console(file=_Sink(tid), width=110, highlight=False, soft_wrap=True)
 
 
 @dataclass
@@ -276,7 +319,7 @@ def _run(t: Task) -> None:
     忘了这一步,它的图片、搜索配额、用量会落到那个兜底上下文上,等于全部丢失。
     """
     c = ctx.AgentCtx(role="sub", task_id=t.id, label=t.id, vm_grant=t.vm,
-                     fs=t.fs, console=_buffer_console())
+                     fs=t.fs, console=_buffer_console(t.id))
     t.ctx = c                                     # 保留引用,供 /subtasks 查状态
     outcome = "done"
     try:
@@ -419,6 +462,60 @@ def resume(tid: str, answer: str = "", wait: bool = True,
     return _wait_for(t, timeout) if wait else {"status": "running", "task_id": t.id}
 
 
+def tell(tid: str, text: str) -> str:
+    """跟一个子 agent 说句话(接管状态下用户敲的)。
+
+    **两种情况走的路完全不同,但都成立**:
+
+    - 它**停着**(挂起/干完了/中断了)→ 当成 `resume` 的答复,让它带着这句话接着干。
+    - 它**正在跑** → 直接把这句话追加进它的对话。它每一步都会重发整段历史,所以下一轮
+      就看见了。不用中断它,也不用等 —— 这正是"每一步都重发历史"这个代价换来的好处。
+
+    跑着的时候插话有个前提**:它下一步才看得到**,而且它可能正卡在一次很长的工具调用里。
+    所以话要说得像"补充信息",别指望它立刻掉头。
+    """
+    t = get(tid)
+    if t is None:
+        return f"没有 {tid} 这个任务。"
+    text = (text or "").strip()
+    if not text:
+        return "(空话,没发)"
+    if t.status == "running":
+        t.messages.append({"role": "user", "content": text})
+        return f"已插进 {tid} 的对话,它下一步会看到。"
+    if t.status in ("waiting_input", "interrupted", "done"):
+        # 干完了还能接着聊:把话续在结论之后,等于"再让它做一件事"。
+        t.resumed.append(text)
+        t.ask = ""
+        t.notifier = threading.Event()
+        # 这次是**用户**直接交代的,主 agent 不在等;所以按"没人等"处理 ——
+        # 它跑完会照常通报给主 agent(主 agent 是协调者,该知道下面又发生了什么)。
+        t.awaited = False
+        _start(t)
+        return f"{tid} 接着跑了(在它之前那段的后面接着做)。" if t.messages else f"{tid} 跑起来了。"
+    return f"{tid} 现在是 {t.status},没法接话。"
+
+
+def kill(tid: str) -> str:
+    """让一个子 agent 停下来。
+
+    **只能商量,不能强杀** —— Python 没法从外面干掉一个线程。所以是给它设个旗子,
+    它在**每一步之间**check 一次。它要是正卡在一次很长的工具调用里(比如容器里跑着
+    60 秒的命令),那一下必须等完 —— 但不会再多走一步。
+
+    要真正的强杀,得把子 agent 做成独立进程,那是另一件事,现在没做。
+    """
+    t = get(tid)
+    if t is None:
+        return f"没有 {tid} 这个任务。"
+    if t.status != "running":
+        return f"{tid} 现在不是运行状态({t.status}),不用停。"
+    if t.ctx is not None:
+        t.ctx.cancelled = True
+    return (f"已叫停 {tid} —— 它在**当前这一步**做完之后停,正在跑的工具调用不会被打断。"
+            f"看它停没停用 /subtasks {tid}。")
+
+
 def _load(tid: str) -> Task | None:
     """从磁盘读回来一个任务(进程重启后 _TASKS 是空的)。
 
@@ -536,6 +633,50 @@ def listing() -> str:
 
 def get(tid: str) -> Task | None:
     return _TASKS.get(tid) or _load(tid)
+
+
+def buffer_text(tid: str) -> str:
+    """它到刚才为止的输出(接管时先补一段,不然用户盯着空白不知道它在忙什么)。"""
+    t = get(tid)
+    if t is None or t.ctx is None:
+        return ""
+    sink = getattr(getattr(t.ctx, "console", None), "file", None)
+    return sink.text() if sink is not None else ""
+
+
+def show(tid: str) -> str:
+    """一个子 agent 的详情(给人看的,不进模型上下文)。
+
+    和 `report()` 的区别:那个是**给主 agent 的交接**,只有结论;这个是**给用户看的**,
+    要说清它是什么状态、在等什么、干到哪了 —— 以及怎么接管它。
+    """
+    t = get(tid)
+    if t is None:
+        return f"没有 {tid} 这个任务。现有:{listing()}"
+    lines = [
+        f"{t.id}  [{t.status}]  {_cost_line(t)}",
+        f"任务: {t.prompt}",
+        f"创建: {t.created}   更新: {t.updated}",
+        f"权限: 读={'、'.join(t.fs.read) or '无'} 写={'、'.join(t.fs.write) or '无'}"
+        f"{' 可删' if t.fs.delete else ''}{'  VM' if t.vm else ''}",
+    ]
+    if t.ask:
+        lines.append(f"**在等**: {t.ask}")
+    if t.status == "running":
+        lines.append("(正在跑。要盯着它看、或者跟它说话:/subtasks %s enter)" % t.id)
+    elif t.status == "waiting_input":
+        lines.append("(它停着等人回话。接管过去直接答:/subtasks %s enter)" % t.id)
+    elif t.status == "done" and t.result:
+        lines.append("\n--- 它交回来的报告 ---\n" + t.result[:1500])
+    if t.error:
+        lines.append(f"\n出错: {t.error}")
+    lines.append(f"\n对话在 {task_dir(t.id) / 'messages.jsonl'}(共 {len(t.messages)} 条);"
+                 f"看全过程:/subtasks {t.id} log")
+    return "\n".join(lines)
+
+
+def log(tid: str) -> str:
+    return transcript(tid)
 
 
 def transcript(tid: str) -> str:
