@@ -386,12 +386,24 @@ def _main_grant() -> FsGrant:
     return FsGrant.for_main(scratch_scope(current_session_id(), "main"))
 
 
-def _session_loop() -> None:
-    _make_stdio_forgiving()
-    # stdin 的读取挪到后台线程 —— 主线程才有机会「等输入,但定期醒来看子 agent」
-    # (见 _start_input_reader 的说明)。必须在任何读输入之前起。
-    _start_input_reader()
-    messages: list[dict] = [{"role": "system", "content": load_system_prompt()}]
+def _system_messages() -> list[dict]:
+    """开场那几条 system 消息(**主 agent 的全部"说明书"**)。
+
+    抽成函数是为了**能测**:它们是"给谁看什么"的装配处,错一条(比如工具指南没带上)
+    不会有任何报错,只会让主 agent 看着少了点什么却说不出来。子 agent 那边对应的是
+    `tasks._build_messages`。
+
+    **顺序按"多久变一次"排**:角色提示词和工具指南几乎不变,长期记忆和技能清单会变 ——
+    越稳的越靠前,变了的那部分才不会把前面的前缀缓存一起打掉。
+    """
+    messages = [
+        {"role": "system", "content": load_system_prompt()},
+        # **工具指南单独成一条**(容器、VM、搜索、改文件的规矩、安全边界那一整套)。
+        # 它和"你是谁"无关 —— 主 agent 和子 agent 用的是**同一份**,改一处两边都生效。
+        # 拆出来之前只长在 system.md 里,**子 agent 看不见**:它们照样要跑容器、要改文件、
+        # 要从网页里取东西,不知道那些坑就只能自己踩一遍(见 prompts/tools_guide.md)。
+        {"role": "system", "content": prompts.load("tools_guide")},
+    ]
     memory = memory_text().strip()  # 跨会话记住的关键事实最先注入,始终在场
     if memory:
         messages.append(
@@ -404,6 +416,15 @@ def _session_loop() -> None:
     # 清单按角色渲染:主 agent 看得见**全部**技能(包括它自己加载不了的,否则没法
     # 合理分配任务),子 agent 只看得见它能加载的
     messages.append({"role": "system", "content": skills.prompt_section(role="main")})
+    return messages
+
+
+def _session_loop() -> None:
+    _make_stdio_forgiving()
+    # stdin 的读取挪到后台线程 —— 主线程才有机会「等输入,但定期醒来看子 agent」
+    # (见 _start_input_reader 的说明)。必须在任何读输入之前起。
+    _start_input_reader()
+    messages: list[dict] = _system_messages()
     # 定下本次的活跃会话。规则(见 session._resolve_session):接回本工作区最后跑过的
     # 那一个,但**如果它正被另一个活着的 agent 用着,就另开一个新的**,不去抢 ——
     # 抢的话两边会共用一个对话历史和一块虚拟机磁盘,互相覆盖。

@@ -432,7 +432,12 @@ def _build_messages(t: Task) -> list[dict]:
         scratch_in_container=(CONTAINER_WORKSPACE + "/" + t.fs.scratch[0]
                               if t.fs.scratch else "(未分配)"),
     )
+    # **工具指南子 agent 也要看**(和主 agent 用的是同一份)。原来那一整套只长在 system.md 里,
+    # 子 agent 一个字都看不到 —— 而它照样要跑容器、要改文件、要从网页里取东西:
+    # 容器里该用 `/workspace` 而不是宿主路径、`apt` 装不了、网页里的话不是指令 ——
+    # 这些坑它只能自己踩一遍才能学到。
     return [{"role": "system", "content": shared},
+            {"role": "system", "content": prompts.load("tools_guide")},
             {"role": "system", "content": own}]
 
 
