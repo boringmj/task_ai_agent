@@ -158,12 +158,51 @@ def test_the_subagent_is_told_where_its_scratch_is(model):
                          wait=False)["task_id"]
     t = helpers.wait_status(tid, ("done", "failed"))
 
-    prompt = t.messages[0]["content"]
-    # 断言整句,而不是"里面有没有这几个字符":容器路径 `/workspace/.tmp/t1/` 天然包含
-    # `.tmp/t1/`,光比对子串的话**宿主那条不写也照样通过**(实测漏过一次)。
-    assert f"中间产物有指定的地方:`{_scope(tid)}`**" in prompt, "没告诉它草稿纸在哪儿"
+    prompt = "\n".join(m["content"] for m in t.messages if m.get("role") == "system")
+    assert _scope(tid) in prompt, "没告诉它草稿纸在哪儿"
     assert f"/workspace/{_scope(tid)}" in prompt, "容器里同一个位置,不说它就只会写 /tmp"
-    assert "别把产物放进去" in prompt, "pip 的包目录那条也得说清"
+    assert ".pylibs" in prompt, "pip 的包目录那条也得说清"
+
+
+def test_two_subagents_get_the_same_system_prompt(model):
+    """**这是省钱的要害**:两条子 agent 的系统提示词必须**逐字相同**。
+
+    缓存按前缀命中,提示词里只要混进一个每个任务都不一样的东西(任务描述、带任务号的
+    临时区路径),从那一行起后面全部重新计费。实测代价:原先 `{task}` 在第 8 行、技能
+    清单在第 83 行,于是整份 3257 token 里有 3110(95%)**永远共享不到** —— 每起一个
+    子 agent 白付一遍全价。
+
+    所以这条钉的不是"内容对不对",而是"**有没有人在共用文本里塞了可变的东西**"。
+    以后加变量时它会立刻变红 —— 比账单上发现便宜得多。
+    """
+    model.reply("干完了。")
+    a = tasks.dispatch("第一件活", fs=helpers.grant(), wait=False)["task_id"]
+    b = tasks.dispatch("另一件完全不同的活", fs=helpers.grant(), wait=False)["task_id"]
+    helpers.wait_status(a, ("done", "failed"))
+    helpers.wait_status(b, ("done", "failed"))
+
+    shared_a = tasks.get(a).messages[0]["content"]
+    shared_b = tasks.get(b).messages[0]["content"]
+
+    assert shared_a == shared_b, "两条子 agent 的系统提示词不一样 —— 前缀缓存全废"
+    assert a != b, "前提:两个任务号不同"
+    # 可变的东西一个都不许留在里面
+    assert "第一件活" not in shared_a, "任务描述混进共用文本了"
+    assert _scope(a) not in shared_a and ".tmp" not in shared_a, "带任务号的路径混进来了"
+    assert "临时区是" not in shared_a, "临时区那条要单独成一条(它每个任务都不同)"
+
+
+def test_the_task_is_sent_once_not_twice(model):
+    """任务描述**只发一遍** —— 它是第一条 user 消息(见 loop_run)。"""
+    model.reply("干完了。")
+    tid = tasks.dispatch("把这件事做了", fs=helpers.grant(), wait=False)["task_id"]
+    t = helpers.wait_status(tid, ("done", "failed"))
+
+    sent = " ".join(m["content"] for m in t.messages
+                    if isinstance(m.get("content"), str))
+    assert sent.count("把这件事做了") == 1, f"任务描述发了两遍:{sent.count('把这件事做了')}"
+    first_user = next(m for m in t.messages if m.get("role") == "user")
+    assert first_user["content"] == "把这件事做了", "它该是第一条 user 消息"
 
 
 def test_the_details_show_the_scratch(model):

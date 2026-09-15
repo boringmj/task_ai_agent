@@ -404,19 +404,36 @@ def _within(rel: str, scopes: tuple) -> bool:
 
 
 def _build_messages(t: Task) -> list[dict]:
-    """子 agent 的对话开头:它自己的系统提示词(含任务描述和它的技能清单)。"""
+    """子 agent 的对话开头:**一条共用的系统提示词 + 一条只有它自己的补充**。
+
+    **第一条必须逐字相同 —— 它是所有子 agent 的共同前缀。**
+    DeepSeek 的缓存按**前缀**命中,所以提示词里一旦混进每个任务都不一样的东西(任务描述、
+    带任务号的临时区路径),从那一行起后面全部重新计费。实测过代价:任务的 `{task}` 原来
+    在系统提示词第 8 行,而技能清单在第 83 行 —— **整份提示词 3257 token 里有 3110
+    (95%,含技能清单 1823)永远共享不到**,每起一个子 agent 白付一遍全价。
+
+    所以这里分成两条:
+
+      · 第一条:规则、工具与权限、报告格式、技能清单 —— **所有子 agent 逐字相同**;
+      · 第二条:它的临时区路径(带任务号,每个任务不同)。只有这一小条要全价。
+      · 任务描述**不在这里** —— 它已经由 `loop.run` 作为第一条 user 消息发过去了
+        (见 loop_run 的 payload),写进系统提示词本来就是在发两遍。
+
+    改动这段时要记住这条不变量,它由 test_scratch.py 里的
+    `test_two_subagents_get_the_same_system_prompt` 钉着。
+    """
     from . import skills
-    system = prompts.load(
-        "subagent",
-        task=t.prompt,
-        skills=skills.prompt_section(role="sub"),
-        # 临时区**要写进提示词**:光在授权里给一块地方,它不知道那是干什么用的、
-        # 也不知道容器里对应哪个路径,照样会去别处找地方写。
+    shared = prompts.load("subagent", skills=skills.prompt_section(role="sub"))
+    own = prompts.load(
+        "subagent_scratch",
+        # 临时区**要告诉它**:光在授权里给一块地方,它不知道那是干什么用的、也不知道
+        # 容器里对应哪个路径,照样会去别处找地方写(实测:倒进了 .pylibs)。
         scratch=t.fs.scratch[0] if t.fs.scratch else ".tmp/(未分配)",
         scratch_in_container=(CONTAINER_WORKSPACE + "/" + t.fs.scratch[0]
                               if t.fs.scratch else "(未分配)"),
     )
-    return [{"role": "system", "content": system}]
+    return [{"role": "system", "content": shared},
+            {"role": "system", "content": own}]
 
 
 def dispatch(prompt: str, vm: bool = False, wait: bool = True,
@@ -560,7 +577,11 @@ def _run(t: Task) -> None:
 
 
 def loop_run(t: Task, c: ctx.AgentCtx) -> str:
-    """跑一轮(把 import 放这儿,避开 registry 自动发现时的循环导入)。"""
+    """跑一轮(把 import 放这儿,避开 registry 自动发现时的循环导入)。
+
+    任务描述是**作为第一条 user 消息**进去的(所以系统提示词里不再重复一遍,见
+    _build_messages)。恢复时那条消息早就在历史里了,这里接上去的是主 agent 的答复。
+    """
     from . import loop
     # 恢复时:把上一轮存下的回话(主 agent 的答复)当成新输入接上去
     payload = t.resumed.pop() if t.resumed else t.prompt

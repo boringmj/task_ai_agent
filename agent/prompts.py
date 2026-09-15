@@ -3,6 +3,8 @@
 所有写给模型的文本都放在项目根的 `prompts/` 目录里,一个用途一个 `.md`:
 
     prompts/system.md              主系统提示词
+    prompts/subagent.md            子 agent 的系统提示词(**所有子 agent 逐字相同**那条)
+    prompts/subagent_scratch.md    子 agent 的临时区路径(每个任务不同,单独成一条)
     prompts/memory_injection.md    长期记忆注入时的包装
     prompts/commands_list.md       终端指令清单的外壳(里面嵌 {commands})
     prompts/resume_notice.md       会话恢复时追加的提示
