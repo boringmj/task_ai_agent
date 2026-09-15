@@ -26,10 +26,16 @@ def _record_usage(usage) -> None:
     last["prompt"] = getattr(usage, "prompt_tokens", 0) or 0
     last["completion"] = getattr(usage, "completion_tokens", 0) or 0
     last["cache_hit"] = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
+    # **未命中的那部分也要记**:它才是"这次请求有多少是全价"。
+    # (API 可能不给这个字段,那就按 prompt - hit 算 —— 两者必有其一。)
+    last["cache_miss"] = getattr(usage, "prompt_cache_miss_tokens", None)
+    if last["cache_miss"] is None:
+        last["cache_miss"] = max(0, last["prompt"] - last["cache_hit"])
     total["requests"] += 1
     total["completion"] += last["completion"]
     total["prompt"] += last["prompt"]
     total["cache_hit"] += last["cache_hit"]
+    total["cache_miss"] += last["cache_miss"]
 
 
 def context_ratio() -> float:
@@ -45,6 +51,18 @@ def context_ratio() -> float:
 def _cache_rate(prompt: int, hit: int) -> float:
     """缓存命中率(0~100)。命中数来自 API 的 prompt_cache_hit_tokens。"""
     return (hit / prompt * 100) if prompt else 0.0
+
+
+def _in_out(u: dict) -> str:
+    """输入那一截的写法:`输入 45,678(命中 43,210 / 94.6%)`。
+
+    **只报百分比是不够的**:94.6% 可能是"45,678 里命中 43,210",也可能是"1,000 里命中 946" ——
+    前者没省多少,后者是省了大头。绝对数一起给,才看得出这次到底花了多少。
+    """
+    p, h = u.get("prompt", 0), u.get("cache_hit", 0)
+    if not p:
+        return "输入 0"
+    return f"输入 {p:,}(命中 {h:,} / {_cache_rate(p, h):.1f}%)"
 
 
 def begin_turn() -> None:
@@ -79,7 +97,7 @@ def usage_line() -> str:
     pct = (used / MAX_CONTEXT_TOKENS * 100) if MAX_CONTEXT_TOKENS else 0.0
     return (f"上下文 {used:,}/{MAX_CONTEXT_TOKENS:,}({pct:.1f}%)"
             f" · 本轮 {t['requests']} 次请求"
-            f" · 缓存命中 {_cache_rate(t['prompt'], t['cache_hit']):.1f}%"
+            f" · {_in_out(t)}"
             f" · 输出 {t['completion']:,} tokens")
 
 
@@ -96,15 +114,12 @@ def usage_detail() -> str:
     used = c.last_usage["prompt"]
     pct = (used / MAX_CONTEXT_TOKENS * 100) if MAX_CONTEXT_TOKENS else 0.0
     t = _turn_usage()
-    tp, th, tc, tr = t["prompt"], t["cache_hit"], t["completion"], t["requests"]
-    ap, ah, ac, ar = (c.total_usage["prompt"], c.total_usage["cache_hit"],
-                      c.total_usage["completion"], c.total_usage["requests"])
+    tc, tr = t["completion"], t["requests"]
+    ac, ar = c.total_usage["completion"], c.total_usage["requests"]
     return (
         f"上下文 {used:,}/{MAX_CONTEXT_TOKENS:,} tokens({pct:.1f}%)\n"
-        f"本轮:{tr} 次请求,输出 {tc:,} tokens,缓存命中 "
-        f"{_cache_rate(tp, th):.1f}%({th:,}/{tp:,})\n"
-        f"本会话:{ar} 次请求,累计输出 {ac:,} tokens,整体缓存命中 "
-        f"{_cache_rate(ap, ah):.1f}%({ah:,}/{ap:,})"
+        f"本轮:{tr} 次请求,{_in_out(t)},输出 {tc:,} tokens\n"
+        f"本会话:{ar} 次请求,{_in_out(c.total_usage)},累计输出 {ac:,} tokens"
     )
 
 

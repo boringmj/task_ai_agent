@@ -15,8 +15,9 @@ from __future__ import annotations
 import io
 from types import SimpleNamespace as NS
 
+import helpers
 import pytest
-from agent import llm, loop
+from agent import llm, loop, tasks
 from agent.ctx import AgentCtx, use
 from rich.console import Console
 
@@ -104,6 +105,70 @@ def test_context_ratio_is_what_triggers_compaction(monkeypatch):
 def test_the_cache_rate_survives_a_zero_prompt():
     assert llm._cache_rate(0, 0) == 0.0
     assert llm._cache_rate(200, 50) == 25.0
+
+
+def test_the_bill_also_records_what_was_not_cached():
+    """**只记命中是不够的** —— 94.6% 可能是"45,678 里命中 43,210",也可能是
+    "1,000 里命中 946":前者没省多少,后者省了大头。绝对数一起给才看得出花了多少。"""
+    c = AgentCtx(role="main")
+    with use(c):
+        llm._record_usage(_usage(prompt=1000, hit=900))
+        llm._record_usage(_usage(prompt=1000, hit=100))
+
+    assert c.total_usage["cache_hit"] == 1000
+    assert c.total_usage["cache_miss"] == 1000, "没命中的那部分丢了"
+
+
+def test_a_provider_without_the_miss_field_still_gets_one():
+    """API 不一定给 `prompt_cache_miss_tokens` —— 那就按 `prompt - hit` 算。
+    空着一个字段,账目就永远是半截的。"""
+    class _NoMiss:
+        prompt_tokens = 1000
+        completion_tokens = 5
+        prompt_cache_hit_tokens = 800
+
+    c = AgentCtx(role="main")
+    with use(c):
+        llm._record_usage(_NoMiss())
+
+    assert c.total_usage["cache_miss"] == 200
+
+
+def test_the_line_shows_both_numbers_not_just_a_percentage():
+    c = AgentCtx(role="main")
+    with use(c):
+        llm._record_usage(_usage(prompt=1000, completion=50, hit=900))
+        line = llm.usage_line()
+
+    assert "命中 900" in line and "1,000" in line, f"只给了百分比:{line}"
+    assert "输出 50 tokens" in line
+
+
+def test_the_subagent_bill_is_a_running_total(model):
+    """子 agent 那行账目报的是**总量**(跨 resume 累加)。
+
+    原来是 `t.usage = dict(c.total_usage)` —— 每轮**覆盖**:挂起过一次的任务,
+    账上只剩最后那一轮。而人要的是"它一共花了多少"。
+    """
+    model.reply("第一轮。")
+    tid = tasks.dispatch("干活", fs=helpers.grant(), wait=False)["task_id"]
+    helpers.wait_status(tid, ("done", "failed"))
+    one = dict(tasks.get(tid).usage)
+    assert one["requests"] == 1 and one["prompt"] == 1000
+
+    # 跑完的任务要先**验收关闭**才谈得上接着做(主 agent 的正常流程就是 accept 之后再说)
+    tasks.finish(tid, "accept")
+    model.reply("第二轮。")
+    tasks.resume(tid, answer="再补一步", wait=True, timeout=20)
+    t = helpers.wait_status(tid, ("done", "failed", "waiting_input"))
+
+    assert t.usage["requests"] == one["requests"] + 1, f"没累加:{t.usage}"
+    assert t.usage["prompt"] == 2000, "总输入该是两轮之和"
+
+    line = tasks._cost_line(t)
+    assert "总输入 2,000" in line and "总输出 100" in line, line
+    assert "缓存命中 1,800 / 90.0%" in line, line
+    assert "2 次请求" in line
 
 
 # ============================== 流式:分片拼回来 ==============================

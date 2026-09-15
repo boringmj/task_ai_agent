@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parent.parent
 _TMP = Path(tempfile.mkdtemp(prefix="agent-tests-"))
@@ -50,11 +51,19 @@ from agent.ctx import FS_ANY, FsGrant          # noqa: E402
 class FakeModel:
     """替掉 `loop.stream_model`:脚本说这一步模型该调哪个工具,它就调哪个。
 
-    还额外复刻了真实现的两个**副作用**,漏掉它们测试就会得出假结论:
+    还额外复刻了真实现的三个**副作用**,漏掉它们测试就会得出假结论:
       · 中间轮次说的话要打到当前 agent 的输出口上(见 llm.stream_model 末尾)——
         不复刻的话,接管测试会"发现"接管看不到子 agent 说话。
+      · **记账**(`llm._record_usage`):真实实现每收到一帧都会记用量,所以
+        `usage_line` / `_cost_line` / "总"都是活的。不复刻的话,凡是跟用量有关的断言
+        都只能测到 0 —— 那不是"没测",是测了个假的。
       · 每步可以睡一会儿(step_delay),用来让子 agent 活得够久,好让接管看得见。
     """
+
+    # 每次请求报出来的"用量"。挑一组好认的数字:命中率恰好 90%,一眼能看出算没算错。
+    PROMPT = 1000
+    HIT = 900
+    COMPLETION = 50
 
     def __init__(self) -> None:
         self.script: list = []
@@ -80,6 +89,12 @@ class FakeModel:
         self.seen.append([dict(m) for m in messages])
         if self.step_delay:
             time.sleep(self.step_delay)
+        # 复刻真实现每帧都记账这件事(见类注释)—— 记在**当前 agent**的账上
+        from agent import llm
+        llm._record_usage(SimpleNamespace(
+            prompt_tokens=self.PROMPT, completion_tokens=self.COMPLETION,
+            prompt_cache_hit_tokens=self.HIT,
+            prompt_cache_miss_tokens=self.PROMPT - self.HIT))
         if not self.script:
             return ("(脚本用光了)", [], "")
         content, calls, reason = self.script.pop(0)

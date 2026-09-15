@@ -559,7 +559,9 @@ def _run(t: Task) -> None:
         # 返回空)—— 结果就是"后台干完了但主 agent 永远收不到"。发通报放在设状态之后、
         # 唤醒等待者之前,这两个都发生在同一段不可被打断的收尾里。
         t.status = outcome
-        t.usage = dict(c.total_usage)
+        # **累加,不是覆盖** —— 一个任务可能跑了好几轮(挂起→答复、中断→接着做、
+        # 验收后又被叫起来),人要的是它**一共**花了多少(见 _add_usage)。
+        t.usage = _add_usage(t.usage or {}, c.total_usage)
         t.updated = _now()
         # 消息是逐条落盘的(见 append_message),收尾不用再整体重写 ——
         # 只有它自己被压缩过的那种情况才需要,那个由 loop 负责调 rewrite_messages
@@ -774,9 +776,29 @@ def report(t: Task) -> dict:
 
 
 def _cost_line(t: Task) -> str:
+    """一个任务**总共**花了多少 —— 给人看的,不进主 agent 的上下文。
+
+    `prompt` 那一项是**输入总量**(每次请求都重发整个历史,所以它是"喂进去多少",不是
+    "上下文多大")。命中/输入都给绝对数:94.6% 可能是 45,678 里命中 43,210,也可能是
+    1,000 里命中 946 —— 只给百分比看不出这次到底花了多少。
+    """
     u = t.usage or {}
-    return (f"{u.get('requests', 0)} 次请求 / 输出 {u.get('completion', 0):,} tokens"
-            f" / 缓存命中 {_rate(u)}")
+    return (f"总输出 {u.get('completion', 0):,} · 总输入 {u.get('prompt', 0):,}"
+            f"(缓存命中 {u.get('cache_hit', 0):,} / {_rate(u)})"
+            f" · {u.get('requests', 0)} 次请求")
+
+
+def _add_usage(base: dict, new: dict) -> dict:
+    """把两段用量加起来 —— **"总"必须跨 resume 累加**。
+
+    一个任务可以跑好几轮(挂起→答复、被打断→接着做、验收后又叫起来)。原来 `_run` 收尾
+    是 `t.usage = dict(c.total_usage)`,直接**覆盖**:跑了三轮的任务,账上只剩最后一轮 ——
+    而人要的是它一共花了多少。
+    """
+    out = {}
+    for k in set(base) | set(new):
+        out[k] = (base.get(k) or 0) + (new.get(k) or 0)
+    return out
 
 
 def _rate(u: dict) -> str:

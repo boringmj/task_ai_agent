@@ -26,7 +26,9 @@ from dataclasses import dataclass, field
 
 
 def _empty_usage() -> dict:
-    return {"requests": 0, "completion": 0, "prompt": 0, "cache_hit": 0}
+    # miss 是**没吃到缓存的那部分输入**。它和 hit 一起才看得出"这次请求有多少是全价":
+    # prompt = cache_hit + cache_miss,只看 hit 的百分比看不出分母有多大。
+    return {"requests": 0, "completion": 0, "prompt": 0, "cache_hit": 0, "cache_miss": 0}
 
 
 FS_ANY = "*"        # 通配:整个工作区
