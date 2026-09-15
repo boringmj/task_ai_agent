@@ -691,10 +691,15 @@ def _clip(text: str, t: Task, limit: int = RESULT_MAX_CHARS) -> str:
     """
     if len(text) <= limit:
         return text
-    where = _dir(t) / "messages.jsonl"
+    # **别把够不到的路径交给它。** 这里原来写的是"全文在 <会话目录>/messages.jsonl ——
+    # 需要细节就去读,不要凭猜":可子 agent 的对话在**工作区之外**,主 agent 的文件工具
+    # 根本读不到那儿(safe_path 会拒)。一句话让它去读一个读不到的文件,等于让它编 ——
+    # 而它确实会编。要细节只能**问它本人**(它自己那边有完整上下文)。
     return (text[:limit]
             + f"\n\n(报告过长,以上是前 {limit} 字,还有 {len(text) - limit} 字没显示。"
-              f"全文和它干活的完整过程在 {where} —— 需要细节就去读,不要凭猜。)")
+              f"**要细节就用 resume_task('{t.id}', answer='把没显示的那部分说清楚')让它自己讲** "
+              f"—— 它的完整对话在它自己那边,你的文件工具读不到(那是会话目录,在工作区之外)。"
+              f"别凭猜补全。)")
 
 
 def report(t: Task) -> dict:
@@ -731,8 +736,11 @@ def report(t: Task) -> dict:
     if t.status == "failed":
         return {"status": "failed", "task_id": t.id, "message": (
             f"[子 agent {t.id} 失败] {t.error}\n\n"
-            f"它的对话落在 {_dir(t) / 'messages.jsonl'},要查原因就去读。"
-            f"**别把失败当成「干完了但没结果」** —— 那部分活没做,要重派或者自己接。"
+            # 同理:路径不写在这儿 —— 它读不到,写了只会让它去编。
+            f"**要查原因就 resume_task('{t.id}', answer='刚才那步为什么失败,说清楚,"
+            f"换个法子接着做')** —— 它带着失败现场,比你自己从头查快,也不用重读一遍"
+            f"(它的对话在会话目录里,在工作区之外,你的文件工具读不到;用户能翻)。\n"
+            f"**别把失败当成「干完了但没结果」** —— 那部分活没做。"
         )}
     if t.status == "interrupted":
         return {"status": "interrupted", "task_id": t.id, "message": (
@@ -826,11 +834,11 @@ def resume(tid: str, answer: str = "", wait: bool = True,
            vm: bool = False) -> dict:
     """把主 agent 的答复交给一个停着的任务,让它接着干。
 
-    **`closed` 也收** —— 那是"重新叫起来"。它的对话、它读过的所有东西都还在盘上,
-    接着做的成本是零;而重派一个新的等于把它读过的东西再读一遍(实测:一个跑了 48 步的
-    仓库审计被记成 closed,主 agent 接不上,只好重开一个从头扫 —— 白烧一整轮)。
-    `tell()` 一直是这么做的(用户接管时敲句话就能让它接着跑),这里原来不是,那种不对称
-    正是"接不上"的来源。
+    **`closed` 和 `failed` 也收** —— 那是"重新叫起来/换个法子再试"。它的对话、它读过的
+    所有东西都还在盘上,接着做的成本是零;而重派一个新的等于把它读过的东西再读一遍
+    (实测:一个跑了 48 步的仓库审计被记成 closed,主 agent 接不上,只好重开一个从头扫
+    —— 白烧一整轮)。`tell()` 一直是这么做的(用户接管时敲句话就能让它接着跑),
+    这里原来不是,那种不对称正是"接不上"的来源。
 
     `write` / `read` / `allow_delete` / `vm` 是**答复里附带的授权**:它挂起说"我没权限",
     这里就得真的把权限给它(见 _extend_grant)。不附带授权时,答复只是一段话 —— 那对
@@ -839,7 +847,7 @@ def resume(tid: str, answer: str = "", wait: bool = True,
     t = get(tid)                      # 认 2 / T2 / t2(见 _norm)
     if t is None:
         return {"status": "error", "message": f"没有 {tid} 这个任务。"}
-    if t.status not in ("waiting_input", "interrupted", "truncated", "closed"):
+    if t.status not in ("waiting_input", "interrupted", "truncated", "closed", "failed"):
         return {"status": "error",
                 "message": f"{tid} 现在的状态是 {t.status},不在等回话 —— 没什么可接着干的。"}
     why = _extend_grant(t, write=write, read=read,

@@ -77,7 +77,10 @@ def test_a_long_report_is_clipped_and_says_where_the_rest_is(model):
 
     msg = tasks.report(t)["message"]
     assert "报告过长" in msg
-    assert "messages.jsonl" in msg, "得给出去哪儿读全文"
+    # 要细节得**问它本人** —— 不能给一个它读不到的路径(它的对话在工作区之外,
+    # 主 agent 的文件工具够不到;那种话等于让它去编)。见 test_isolation.py
+    assert "resume_task" in msg, "得给出一条它真能做到的路"
+    assert "messages.jsonl" not in msg, "别把够不到的路径交给它"
     assert msg.count("啰嗦") < 3000, "说好了截断,别整个倒进主 agent 的上下文"
 
 
@@ -331,6 +334,27 @@ def test_a_closed_task_can_be_called_back_up(model):
     assert "报告还是 0 字节" in str([m for m in t.messages
                                      if m.get("role") == "user"][-1]["content"])
     assert helpers.structure_ok(t.messages)[0]
+
+
+def test_a_failed_task_can_be_called_back_up_too(model):
+    """炸掉的活也该能**换个法子再试**,而不是只能重派一个从头读。
+
+    它的失败现场就在它的对话里(异常那条 system 消息),接着做比重读一遍便宜。
+    """
+    model.set(("我试试。", [model.call("read_file", path="没有这个文件.txt")], ""))
+    tid = tasks.dispatch("试着干", fs=helpers.grant(), wait=False)["task_id"]
+    helpers.wait_status(tid, ("done", "failed", "truncated"))
+    t = tasks.get(tid)
+    t.status = "failed"                     # 假装它在某一步炸了
+    t.error = "RuntimeError: boom"
+
+    model.reply("换个法子,好了。")
+    out = tasks.resume(tid, answer="刚才那步为什么失败,说清楚,换个法子接着做",
+                       wait=True, timeout=20)
+
+    assert out.get("status") == "done", f"炸过的活叫不起来:{out}"
+    assert "换个法子" in str([m for m in tasks.get(tid).messages
+                              if m.get("role") == "user"][-1]["content"])
 
 
 def test_a_running_task_still_cannot_be_resumed(model, slow):
