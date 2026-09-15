@@ -37,6 +37,74 @@ def _guide() -> str:
     return prompts.load("tools_guide")
 
 
+def _sub_system(model, tid_holder: list) -> list[dict]:
+    """派一个真子 agent,拿它那几条 system 消息(走生产代码那条路)。"""
+    model.reply("干完了。")
+    tid = tasks.dispatch("随便一件活", fs=helpers.grant(), wait=False)["task_id"]
+    tid_holder.append(tid)
+    t = helpers.wait_status(tid, ("done", "failed"))
+    return [m for m in t.messages if m.get("role") == "system"]
+
+
+def test_the_shared_block_comes_first_and_is_identical_for_both_roles(model):
+    """**这是整步改动的全部意义**:前两条 system 消息,主和子**逐字相同**,而且排在最前。
+
+    缓存按前缀命中 —— 只有"所有 agent 都一样的部分"排在最前面,主 agent 自己那条请求
+    才会替所有子 agent 把它们铺进缓存(实测:并发派出的子 agent 一条都没预热,却都命中了
+    这一段)。顺序一乱(比如把角色块提到前面),主 agent 铺下的东西子 agent 一个都用不上。
+    """
+    from agent import cli
+
+    main = [m["content"] for m in cli._system_messages()]
+    sub = [m["content"] for m in _sub_system(model, [])]
+
+    assert main[0] == sub[0] == prompts.load("common"), "通用规则没排到最前"
+    assert main[1] == sub[1] == prompts.load("tools_guide"), "工具指南没跟上"
+    # 第三条起就该分叉了(角色不同)
+    assert main[2] != sub[2], "角色块居然一样 —— 那说明主/子根本没分开"
+    assert "子 agent 的角色" in sub[2], sub[2][:40]
+
+
+def test_the_shared_block_has_nothing_that_varies(model):
+    """**共用块里不许有任何会变的东西** —— 尤其是步数上限。
+
+    主 agent 是 50 步、子 agent 是 60 步(`MAX_STEPS` / `SUB_MAX_STEPS`),这条限制
+    **本身就是角色专属的**。它原来写在"行为准则"里,而行为准则要搬进共用块 ——
+    照搬的话,两边的共用块就差了"50"和"60"这几个字符,**前缀从此对不上**,
+    整个共用块白做(而且这种错不报错、只是命中率悄悄掉下来)。
+    """
+    shared = prompts.load("common") + prompts.load("tools_guide")
+    sub = _sub_system(model, [])
+    task_prompt = "随便一件活"
+
+    assert task_prompt not in shared, "任务描述混进共用块了"
+    assert ".tmp" not in shared and "临时区" not in shared, "临时区路径混进来了"
+    assert "长期记忆" not in shared, "记忆混进来了(它会变,必须排最后)"
+    from agent.core import MAX_STEPS
+    for n in (MAX_STEPS, tasks.SUB_MAX_STEPS):
+        # 用「N 步」这种整句形式判,别拿裸数字:指南里本来就有 "110~130 行" 这种数字
+        assert f"{n} 步" not in shared, \
+            f"步数上限「{n} 步」出现在共用块里 —— 主/子的前缀会因此对不上"
+    # 子 agent 那边:这几种可变的东西也都不该在共用块那两条里
+    assert task_prompt not in sub[0] and task_prompt not in sub[1]
+
+
+def test_the_subagent_gets_the_long_term_memory_and_it_comes_last(model, workspace):
+    """子 agent 也拿到长期记忆(同一个用户、同一个工作区,偏好对它一样成立)。
+
+    但**必须排在最后**:它是这几条里唯一随"什么时候派的活"变的东西 ——
+    排前面的话,记忆一改(或者两次派活之间改过),同批子 agent 的共用前缀就断了。
+    """
+    (workspace / ".agent").mkdir(exist_ok=True)
+    (workspace / ".agent" / "memory.md").write_text(
+        "用户偏好:报告先给结论再给证据。[这条是测试写的]", encoding="utf-8")
+
+    sub = _sub_system(model, [])
+
+    assert "先给结论再给证据" in sub[-1]["content"], "子 agent 没拿到记忆"
+    assert "先给结论再给证据" not in sub[0]["content"], "记忆跑到共用块里去了"
+
+
 def test_the_guide_is_one_file_shared_by_both_roles(model):
     """**同一份文件** —— 不是两边各抄一份(那样迟早就只改一处)。
 
@@ -88,15 +156,17 @@ def test_the_main_prompt_no_longer_repeats_the_guide(model):
 
 
 def test_every_subagent_gets_the_same_guide(model):
-    """所有子 agent 拿到的指南**逐字相同** —— 它和角色提示词一样是缓存前缀的一部分。"""
+    """所有子 agent 拿到的指南**逐字相同** —— 它和角色提示词一样是缓存前缀的一部分。
+
+    (按内容找,不按下标:下标会随着排布变,那样测的就是"第几条"而不是"有没有"了。)
+    """
     model.reply("干完了。")
     a = tasks.dispatch("第一件", fs=helpers.grant(), wait=False)["task_id"]
     b = tasks.dispatch("第二件", fs=helpers.grant(), wait=False)["task_id"]
     helpers.wait_status(a, ("done", "failed"))
     helpers.wait_status(b, ("done", "failed"))
 
-    def guide_of(tid):
-        return [m["content"] for m in tasks.get(tid).messages
-                if m.get("role") == "system"][1]
-
-    assert guide_of(a) == guide_of(b) == _guide()
+    for tid in (a, b):
+        contents = [m["content"] for m in tasks.get(tid).messages
+                    if m.get("role") == "system"]
+        assert _guide() in contents, f"{tid} 的提示词里没有那份指南"

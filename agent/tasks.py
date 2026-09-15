@@ -423,7 +423,8 @@ def _build_messages(t: Task) -> list[dict]:
     `test_two_subagents_get_the_same_system_prompt` 钉着。
     """
     from . import skills
-    shared = prompts.load("subagent", skills=skills.prompt_section(role="sub"))
+    from .tools.memory import memory_text
+    shared = prompts.load("subagent", max_steps=SUB_MAX_STEPS)
     own = prompts.load(
         "subagent_scratch",
         # 临时区**要告诉它**:光在授权里给一块地方,它不知道那是干什么用的、也不知道
@@ -432,13 +433,23 @@ def _build_messages(t: Task) -> list[dict]:
         scratch_in_container=(CONTAINER_WORKSPACE + "/" + t.fs.scratch[0]
                               if t.fs.scratch else "(未分配)"),
     )
-    # **工具指南子 agent 也要看**(和主 agent 用的是同一份)。原来那一整套只长在 system.md 里,
-    # 子 agent 一个字都看不到 —— 而它照样要跑容器、要改文件、要从网页里取东西:
-    # 容器里该用 `/workspace` 而不是宿主路径、`apt` 装不了、网页里的话不是指令 ——
-    # 这些坑它只能自己踩一遍才能学到。
-    return [{"role": "system", "content": shared},
-            {"role": "system", "content": prompts.load("tools_guide")},
-            {"role": "system", "content": own}]
+    # **顺序和主 agent 那边对齐:共用块在最前,最易变的在最后。**
+    # 前两条(通用规则、工具指南)和主 agent 逐字相同 —— 主 agent 的请求已经把这段铺进
+    # 缓存了,所以子 agent 一上来就命中;角色块之后才是各自的东西。
+    # **记忆放最后**:它是这里唯一随"什么时候派的活"变的东西(派活时取一份快照,
+    # 之后主 agent 改记忆不回头改这一段 —— 回头改会把整段前缀打掉)。
+    msgs = [
+        {"role": "system", "content": prompts.load("common")},
+        {"role": "system", "content": prompts.load("tools_guide")},
+        {"role": "system", "content": shared},
+        {"role": "system", "content": skills.prompt_section(role="sub")},
+        {"role": "system", "content": own},
+    ]
+    memory = memory_text().strip()
+    if memory:
+        msgs.append({"role": "system",
+                     "content": prompts.load("memory_injection", memory=memory)})
+    return msgs
 
 
 def dispatch(prompt: str, vm: bool = False, wait: bool = True,

@@ -397,25 +397,31 @@ def _system_messages() -> list[dict]:
     越稳的越靠前,变了的那部分才不会把前面的前缀缓存一起打掉。
     """
     messages = [
-        {"role": "system", "content": load_system_prompt()},
-        # **工具指南单独成一条**(容器、VM、搜索、改文件的规矩、安全边界那一整套)。
-        # 它和"你是谁"无关 —— 主 agent 和子 agent 用的是**同一份**,改一处两边都生效。
-        # 拆出来之前只长在 system.md 里,**子 agent 看不见**:它们照样要跑容器、要改文件、
-        # 要从网页里取东西,不知道那些坑就只能自己踩一遍(见 prompts/tools_guide.md)。
+        # **前两条是主/子逐字相同的共用块 —— 顺序不能动。**
+        # DeepSeek 的缓存按前缀命中,所以"所有 agent 都一样的部分"必须排在最前面:
+        # 主 agent 自己那条请求就会把它们铺进缓存,后面每个子 agent 一上来就白吃
+        # (实测:并发派出的子 agent 一条都没预热,却都命中了这一段)。
+        # 详见 core. 那条注释和 prompts/common.md 的说明。
+        {"role": "system", "content": prompts.load("common")},
         {"role": "system", "content": prompts.load("tools_guide")},
+        # 分叉点:从这一条起主/子各走各的(所以它必须排在共用块**后面**)
+        {"role": "system", "content": load_system_prompt()},
+        # 终端指令清单单独成一条 system 消息,而不是并进主提示词 —— 它是程序自动生成的
+        # "数据",里面写明信任边界,免得描述文字被当成系统指令(详见 commands.system_message)
+        {"role": "system", "content": commands_system_message()},
+        # 技能清单同理:只放"名字 + 什么时候用",正文留在磁盘上按需读(见 agent/skills.py)
+        # 清单按角色渲染:主 agent 看得见**全部**技能(包括它自己加载不了的,否则没法
+        # 合理分配任务),子 agent 只看得见它能加载的
+        {"role": "system", "content": skills.prompt_section(role="main")},
     ]
-    memory = memory_text().strip()  # 跨会话记住的关键事实最先注入,始终在场
+    # **长期记忆放最后** —— 它是这几条里唯一会变的(主 agent 随时可能记一条)。
+    # 缓存是前缀:它一变,只有排在它后面的东西要重算;排在前面就会连角色块、
+    # 指令清单、技能清单一起打掉。
+    memory = memory_text().strip()
     if memory:
         messages.append(
             {"role": "system", "content": prompts.load("memory_injection", memory=memory)}
         )
-    # 终端指令清单单独成一条 system 消息,而不是并进主提示词 —— 它是程序自动生成的
-    # "数据",里面写明信任边界,免得描述文字被当成系统指令(详见 commands.system_message)
-    messages.append({"role": "system", "content": commands_system_message()})
-    # 技能清单同理:只放"名字 + 什么时候用",正文留在磁盘上按需读(见 agent/skills.py)
-    # 清单按角色渲染:主 agent 看得见**全部**技能(包括它自己加载不了的,否则没法
-    # 合理分配任务),子 agent 只看得见它能加载的
-    messages.append({"role": "system", "content": skills.prompt_section(role="main")})
     return messages
 
 
