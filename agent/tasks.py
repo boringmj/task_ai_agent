@@ -49,6 +49,22 @@ REPLAY_MAX_CHARS = int(os.environ.get("SUBAGENT_REPLAY_MAX", "6000"))
 # 等子 agent 时的轮询间隔。**必须带超时** —— 见 _wait_for 里那段说明(不可中断的
 # 阻塞锁会让 Ctrl+C 失效,用户以为程序死了)。
 WAIT_POLL = 0.25
+
+# ---- 派发闸门:让缓存先落盘,再放一批活出去 ----
+# DeepSeek 的缓存按**前缀**命中,而"落盘"发生在**请求结束之后**(文档:构建耗时为秒级)。
+# 同一瞬间发出的几条子 agent,**谁都还没替对方铺下缓存** —— 实测(合成前缀,真实 API):
+# 并发三条,每条都白付了 1,024 tokens(那是"子 agent 之间"那层公共前缀);等第一条跑完
+# 再放其余的,后面的就都吃到了。所以:先放一条、等它落盘,再放剩下的。
+#
+# **只做一波** —— 实测第二波不再有额外收益(覆盖已经到 512 token 网格上的最大值)。
+SUB_WARM = os.environ.get("SUBAGENT_WARM_ENABLED", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+# "第一次请求返回"≠"已落盘",所以返回之后还要再等一会儿。**默认 5 秒**是按文档那句
+# "构建耗时为秒级"定的(实测 2 秒在小请求上空载也够,但那是赌;这个值可配)。
+SUB_WARM_SETTLE = float(os.environ.get("SUBAGENT_WARM_SETTLE", "5"))
+# 等不到的兜底:**绝不能把主 agent 永远卡在这儿**。超时就放行,并如实说一句。
+SUB_WARM_TIMEOUT = float(os.environ.get("SUBAGENT_WARM_TIMEOUT", "30"))
+_WARMED = False      # 进程级:一个进程只预热一次(缓存 TTL 几小时,后续批次本来就热)
 # 等的时候每隔这么久出一声,让人知道它还活着
 WAIT_HEARTBEAT = float(os.environ.get("SUBAGENT_HEARTBEAT", "10"))
 # 单次等待的硬上限:再久也先不等了,让它转后台,免得主 agent 被一个卡住的子 agent
@@ -503,6 +519,72 @@ def _start(t: Task) -> None:
     th = threading.Thread(target=_run, args=(t,), name=f"subagent-{t.id}", daemon=True)
     t.thread = th
     th.start()
+
+
+def _wait_cache_warm(tid: str) -> str:
+    """等 `tid` 的**第一次请求落盘**,返回一句给人看的说明(等到了就返回空串)。
+
+    判据分两段,缺一不可:
+      ① 它的**第一次请求返回**(`total_usage["requests"] >= 1`)—— 这是"开始计时"的锚点,
+         请求还没发出去,谈不上落盘;
+      ② 再等 `SUB_WARM_SETTLE` 秒 —— **返回 ≠ 落盘**,文档说构建是秒级。
+    """
+    global _WARMED
+    try:
+        ctx.out().print(
+            f"! 预热缓存:等 {tid} 的第一次请求落盘(约 {SUB_WARM_SETTLE:.0f} 秒;"
+            f"之后这一批都能少付一截全价输入)", style="dim", markup=False)
+    except Exception:      # noqa: BLE001 - 提示打不出来不该拦住派活
+        pass
+    tick = _TASKS.get(tid)
+    end = time.monotonic() + SUB_WARM_TIMEOUT
+    got = False
+    while time.monotonic() < end:
+        c = getattr(tick, "ctx", None)
+        if c is not None and (c.total_usage or {}).get("requests", 0) >= 1:
+            got = True
+            break
+        if tick is None:
+            break
+        if tick.status != "running":
+            # **它已经跑完了**(命短的活在负载高时可能在我们轮询之前就结束)。
+            # 那说明它的请求早就发过、也早就落盘了 —— 是我们来得晚,不是"没等到"。
+            # 这里原来先判状态、后判用量,于是那种情况会被当成超时,**报一个假警报**。
+            got = True
+            break
+        time.sleep(WAIT_POLL / 2)      # 轮询而不是阻塞睡:保持可被 Ctrl+C 打断
+    _WARMED = True
+    if not got:
+        return (f"({tid} 的第一次请求还没回来,没等到缓存落盘就先放行了 —— 这一批可能"
+                f"没吃上缓存;要更稳可以调大 SUBAGENT_WARM_TIMEOUT)")
+    time.sleep(SUB_WARM_SETTLE)
+    return ""
+
+
+def dispatch_batch(items: list[dict]) -> tuple[list[dict], str]:
+    """一次派一批活:**第一波串行预热,其余一起放**。返回 (每件的结果, 给人看的说明)。
+
+    `items` 是一串 `dispatch()` 的关键字参数(每件可以带自己的 write 范围)。
+
+    **为什么不干脆全并发**(实测数据):同一瞬间发出的几条,谁都还没替对方铺下缓存前缀。
+    并发三条子形状的请求,每条都白付了 1,024 tokens;而等第一条跑完再发的那条,只付了
+    237。多等几秒,换后面每一条都省一截 —— 而且这个"等"一个进程只发生一次。
+
+    (真跑一遍的账:`SUBAGENT_WARM_SETTLE` 调大调小、或者干脆设 `SUBAGENT_WARM_ENABLED=0`
+    关掉,都能从每轮那行 usage 的"未命中"里看出差别。)
+    """
+    global _WARMED
+    if not items:
+        return [], ""
+    if len(items) == 1 or not SUB_WARM or _WARMED or items[0].get("wait"):
+        # 一件、关了、已经预热过、或者调用方本来就在干等第一件 —— 没什么可预热的,别卡
+        return [dispatch(**it) for it in items], ""
+    first = dispatch(**items[0])
+    if first.get("status") == "error":
+        _WARMED = True                 # 都没派出去,别让后面的一直等
+        return [first] + [dispatch(**it) for it in items[1:]], ""
+    note = _wait_cache_warm(first["task_id"])
+    return [first] + [dispatch(**it) for it in items[1:]], note
 
 
 def _say(c, t: Task) -> None:

@@ -64,26 +64,75 @@ from .registry import tool
                                "写坏一个文件还能改回来,删掉就没了。要删也只能删在 write "
                                "范围里的东西。",
             },
+            "batch": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "task": {"type": "string"},
+                        "write": {"type": "array", "items": {"type": "string"}},
+                        "read": {"type": "array", "items": {"type": "string"}},
+                        "allow_delete": {"type": "boolean"},
+                        "vm": {"type": "boolean"},
+                    },
+                },
+                "description": "**一次派好几件互相独立的活时用这个**(比连着调好几次省往返)。"
+                               "每项一个对象,字段和单件时一样(每件可以有自己的 write 范围)。"
+                               "**派出去的顺序由工具管**:先放一件、等它第一次请求落盘,"
+                               "再一起放其余的(几秒钟,一个进程只发生一次)—— 这样它们能共用"
+                               "同一段缓存前缀,每条少付一截全价输入。"
+                               "**别自己一件一件派**,那等于把省下的 token 又花回去。",
+            },
         },
-        "required": ["task"],
+        "required": [],
     },
 )
-def dispatch_task(task: str, vm: bool = False, wait: bool = False,
+def dispatch_task(task: str = "", vm: bool = False, wait: bool = False,
                   write: list | None = None, read: list | None = None,
-                  allow_delete: bool = False) -> str:
+                  allow_delete: bool = False, batch: list | None = None) -> str:
     from .. import ctx, tasks
     from ..ctx import FS_ANY, FsGrant
     from .container import prepare_scopes
-    fs = FsGrant(read=tuple(read) if read else (FS_ANY,),
-                 write=tuple(write or ()),
-                 delete=bool(allow_delete))
-    # 范围不存在就先建出来(建早了才早发现)。但那些说明**只打到终端**:
-    # 每向主 agent 说一句话,它整段上下文就要重发一遍模型 —— 边角信息不值得那个价。
-    for note in prepare_scopes(fs.write) if fs.write else []:
-        try:
-            ctx.out().print(f"! {note}", style="dim", markup=False)
-        except Exception:      # noqa: BLE001 - 提示打不出来不该拦住派活
-            pass
+
+    def _fs(w=None, r=None, dele=None) -> FsGrant:
+        return FsGrant(read=tuple(r) if r else (FS_ANY,),
+                       write=tuple(w or ()), delete=bool(dele))
+
+    def _prep(grant: FsGrant) -> None:
+        # 范围不存在就先建出来(建早了才早发现)。但那些说明**只打到终端**:
+        # 每向主 agent 说一句话,它整段上下文就要重发一遍模型 —— 边角信息不值得那个价。
+        for note in prepare_scopes(grant.write) if grant.write else []:
+            try:
+                ctx.out().print(f"! {note}", style="dim", markup=False)
+            except Exception:      # noqa: BLE001 - 提示打不出来不该拦住派活
+                pass
+
+    if batch:
+        if task.strip():
+            return "错误:task 和 batch 只能给一个(一件活用 task,多件用 batch)。"
+        items = []
+        for i, one in enumerate(batch, 1):
+            if not isinstance(one, dict) or not str(one.get("task") or "").strip():
+                return f"错误:batch 里第 {i} 项没有 task(每项都要写清要它做什么)。"
+            grant = _fs(one.get("write"), one.get("read"), one.get("allow_delete"))
+            _prep(grant)
+            items.append({"prompt": str(one["task"]).strip(),
+                          "vm": bool(one.get("vm")),
+                          "fs": grant, "wait": False})
+        results, note = tasks.dispatch_batch(items)
+        ok = [r["task_id"] for r in results if r.get("task_id")]
+        bad = [r.get("message", "?") for r in results if r.get("status") == "error"]
+        out = f"已派 {len(ok)} 件:{'、'.join(ok)},都在后台跑,干完会通报你。"
+        if bad:
+            out += f"({len(bad)} 件没派出去:{';'.join(bad)})"
+        if note:
+            out += f" {note}"
+        return out
+
+    if not (task or "").strip():
+        return "错误:任务描述是空的 —— 子 agent 不知道要干什么。"
+    fs = _fs(write, read, allow_delete)
+    _prep(fs)
     r = tasks.dispatch(task, vm=vm, wait=wait, fs=fs)
     return r.get("message") or (f"已派给 {r['task_id']},它在后台跑。"
                                 f"用 task_status 看进展;干完我会告诉你。")
