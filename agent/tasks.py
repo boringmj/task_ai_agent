@@ -748,8 +748,15 @@ def report(t: Task) -> dict:
     # 剩下的(closed 之类)是已经收场的。**必须显式写出来** —— 原来这里是无条件兜底,
     # 于是新加的状态会**悄悄掉进"完成"那一支**:问一个正在跑的活,回一句"已完成"
     # (实测把主 agent 绕晕过)。状态多起来之后,"兜底"就是个陷阱。
+    #
+    # **收场了不等于接不上。** 它读过的文件都还在它自己的对话里,想接着做直接
+    # resume_task 就行 —— 这句话必须写出来:实测主 agent 看到"已经收场了"就以为没救了,
+    # 转头重派一个新的去干同一件事,白烧一整轮仓库扫描(而答案就在它手里)。
     return {"status": t.status, "task_id": t.id, "message": (
-        f"{t.id} 现在处于 {t.status},已经收场了。/subtasks all 能翻到它。"
+        f"{t.id} 现在处于 {t.status},已经收场了。\n"
+        f"**但它的对话和产出都还在盘上** —— 要接着做(补一步、写报告、复核)就直接 "
+        f"`resume_task('{t.id}', answer='...')`,它会带着原来的上下文继续,不用重读一遍。\n"
+        f"(想看它之前干了什么:/subtasks {t.id} log)"
     )}
 
 
@@ -817,7 +824,13 @@ def resume(tid: str, answer: str = "", wait: bool = True,
            timeout: float | None = None, write: list | None = None,
            read: list | None = None, allow_delete: bool | None = None,
            vm: bool = False) -> dict:
-    """把主 agent 的答复交给一个挂起(或中断)的任务,让它接着干。
+    """把主 agent 的答复交给一个停着的任务,让它接着干。
+
+    **`closed` 也收** —— 那是"重新叫起来"。它的对话、它读过的所有东西都还在盘上,
+    接着做的成本是零;而重派一个新的等于把它读过的东西再读一遍(实测:一个跑了 48 步的
+    仓库审计被记成 closed,主 agent 接不上,只好重开一个从头扫 —— 白烧一整轮)。
+    `tell()` 一直是这么做的(用户接管时敲句话就能让它接着跑),这里原来不是,那种不对称
+    正是"接不上"的来源。
 
     `write` / `read` / `allow_delete` / `vm` 是**答复里附带的授权**:它挂起说"我没权限",
     这里就得真的把权限给它(见 _extend_grant)。不附带授权时,答复只是一段话 —— 那对
@@ -826,7 +839,7 @@ def resume(tid: str, answer: str = "", wait: bool = True,
     t = get(tid)                      # 认 2 / T2 / t2(见 _norm)
     if t is None:
         return {"status": "error", "message": f"没有 {tid} 这个任务。"}
-    if t.status not in ("waiting_input", "interrupted", "truncated"):
+    if t.status not in ("waiting_input", "interrupted", "truncated", "closed"):
         return {"status": "error",
                 "message": f"{tid} 现在的状态是 {t.status},不在等回话 —— 没什么可接着干的。"}
     why = _extend_grant(t, write=write, read=read,
@@ -1156,11 +1169,19 @@ def shutdown(timeout: float = 3.0) -> str:
 
     做法是先叫停、再等一小会儿。等不到也不要紧:下面把**转发关掉**(见 `_Sink`),
     剩下的线程就算还活着也碰不到 stdout 了 —— 那才是崩溃的根因,等不等得到只是体面问题。
+
+    **落到「中断」而不是「关闭」** —— 退出程序是"我现在走了",不是"这些活我不要了"。
+    这个区别不是措辞问题,它决定下次启动时主 agent 能不能接着用它:`closed` 不在
+    `_NEEDS_MAIN` 里,也不是 `resume` 收的状态 —— 于是那份工作(以及它读过的一大堆文件)
+    就再也接不上了。实测踩到过:一个跑了 48 步的仓库审计,在用户退出时被记成 closed,
+    主 agent 想接着干却被告知"已经收场了",只能重派一个新的从头扫一遍。
     """
     global _SHUTTING_DOWN
     with _LOCK:
         live = [t for t in _TASKS.values() if t.status == "running"]
     for t in live:
+        # 和 /switch 同一个口径(见 stop_for_switch):没做完的活是**暂停**,不是丢弃
+        t.cancel_status = "interrupted"
         if t.ctx is not None:
             t.ctx.cancelled = True
     for t in live:
@@ -1168,7 +1189,10 @@ def shutdown(timeout: float = 3.0) -> str:
         if th is not None and th.is_alive():
             th.join(timeout / max(1, len(live)))
     _SHUTTING_DOWN = True
-    return f"退出前收拢了 {len(live)} 个还在跑的子 agent。" if live else ""
+    # 名字要报出来:用户下次启动时能不能接上它们,取决于他知道刚才被停的是哪几个
+    return (f"退出前收拢了 {len(live)} 个还在跑的子 agent"
+            f"({'、'.join(t.id for t in live)})—— 标成「中断」,下次进来可以接着做。"
+            if live else "")
 
 
 def get(tid: str) -> Task | None:

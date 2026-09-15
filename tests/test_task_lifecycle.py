@@ -286,6 +286,82 @@ def test_reset_leaves_other_sessions_alone(model):
     assert tasks.get("t8").status == "done"
 
 
+# ============================== 退出与复活 ==============================
+
+
+def test_quitting_marks_them_interrupted_not_closed(model, slow):
+    """**退出程序 ≠ 这些活我不要了。**
+
+    `shutdown()` 原来只置 `cancelled`,没设 `cancel_status` —— 而它默认是 `closed`。
+    于是退出时被收拢的子 agent 全被记成"不要了":下次启动 `recover()` 只看
+    queued/running,已经 closed 的它一动不动,主 agent 再想接着干就被拒。
+
+    实测就是这么丢的:`exit 130`(Ctrl+C)停在一次工具调用上,一个跑了 48 步、读了
+    337KB 扫描证据的仓库审计被记成 closed —— 主 agent 只好重派一个从头扫一遍。
+    """
+    slow["delay"] = 0.8
+    model.set(*[("干着。", [model.call("get_current_time")], "")] * 6)
+    tid = tasks.dispatch("跑了半截的活", fs=helpers.grant(), wait=False)["task_id"]
+    slow["entered"].wait(10)
+
+    out = tasks.shutdown(timeout=2.0)
+    slow["delay"] = 0.0
+
+    assert tid in out, "该说清收拢了谁"
+    t = helpers.wait_status(tid, ("interrupted", "closed", "done"))
+    assert t.status == "interrupted", f"退出被记成了 {t.status} —— 那份活就再也接不上了"
+
+
+def test_a_closed_task_can_be_called_back_up(model):
+    """收场了**不等于接不上**。`tell()` 一直允许(用户接管时敲句话就能让它接着跑),
+    `resume()` 原来不允许 —— 那个不对称就是"主 agent 只能重派一个"的来源。"""
+    model.reply("第一段干完了。")
+    tid = tasks.dispatch("把报告写了", fs=helpers.grant(), wait=False)["task_id"]
+    helpers.wait_status(tid, ("done", "failed"))
+    tasks.finish(tid, "accept")
+    assert tasks.get(tid).status == "closed"
+
+    model.reply("补上了。")
+    out = tasks.resume(tid, answer="报告还是 0 字节,把结论写进去", wait=True, timeout=20)
+    t = helpers.wait_status(tid, ("done", "failed"))
+
+    assert out.get("status") == "done", f"没叫起来:{out}"
+    assert t.status == "done"
+    assert sum(1 for m in t.messages if m.get("role") == "assistant") >= 2, "它没接着做"
+    assert "报告还是 0 字节" in str([m for m in t.messages
+                                     if m.get("role") == "user"][-1]["content"])
+    assert helpers.structure_ok(t.messages)[0]
+
+
+def test_a_running_task_still_cannot_be_resumed(model, slow):
+    """**别把闸门整个拆了**:正在跑的还是不能"续" —— 它不需要答复,插话走 tell。"""
+    slow["delay"] = 0.8
+    model.set(*[("干着。", [model.call("get_current_time")], "")] * 6)
+    tid = tasks.dispatch("慢慢干", fs=helpers.grant(), wait=False)["task_id"]
+    slow["entered"].wait(10)
+
+    out = tasks.resume(tid, answer="接着做", wait=False)
+    slow["delay"] = 0.0
+
+    assert out["status"] == "error"
+    tasks.kill(tid)
+    helpers.wait_status(tid, ("closed", "done"))
+
+
+def test_a_closed_report_tells_the_main_agent_it_can_be_revived(model):
+    """主 agent 是通过 `task_status` 那段话知道"还能不能接"的 —— 它原来只说
+    "已经收场了,`/subtasks all` 能翻到它",于是主 agent 以为没救了(实测:转头重派)。"""
+    model.reply("干完了。")
+    tid = tasks.dispatch("干活", fs=helpers.grant(), wait=False)["task_id"]
+    helpers.wait_status(tid, ("done", "failed"))
+    tasks.finish(tid, "accept")
+
+    msg = tasks.report(tasks.get(tid))["message"]
+
+    assert "resume_task" in msg, "得说清怎么把它叫起来"
+    assert "还在盘上" in msg
+
+
 # ============================== 重启之后 ==============================
 
 
