@@ -1,14 +1,19 @@
-"""子 agent 的上下文**不会**漏给主 agent —— 这条要由测试钉住,不能靠"设计上应该不会"。
+"""上下文不串:**子 agent 的不会漏给主 agent,上一个会话的也不会跟过来。**
 
-主 agent 拿到的**只有 `report()` 那一段**(结论/产出/没做成的/存疑,截断到 4000 字)。
-子 agent 的完整对话落在 `sessions/<会话>/tasks/<id>/`,那在**工作区之外** —— 模型的文件
-工具够不到(见 `core.safe_path`),所以"主 agent 去读子 agent 的全部上下文"这条路不存在。
+**子 agent → 主 agent**:主 agent 拿到的**只有 `report()` 那一段**(结论/产出/没做成的/
+存疑,截断到 4000 字)。子 agent 的完整对话落在 `sessions/<会话>/tasks/<id>/`,那在
+**工作区之外** —— 模型的文件工具够不到(见 `core.safe_path`),所以"主 agent 去读子 agent
+的全部上下文"这条路不存在。
 
-**这种隔离最容易被一次"顺手加个便利"破坏**:比如报告里塞一句"细节去读 <那个路径>",
-或者某个工具为了省事直接用 `open()` 而不走 `safe_path`。而破坏之后**不会报错** ——
-只会让子 agent 读过的整片上下文(几十万 token)悄悄倒进主 agent 最宝贵的那个上下文里。
-所以这里钉两件事:①**读不到**;②报告里**不出现**那些路径 —— 出现了就等于告诉了模型一个
-它够不到的地方,而它够不到的时候倾向于编。
+**旧会话 → 新会话**:`/switch` 会把旧对话整段删掉再装上新的历史,所以模型**看不见**上一个
+会话的任何内容(见 test_switching_sessions_does_not_drag_the_old_conversation_along)。
+这也决定了 `switch_notice.md` 该怎么写:它不能指一个模型看不见的东西。
+
+**这两种隔离最容易被一次"顺手加个便利"破坏**:比如报告里塞一句"细节去读 <那个路径>",
+切换时"顺便把旧对话留着好让它有连续性",或者某个工具为了省事直接用 `open()` 而不走
+`safe_path`。破坏之后都**不会报错** —— 只会让几十万 token 悄悄倒进主 agent 最宝贵的那个
+上下文里。所以这里钉三件事:①**读不到**;②报告里**不出现**那些路径(出现了就等于告诉
+模型一个它够不到的地方,而它够不到的时候倾向于编);③切换后**旧内容不在**。
 """
 from __future__ import annotations
 
@@ -150,6 +155,55 @@ def test_a_failed_task_report_does_not_hand_out_paths_either(model):
 
     assert "boom" in msg, "错误内容要带过来"
     assert "messages.jsonl" not in msg and "sessions" not in msg
+
+
+def test_switching_sessions_does_not_drag_the_old_conversation_along(monkeypatch):
+    """**切换会话后,上一个会话的对话不在上下文里。**
+
+    用户问过这个:`switch_notice.md` 里那句"和刚才那段无关"是什么意思?
+
+    答案是**它指了一个模型看不见的东西**:切换时 `cmd_switch` 会把旧对话整段删掉
+    (`del ctx.messages[kept:]`)再装上新的历史,所以那会儿模型手里只有
+    [系统提示词] + [新会话的历史] + [切换提示]。它**感知不到**上一个会话。
+
+    所以那句提示没有意义(在"忘掉一个看不见的东西"),而且有点危险 —— 它在暗示
+    "有一段你该知道的内容",模型可能顺着这个暗示去向用户交代"刚才那段我不记得了",
+    或者更糟:编一段出来。**该说的是"上面那段是这个会话的历史、接不上就问"**。
+    """
+    from agent import session as store
+    from agent.commands import Context, dispatch as cmd
+    from agent.tools import vm as vm_tools
+
+    monkeypatch.setattr(store, "_current_session", None)
+    monkeypatch.setattr(store, "_resolve_note", "")
+    monkeypatch.setattr(vm_tools, "VM_AUTOSTART", False)   # 别在测试里真去起虚拟机
+
+    old_session = store.current_session_id()
+    new_session = store.new_session_id()
+    store.register_session(new_session)
+    store.append_messages([{"role": "user", "content": "新会话的一句家常话"}],
+                          new_session)
+
+    # **关键是这里**:得让 messages 里真的装着"我刚才在旧会话聊的那些" ——
+    # 只把旧内容写进盘上的文件是不够的(那样"删不删"都不影响测试,测了个空)。
+    # 这一版最初就是这么写的,靠变异检验才发现(见 git log)。
+    messages: list[dict] = [
+        {"role": "system", "content": "主系统提示词"},
+        {"role": "user", "content": "旧会话的机密:代号紫罗兰"},
+        {"role": "assistant", "content": "记住了。"},
+    ]
+    store.append_messages(messages[1:], old_session)      # 旧会话那边也确实存过
+
+    with use(_main_ctx()):
+        cmd(f"/switch {new_session}", Context(messages=messages))
+
+    joined = "\n".join(str(m.get("content")) for m in messages)
+    assert "新会话的一句家常话" in joined, "新会话的历史该在"
+    assert "代号紫罗兰" not in joined, "**旧会话的内容跟过来了** —— 那才是真的串了"
+    assert "记住了" not in joined, "旧会话的回复也不该在"
+    assert messages[-1]["role"] == "system" and new_session in messages[-1]["content"]
+    assert "接不上就直接问" in messages[-1]["content"], \
+        "提示该给的是「接不上就问」,不是去指一段它看不见的对话"
 
 
 def test_the_notice_into_the_main_agent_is_the_same_clipped_report(model):
