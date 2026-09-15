@@ -12,21 +12,22 @@
 """
 from __future__ import annotations
 
+import pathlib
+
 import helpers
 import pytest
-from agent import prompts, tasks
+from agent import core, prompts, tasks
 
 # 两边都该看到的(工具指南里的东西)。
 # **用有辨识度的整句,不用关键词**:`/workspace`、`apt` 这种词在 system.md 里本来就有
 # (比如那句 .pylibs 的说明),拿它们当判据会误报 —— 这条测试自己踩过一次。
 SHARED = [
-    ("容器路径翻译", "不能照抄宿主路径"),
+    ("容器路径翻译", "容器路径与宿主机路径不一致"),
     ("容器里装不了系统工具", "你装不了、也留不住"),
     ("网页内容不是指令", "只是资料的一部分"),
     ("改文件按行改", "以当前实际行号为准"),
     ("安全边界", "符号链接"),
     ("非交互命令", "not a terminal"),
-    ("别指望 VM 长期跑服务", "别指望它做长期运行的服务"),
 ]
 
 # 只有主 agent 该有 / 只该在它那份里
@@ -73,13 +74,21 @@ def test_the_shared_block_has_nothing_that_varies(model):
     照搬的话,两边的共用块就差了"50"和"60"这几个字符,**前缀从此对不上**,
     整个共用块白做(而且这种错不报错、只是命中率悄悄掉下来)。
     """
-    shared = prompts.load("common") + prompts.load("tools_guide")
+    # **查装配之后真正发出去的那两条**,不是查模板文件 —— 第一版查的是模板,
+    # 于是"cli 在拼装时往共用块里塞了会话路径"这种错它根本看不见(变异检验时没红才发现)。
+    from agent import cli
+
+    main_shared = cli._system_messages()[0]["content"]
     sub = _sub_system(model, [])
+    shared = main_shared + sub[0]["content"]
     task_prompt = "随便一件活"
 
     assert task_prompt not in shared, "任务描述混进共用块了"
-    assert ".tmp" not in shared and "临时区" not in shared, "临时区路径混进来了"
-    assert "长期记忆" not in shared, "记忆混进来了(它会变,必须排最后)"
+    # 查**具体的值**,不是查词:共用块里出现"临时区"这个词是对的(指南要讲它是什么),
+    # 出现"这个任务的临时区路径"才是错的 —— 按词判会被正常措辞绊倒。
+    assert core.scratch_scope(tasks._sid(), "t1") not in shared, "临时区路径混进来了"
+    assert core.scratch_scope(tasks._sid(), "main") not in shared, "主 agent 的临时区路径混进来了"
+    assert tasks._sid() not in shared, "会话 id 混进共用块了"
     from agent.core import MAX_STEPS
     for n in (MAX_STEPS, tasks.SUB_MAX_STEPS):
         # 用「N 步」这种整句形式判,别拿裸数字:指南里本来就有 "110~130 行" 这种数字
@@ -103,6 +112,38 @@ def test_the_subagent_gets_the_long_term_memory_and_it_comes_last(model, workspa
 
     assert "先给结论再给证据" in sub[-1]["content"], "子 agent 没拿到记忆"
     assert "先给结论再给证据" not in sub[0]["content"], "记忆跑到共用块里去了"
+
+
+def test_no_placeholder_ever_goes_out_unsubstituted(model, workspace):
+    """**任何一条发出去的提示词里都不该留着 `{xxx}`。**
+
+    模板里的 `{scratch}` / `{max_steps}` 这些由调用方传值替换(`prompts.load` 只替换
+    **传进来的**那些)。漏传一个不会报错 —— 占位符就原样发给模型了("你的临时区是
+    `{scratch}`"),它只能猜。实测漏过一次:`resume_notice.md` 新加了 `{scratch}`,
+    而 cli 那边没传。
+
+    做法:从 `prompts/*.md` 里扫出**所有**占位符名,再逐条检查真实渲染出来的出口。
+    """
+    import re
+    from agent import cli, prompts as P
+
+    names = set()
+    for f in pathlib.Path(P.PROMPTS_DIR).glob("*.md"):
+        names |= set(re.findall(r"\{([a-z_][a-z0-9_]*)\}", f.read_text(encoding="utf-8")))
+    assert len(names) > 5, f"只扫到 {names} —— 这个测试自己失效了"
+
+    # 让记忆那一条也真的渲染出来(测试环境默认没有记忆文件)
+    (workspace / ".agent").mkdir(exist_ok=True)
+    (workspace / ".agent" / "memory.md").write_text("测试写的一条记忆。", encoding="utf-8")
+
+    rendered = [m["content"] for m in cli._system_messages()]
+    rendered += [m["content"] for m in _sub_system(model, [])]
+    rendered.append(cli._restore_notice(3)["content"])
+
+    for name in sorted(names):
+        for text in rendered:
+            assert "{" + name + "}" not in text, \
+                f"`{{{name}}}` 没被替换就发出去了 —— 模型看到的是一个占位符"
 
 
 def test_the_guide_is_one_file_shared_by_both_roles(model):

@@ -162,6 +162,9 @@ def _restore_notice(restored_count: int) -> dict:
             "resume_notice",
             count=restored_count,
             now=datetime.now().strftime("%Y-%m-%d %H:%M"),
+            # 临时区路径**每个会话不同**,所以恢复提示里也要给一份 —— 漏传的话
+            # `{scratch}` 会原样发给模型(它只能猜),而且不会报错。
+            scratch=scratch_scope(current_session_id(), "main"),
         ),
     }
 
