@@ -69,9 +69,23 @@ def _qemu_pid_file(sid: str) -> Path:
 
 VM_VMSERVER_PORT = 40000                            # vmserver 在 guest 内监听的端口(固定)
 VM_CMD_TIMEOUT = int(os.environ.get("VM_CMD_TIMEOUT", "60"))     # vm_run 默认额度(秒)
-# 长任务额度,给 3 小时。是折中而不是"永不超时":vmserver 每条连接一个线程,超时是回收
-# 挂死命令的唯一机制 —— 一条等输入的 cat 会一直占着线程,而调用方早忘了它。
-VM_LONG_TIMEOUT = int(os.environ.get("VM_LONG_TIMEOUT", "10800"))
+# 长任务额度。这个数**不是**"一条命令最多能跑多久"的期望值,而是"用户可以等多久不被吓到"
+# 的期望值 —— 额度多长,用户就可能对着一个毫无反应的终端坐多久,原因有两条:
+#
+#   1. 主线程整段阻塞在这个 socket 读里,期间**按 Ctrl+C 没有任何反应**。实测:真控制台
+#      Ctrl+C 投递给了进程,但 Windows 上没有 POSIX 的 EINTR 去打断 select/recv,而
+#      KeyboardInterrupt 只在主线程**回到 Python 字节码**时才抛得出来 —— 阻塞的 C 调用
+#      中途不检查,异常就困在里面(连按两次也不会强制退出,同样实测过)。
+#   2. 命令的输出是一整块在结束时才返回的(vmserver 收完才 respond),中途一个字都没有。
+#
+# 所以原来那个 3 小时是错的:真需要跑几十分钟的活应该丢后台 + 轮询日志,而不是让人干等
+# —— 那才是这套机制该用的地方(见 vm_run 的工具说明)。同时这仍是**唯一**的回收机制
+# (vmserver 每条连接一个线程,一条等输入的 cat 会一直占着),所以也不能设成永不超时。
+VM_LONG_TIMEOUT = int(os.environ.get("VM_LONG_TIMEOUT", "600"))
+# 常驻转发(vm_tunnel)的空闲超时,和上面的命令额度是**两回事**,别跟着一起改小:
+# 它要覆盖的是"SSH 挂着一动不动"这种常态,超时到了会被单向关掉、会话莫名其妙卡死
+# (原值 60 秒时踩过)。真断开时 recv 返回空串会正常收尾,不靠这个值兜底。
+VM_TUNNEL_IDLE_TIMEOUT = int(os.environ.get("VM_TUNNEL_IDLE_TIMEOUT", "10800"))
 
 _vm_port: int | None = None                        # 启动时动态分配,避免多开抢 2222
 _vm_token = ""                                     # 每启动随机生成、经串口注入 guest,服务端每次请求读它
@@ -474,11 +488,16 @@ def vm_status() -> str:
 
 @tool(
     agents=("main", "sub"),
+    # 数字用常量拼,别写死字面量 —— 写死过一个「上限 3 小时」,后来额度改了、说明没跟上,
+    # 模型照着这条说明去做计划,拿到的却完全是另一回事。
     description="在沙箱虚拟机里执行一条命令,通过 socket 连 guest 内的 vmserver 执行(JSON 协议,非 SSH)。"
                 "适合在隔离的完整系统里装软件、跑服务、做重活。若虚拟机还没就绪,会返回当前进度并让你稍后再试。"
-                "命令默认最长跑 60 秒;构建、测试、下载这类长任务传 long_lived=true(上限 3 小时)。"
-                "**特别久的活更推荐丢后台**:`nohup 命令 > /tmp/x.log 2>&1 &`,再隔一会儿查一次 —— "
-                "连接是短的,中途断了也不影响任务本身。"
+                f"命令默认最长跑 {VM_CMD_TIMEOUT} 秒;构建、测试、下载这类长任务传 long_lived=true"
+                f"(上限 {VM_LONG_TIMEOUT} 秒)。**再久的活一律丢后台**,别靠加大这个上限:"
+                "命令跑着的时候一个字都不输出,整个会话都停在那儿等它。"
+                "丢后台要写成 `(命令 > /tmp/x.log 2>&1 < /dev/null &)`,过一会儿读日志看结果 —— "
+                "**只加 `&` 是不够的**(它占着的管道没关,这个调用仍会一直等到超时才返回);"
+                "guest 里**没有 `nohup`**,别用它。"
                 "别用交互式命令(vim/top 等,它们没有终端会直接失败)。"
                 "路径注意:客户机是 Linux,路径风格与宿主不同(没有 D:\\ 那套)。",
     parameters={
@@ -490,7 +509,8 @@ def vm_status() -> str:
                     },
                     "long_lived": {
                         "type": "boolean",
-                        "description": "长任务模式:超时上限从 60 秒提到 3 小时。构建/测试/下载用",
+                        "description": f"长任务模式:超时上限从 {VM_CMD_TIMEOUT} 秒提到 "
+                                       f"{VM_LONG_TIMEOUT} 秒。构建/测试/下载用",
                     },
                 },
                 "required": ["command"],
@@ -502,7 +522,9 @@ def vm_run(command: str, long_lived: bool = False) -> str:
     vmserver 用无 TTY 的 subprocess 跑命令、自带超时(超时就 kill,返回 timed_out),
     所以交互程序(vim/top)会直接秒失败、不会卡死会话;命令输出是结构化 JSON,无壳提示符。
 
-    long_lived=True 把上限从 60 秒提到 3 小时,给构建/测试/下载这类长任务用。
+    long_lived=True 把上限从 VM_CMD_TIMEOUT 提到 VM_LONG_TIMEOUT,给构建/测试/下载这类
+    长任务用。**这不是"命令能跑多久"的旋钮** —— 等的时候主线程整段阻塞在这里,输出要等
+    命令结束才回来,所以再长的活应该丢后台 + 轮询日志(见常量那段的注释)。
     """
     st = vm_state_get()
     if st["status"] != "ready":
@@ -790,10 +812,11 @@ def _vm_proxy_relay(guest_port: int, client) -> None:
     import socket as sk, json
     try:
         up = sk.create_connection(("127.0.0.1", _vm_vmserver_host_port), timeout=10)
-        # 空闲超时给足(3 小时)。原来是 60 秒:HTTP 那种请求-响应太快、碰不到,但 SSH
-        # 这类长连接空闲一分钟就会被关掉方向、会话卡死。对端**真的**断开时 recv 会返回
-        # 空串正常收尾,不靠这个超时兜底,所以放大它是安全的。
-        up.settimeout(VM_LONG_TIMEOUT)
+        # 空闲超时给足(VM_TUNNEL_IDLE_TIMEOUT,3 小时),和 vm_run 的命令额度分开 ——
+        # 那个是"用户愿意等多久",这个是"SSH 挂着一动不动还能活多久",两个数没法共用。
+        # 原来是 60 秒:HTTP 那种请求-响应太快、碰不到,但 SSH 这类长连接空闲一分钟就会被
+        # 关掉方向、会话卡死。对端**真的**断开时 recv 会返回空串正常收尾,不靠它兜底。
+        up.settimeout(VM_TUNNEL_IDLE_TIMEOUT)
         req = {"token": _vm_token, "cmd": "proxy", "host": "127.0.0.1", "port": guest_port}
         up.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
         ack = json.loads(up.makefile("rb").readline().decode("utf-8", "replace"))
