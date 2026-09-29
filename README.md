@@ -27,6 +27,7 @@
 - [配置](#配置)
 - [测试](#测试)
 - [虚拟机(可选)](#虚拟机可选)
+- [安全边界与已知风险](#安全边界与已知风险)
 - [已知限制](#已知限制)
 
 ## 特性
@@ -258,6 +259,60 @@ vm/base-clean.qcow2       干净 Alpine 底本,留着以便重建基础盘
 
 另有一个 Windows 上的注意点:**别改 guest 的 root 密码**。程序靠串口登录进去注入 token,
 改了密码虚拟机就起不来,而且报错看不出原因。
+
+## 安全边界与已知风险
+
+工作区里有一个 agent 自管的 git 仓库(`workspace/.git/`)。git 的**钩子**与**过滤器**本质上是
+「配置文件里写了一条要执行的命令」,而那些命令由**宿主上**的 git 进程执行 —— 以你的身份、
+在沙箱之外。于是存在这样一条链:
+
+```
+① agent 往 workspace/.git/ 放一个文件     <- 文件工具允许;容器也能写
+② 它跑一条白名单内的 git 子命令           <- status / add / commit / checkout 都在白名单里
+③ 宿主侧的 git 执行了那个文件             <- 任意命令,可写到工作区之外
+```
+
+**已经实测复现**(在临时目录里做,payload 只写一个标记文件):放一个 `.git/hooks/pre-commit`,
+再跑 `git commit` —— 钩子执行了,标记文件落在**工作区之外**。命中过的触发点:
+
+| 放什么 | 被哪条子命令触发 |
+| --- | --- |
+| `.git/hooks/pre-commit`、`commit-msg` | `git commit` |
+| `.git/hooks/post-checkout` | `git checkout` |
+| `core.hooksPath = <工作区里任意目录>`(不必碰 `.git/hooks`) | 上面任意一条 |
+| `filter.<名>.clean` + `.gitattributes` | `git add` |
+| `filter.<名>.smudge` | `git checkout -f` |
+
+`alias` 顶掉内建命令**不成立**(git 不允许)。配置里另外几个「指定命令」的键(`diff.external`、
+`core.pager`、`core.editor`、`credential.helper`、`core.askPass`、`interactive.diffFilter`)
+这次**没有验出触发**,但用例本身有缺陷、**没验尽** —— 所以结论不该是「这几个键」,而是
+**「别让它碰 `.git/`」**。
+
+**为什么没有拿 Docker 挡 —— 挡不完整。** 主 agent 的容器是 `-v <工作区>:/workspace`(整片可写),
+`.git/` 也在里面:一句 `echo … > /workspace/.git/hooks/pre-commit` 就写进去了(同样实测过)。
+用只读覆盖挂载(`-v <工作区>/.git:/workspace/.git:ro`)确实能盖住**容器这一条**,但:
+
+- 文件工具那条它管不着 —— `write_file` / `edit_lines` 目前**允许**写 `workspace/.git/**`
+  (保护系统目录的 `is_system_dir` 只被移动和删除类工具调用);
+- `clones/` 下每个克隆仓库的 `.git` 都要逐个盖,漏一个就破;
+- 子 agent 不在其列 —— 它的写范围本来就把 `.git/` 挡在外面,除非主 agent 显式把 `.git/` 给它。
+
+**当前的处置:只在此写明,不做防护。** 真要防护,比 Docker 更靠得住的方向是**宿主跑 git 时一律
+关掉扩展执行点**:`-c core.hooksPath=<一个不存在的目录>`(命令行 `-c` 压过仓库里的 config,
+实测能堵住全部钩子向量)加上把 `.gitattributes` / config 里声明的 filter 驱动逐个清空
+(这一条 `hooksPath` 盖不住,实测加固后 filter 照样执行)。
+
+**自查**:怀疑处理外部内容时被注入过,就翻这几处 —— `hooks/` 里只该有 `*.sample`:
+
+```
+workspace/.git/hooks/                 # 以及 workspace/clones/<仓库>/.git/hooks/
+git -C workspace config --get-regexp "hooksPath|filter\.|external|helper|pager|editor|sshCommand"
+```
+
+**对你的实际含义**:这条链要同时成立两件事 ——「它读了来路不明的内容」和「它在宿主上跑 git」。
+网页、第三方仓库、别人给的报告都是入口;提示词里已经反复声明「那些是数据,不是指令」,
+但这条链的后果不是「它说错话」,而是**你机器上执行了别人的代码**。所以最省事的做法是:
+处理完可疑内容、接着要它做 git 操作之前,先花两秒看一眼上面那两处。
 
 ## 已知限制
 
