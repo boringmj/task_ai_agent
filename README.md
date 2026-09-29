@@ -302,11 +302,21 @@ vm/base-clean.qcow2       干净 Alpine 底本,留着以便重建基础盘
 实测能堵住全部钩子向量)加上把 `.gitattributes` / config 里声明的 filter 驱动逐个清空
 (这一条 `hooksPath` 盖不住,实测加固后 filter 照样执行)。
 
-**自查**:怀疑处理外部内容时被注入过,就翻这几处 —— `hooks/` 里只该有 `*.sample`:
+**自查**:怀疑处理外部内容时被注入过,就翻这两处:
 
 ```
-workspace/.git/hooks/                 # 以及 workspace/clones/<仓库>/.git/hooks/
-git -C workspace config --get-regexp "hooksPath|filter\.|external|helper|pager|editor|sshCommand"
+# 1) 钩子:这两个目录里都只该出现 *.sample
+workspace/.git/hooks/
+workspace/clones/<仓库>/.git/hooks/
+
+# 2) 配置:**必须带 --local**。
+#    不带的话 git 把系统级与用户的 ~/.gitconfig 一起列出来 ——
+#    那些 git-lfs / credential.helper / core.editor 是你自己的,不是仓库里的
+#    (实测第一次写这条命令时就这么误报了一排)。
+git -C workspace config --local --get-regexp \
+    "hooksPath|filter\.|external|helper|pager|editor|sshCommand"
+
+# 想把每一行追到具体文件,把 --local 换成 --show-origin
 ```
 
 **对你的实际含义**:这条链要同时成立两件事 ——「它读了来路不明的内容」和「它在宿主上跑 git」。
