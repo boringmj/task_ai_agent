@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import queue
+import signal
 import sys
 import threading
 from datetime import datetime
@@ -216,6 +217,35 @@ _IDLE = _Idle()
 _INPUT: "queue.Queue" = queue.Queue()
 
 
+def _stdin_reader_loop() -> None:
+    """读 stdin,把整行塞进 `_INPUT`;真正的 EOF 塞 `None`。
+
+    **空串不一定是 EOF —— 这是这里最容易写错的一处。** Ctrl+C 会让控制台的那次读
+    提前返回空串(实测:偶发,取决于按下时线程是否正卡在读里)。要是把它当 EOF,
+    主循环就会走"再见。break" —— 表面上就是"按 Ctrl+C 程序直接退了",而且**按几次
+    都一样**,因为读线程已经退出了。
+
+    区分办法:立刻**再读一次**。
+      · 真 EOF(stdin 关了 / Ctrl+Z):再读还是立刻返回空串;
+      · 假 EOF(被 Ctrl+C 打断):再读会**阻塞**等下一行 —— 正是我们要的。
+    所以不需要超时、不需要轮询,这个重读本身就区分了两种情况。
+    """
+    while True:
+        try:
+            line = sys.stdin.readline()
+        except Exception:  # noqa: BLE001 - 读崩了按 EOF 处理
+            line = ""
+        if line == "":
+            try:
+                line = sys.stdin.readline()      # 重读一次,见上面的说明
+            except Exception:  # noqa: BLE001
+                line = ""
+            if line == "":
+                _INPUT.put(None)                 # 连续两次空串 → 真 EOF
+                return
+        _INPUT.put(line)
+
+
 def _start_input_reader() -> None:
     """把 stdin 的读取挪进一条后台线程。
 
@@ -227,17 +257,8 @@ def _start_input_reader() -> None:
     读取线程只负责把整行塞进队列,**不打印任何东西**,也不做任何解析 —— 提示符、
     多行规则、Ctrl+C 全留在主线程(不然两条线程都会碰终端)。
     """
-    def run() -> None:
-        while True:
-            try:
-                line = sys.stdin.readline()
-            except Exception:  # noqa: BLE001 - 读崩了就当作 EOF
-                line = ""
-            _INPUT.put(None if line == "" else line)
-            if line == "":
-                return
-
-    threading.Thread(target=run, daemon=True, name="stdin-reader").start()
+    threading.Thread(target=_stdin_reader_loop, daemon=True,
+                     name="stdin-reader").start()
 
 
 def _take_line(timeout: float):
@@ -257,17 +278,20 @@ def _read_multiline(prompt: str = "你 > "):
     例外:**第一行本身就是终端指令**(以 / 开头)或裸的 exit/quit 时,回车即执行,
     不必再敲空行 —— 指令天生是单行的,逼人多按一次回车只会烦人。
 
-    **Ctrl+C 只清空当前输入,不退出程序** —— 要连按两次才退(第一次清空并提示,
-    第二次才返回 None)。为什么改成这样:**中断的落点不由用户决定** —— 主线程卡在长
-    阻塞调用里时中断会挂起,等调用返回时往往正好落在提示符上(实测:VM 任务/模型请求
-    期间按的那一下,最后落在这一段)。原来"提示符下 Ctrl+C = 退出",于是用户只是想把
-    刚才那一轮停下来,结果整个程序退了。第一次只清行 + 提示,就把"迟到的中断"降级成
-    一个无害的动作。
+    **Ctrl+C 只清空当前输入,永不退出程序。** 退出只有两个入口:`/exit`(或裸敲
+    exit/quit)、以及 Ctrl+D / Ctrl+Z 这种真正的 EOF。
 
-    返回:输入文本 / `None`(该退出)/ `_IDLE`(先别等了,回去处理子 agent 的事)。
+    为什么走到这么绝对:**中断的落点不由用户决定** —— 主线程卡在长阻塞调用里时,
+    中断会挂起,等调用返回才落地,而那时程序往往已经回到提示符了(VM 任务/模型请求
+    期间按的那一下,实测就落在这里)。原来"提示符下 Ctrl+C = 退出",于是用户只是想把
+    刚才那一轮停下来,结果整个程序退了。上一版改成"连按两次退出",但**连按两次本来就是
+    人在着急时的习惯动作** —— 只要有任一 Ctrl+C 能退出,这个问题就还会以别的样子回来。
+    所以干脆让 Ctrl+C 在任何位置都只做打断/清行。
+
+    返回:输入文本 / `None`(**真正的 EOF**,该退出)/ `_IDLE`(先别等了,回去处理
+    子 agent 的事)。
     """
     lines: list[str] = []
-    armed = False        # 已经按过一次 Ctrl+C;再按一次才真的退出
     need_prompt = True   # 初次进入、以及每次被打断后,都要补一个提示符
 
     while True:
@@ -304,7 +328,6 @@ def _read_multiline(prompt: str = "你 > "):
             if line in {"\n", "\r\n"}:  # 空行 = 提交
                 break
             lines.append(line.rstrip("\r\n"))
-            armed = False           # 用户又输入了 → 重新计数(不会"隔很久再按一次就退")
             if len(lines) == 1 and (lines[0].lstrip().startswith("/")
                                     or lines[0].strip().lower() in _EXIT_WORDS):
                 break               # 指令:回车即走,连续行提示符都不打
@@ -315,15 +338,19 @@ def _read_multiline(prompt: str = "你 > "):
             # 打断的是"这段输入",不是"整个程序"。恢复打印用裸 write(不走 Rich):
             # 这时可能刚被打断在 console.print 的 os.get_terminal_size() 里,
             # 再走一次 Rich 有二次异常的风险。
+            #
+            # **这里不返回 None** —— 不管按几次都不退出(见函数开头那段说明)。
+            # 中断可能是一次、也可能是几次积压后一起落地,按次数区分没有意义。
             sys.stdout.write("\n")
-            if armed:
-                return None                     # 连按两次 → 真的退出
-            armed = True
             if lines:
                 lines.clear()
-                sys.stdout.write("(已清空输入;再按一次 Ctrl+C 退出)\n")
+                sys.stdout.write("(已清空输入;Ctrl+C 不会退出程序,退出用 /exit)\n")
             else:
-                sys.stdout.write("(再按一次 Ctrl+C 退出)\n")
+                sys.stdout.write("(Ctrl+C 只打断当前操作,不会退出;退出用 /exit)\n")
+            # **必须立刻 flush**:这个提示是写给"正着急按 Ctrl+C 的人"看的,
+            # 而 stdout 被重定向成管道时是块缓冲 —— 不 flush 的话它要等到下次
+            # 缓冲满了才出现(实测:连按三次都看不到这行)。
+            sys.stdout.flush()
             need_prompt = True                  # 补回提示符,接着读
             continue
 
@@ -494,9 +521,13 @@ def _run_turn(messages: list[dict], text: str | None) -> None:
 
 def _session_loop() -> None:
     _make_stdio_forgiving()
-    # stdin 的读取挪到后台线程 —— 主线程才有机会「等输入,但定期醒来看子 agent」
-    # (见 _start_input_reader 的说明)。必须在任何读输入之前起。
-    _start_input_reader()
+    # **读线程要等启动完再起**(见下面主循环前的那一处)。这里先不碰它。
+    #
+    # 原来是在这儿起的,结果实测出一个很难查的问题:启动期(导入/恢复会话/Docker 探活,
+    # 几秒)如果按了 Ctrl+C —— 这时中断被忽略,可**控制台那次读已经被打断了** ——
+    # 读线程会把后续的读全部当成 EOF,主循环一启动就拿到 None,直接 `再见。`。
+    # 表现出来就是"启动时按了下 Ctrl+C,程序没了"。读线程在没有输入可读的时候才起,
+    # 就不存在"被启动期的中断打断"这回事。
     messages: list[dict] = _system_messages()
     # 定下本次的活跃会话。规则(见 session._resolve_session):接回本工作区最后跑过的
     # 那一个,但**如果它正被另一个活着的 agent 用着,就另开一个新的**,不去抢 ——
@@ -529,8 +560,8 @@ def _session_loop() -> None:
             console.print(f"VM:{vm_autostart_note()}", style="dim")
     except Exception as exc:  # noqa: BLE001
         console.print(f"VM:启动失败(不影响 agent)—— {exc}", style="yellow")
-    console.print("多行输入用空行提交;执行中 Ctrl+C 取消本轮,"
-                  "提示符下连按两次 Ctrl+C 退出。", style="dim")
+    console.print("多行输入用空行提交;Ctrl+C 只打断当前操作,"
+                  "不会退出程序(退出用 /exit,或 Ctrl+D)。", style="dim")
     console.print("指令:" + "、".join(n for n, *_ in all_commands())
                   + f"(/help 有说明);上下文到 {AUTO_COMPACT_RATIO:.0%} 自动压缩。",
                   style="dim")
@@ -551,6 +582,13 @@ def _session_loop() -> None:
     loop.reconcile_announced(messages)
     _replay_history(history)   # 把上次对话按原样重放一遍，接着聊
     console.print()
+
+    # **启动完成,把 Ctrl+C 还给 REPL。** `agent.py` 在导入前把它设成了忽略 —— 那一段
+    # 没有任何东西接得住 KeyboardInterrupt(实测:启动后一两秒按 Ctrl+C,进程直接以
+    # 0xC000013A 退出)。从这里开始,中断由主循环接:清行 / 打断当前轮,**永不退出**。
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    # 读线程**在这里**才起:启动期的中断不会再打断它的控制台读(见本轮开头的说明)。
+    _start_input_reader()
 
     while True:
         try:
@@ -638,8 +676,16 @@ def _session_loop() -> None:
             # 兜底:任何没被 _run_turn 接住的中断(例如渲染 Markdown 那一下),
             # **不退出程序**。用户按 Ctrl+C 想停下的是刚才那一轮,不是关掉整个会话;
             # 而且这种"迟到"的中断多半是阻塞调用期间按的、直到这里才落地 —— 把它
-            # 当成"用户想退出"是误判。真要退出:/exit,或在提示符上连按两次 Ctrl+C。
-            console.print("\n[已打断]", style="dim")
+            # 当成"用户想退出"是误判。退出只有 /exit 与真正的 EOF。
+            #
+            # 这里的打印**自己也要包一层**:连按的时候,第二个中断可能正好在
+            # "处理第一个中断"的这段时间里落地 —— 那会从这个 except 里逃出去、
+            # 一路穿出主循环,进程就崩了(还是"Ctrl+C 把程序弄没了",只是换了条路)。
+            try:
+                sys.stdout.write("\n[已打断]\n")
+                sys.stdout.flush()
+            except KeyboardInterrupt:
+                pass
             continue
 
 

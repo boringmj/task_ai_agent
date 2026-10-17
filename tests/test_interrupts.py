@@ -4,7 +4,8 @@
 常常正好在提示符上。原来"提示符下 Ctrl+C = 退出",于是用户只是想把刚才那一轮停下来,
 整个程序却退了。这里把新的语义钉住:
 
-    · 提示符下第一次 Ctrl+C 只清空输入(并提示),第二次才退出;
+    · **任何 Ctrl+C 都不退出程序**:提示符下只清空输入,按几次都一样;
+    · 退出的入口只有 /exit 与真正的 EOF(Ctrl+D / Ctrl+Z);
     · 一轮执行中被打断 → 本轮收尾,程序继续;
     · 后台子 agent 叫醒的那条入口和用户入口**走同一个受保护函数**(原来那条是裸的)。
 """
@@ -32,26 +33,82 @@ class _Take:
 
 # ---------------------------------------------------------------- 提示符
 
-def test_first_ctrl_c_only_clears_the_line(monkeypatch):
-    """第一次只清空 + 提示,继续读 —— 不返回 None(那是退出信号)。"""
+def test_ctrl_c_only_clears_the_line(monkeypatch):
+    """只清空 + 提示,继续读 —— 不返回 None(那是退出信号)。"""
     monkeypatch.setattr(cli, "_take_line", _Take([KeyboardInterrupt, "\n"]))
     assert cli._read_multiline("> ") == ""
 
 
-def test_second_consecutive_ctrl_c_exits(monkeypatch):
-    monkeypatch.setattr(cli, "_take_line",
-                        _Take([KeyboardInterrupt, KeyboardInterrupt]))
+def test_ctrl_c_never_exits_no_matter_how_many_times(monkeypatch):
+    """按几次都一样 —— 连按本来就是人着急时的习惯动作,不能拿次数当退出条件。"""
+    monkeypatch.setattr(
+        cli, "_take_line",
+        _Take([KeyboardInterrupt, KeyboardInterrupt, KeyboardInterrupt, "hello\n"]),
+    )
+    assert cli._read_multiline("> ") == "hello"
+
+
+def test_ctrl_c_clears_what_was_already_typed(monkeypatch):
+    """被打断前的半截输入不提交(否则会悄悄发出去一段没写完的话)。"""
+    monkeypatch.setattr(
+        cli, "_take_line", _Take(["half typed\n", KeyboardInterrupt, "\n"]),
+    )
+    assert cli._read_multiline("> ") == ""
+
+
+def test_a_real_eof_still_exits(monkeypatch):
+    """退出入口不能被堵死:Ctrl+D / Ctrl+Z 的 EOF 仍然返回 None。"""
+    monkeypatch.setattr(cli, "_take_line", _Take([None]))
     assert cli._read_multiline("> ") is None
 
 
-def test_typing_resets_the_double_press(monkeypatch):
-    """中间输入过东西,下一次 Ctrl+C 就重新算"第一次",不能算连按。"""
-    monkeypatch.setattr(
-        cli, "_take_line",
-        _Take([KeyboardInterrupt, "hello\n", KeyboardInterrupt, "\n"]),
-    )
-    # 第二次中断把已输入的内容清掉,然后正常提交 → "";关键是不是 None(没退出)
-    assert cli._read_multiline("> ") == ""
+# ---------------------------------------------------------------- stdin 读线程
+
+class _FakeStdin:
+    """按脚本返回行;脚本用完 = 真 EOF。"""
+
+    def __init__(self, script):
+        self.script = list(script)
+
+    def readline(self):
+        if not self.script:
+            return ""
+        item = self.script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+def _drain_input():
+    while not cli._INPUT.empty():
+        cli._INPUT.get_nowait()
+
+
+def test_an_interrupted_console_read_is_not_treated_as_eof(monkeypatch):
+    """**这就是"按 Ctrl+C 程序直接退了"的真凶。**
+
+    Ctrl+C 会让控制台的那次读提前返回空串;如果把它当 EOF,读线程会推一个 None
+    然后退出,主循环立刻走 `再见。break` —— 而且之后再按都没用(线程已经没了)。
+    """
+    import sys as _sys
+    _drain_input()
+    monkeypatch.setattr(_sys, "stdin", _FakeStdin(["", "hello\n"]))
+    cli._stdin_reader_loop()                     # 脚本用完后才遇到真 EOF
+
+    got = []
+    while not cli._INPUT.empty():
+        got.append(cli._INPUT.get_nowait())
+    # 第一项必须是读到的那一行,不能是 None(假 EOF 被吞掉)
+    assert got[0] == "hello\n"
+    assert got[-1] is None                       # 真正的 EOF 仍然送到
+
+
+def test_two_consecutive_empty_reads_are_a_real_eof(monkeypatch):
+    import sys as _sys
+    _drain_input()
+    monkeypatch.setattr(_sys, "stdin", _FakeStdin([]))
+    cli._stdin_reader_loop()
+    assert cli._INPUT.get_nowait() is None
 
 
 # ---------------------------------------------------------------- 一轮的执行
