@@ -36,6 +36,11 @@ WS.mkdir(parents=True)
 shutil.copytree(REPO / "prompts", PROJ / "prompts")
 os.environ["AGENT_PROJECT_DIR"] = str(PROJ)
 os.environ["AGENT_SESSIONS_DIR"] = str(_TMP / "sessions")
+# **工作区名也要钉死。** 不钉的话,开发者 `.env` 里的 AGENT_WORKSPACE 会被 load_dotenv()
+# 读进来:core.ROOT 变成 PROJ/<那个名字>,而测试里的 WS 固定是 PROJ/workspace ——
+# 于是断言全在错的地方找文件。实测踩过:`.env` 写了 AGENT_WORKSPACE=temp 之后挂了 4 条
+# (临时区挂载、权限授予、记忆注入),看着像功能坏了,其实只是测试在自说自话。
+os.environ["AGENT_WORKSPACE"] = "workspace"
 os.environ["DEEPSEEK_API_KEY"] = "sk-fake-tests-never-used"
 os.environ["MODEL"] = "fake"
 os.environ["SUBAGENT_MAX_STEPS"] = "20"      # 测试里的脚本都很短,步数上限调小更早暴露问题
