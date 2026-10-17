@@ -9,19 +9,23 @@
 """
 from __future__ import annotations
 
+import contextvars
 import importlib
 import json
+import queue
+import threading
 from pathlib import Path
 
 from .. import ctx
 
 _TOOL_FUNCS: dict[str, object] = {}   # 工具名 -> 实现函数
 _TOOL_AGENTS: dict[str, tuple] = {}   # 工具名 -> 谁能调用(默认授权)
+_TOOL_LONG_RUNNING: dict[str, bool] = {}   # 工具名 -> 是否按"长任务"执行(见 dispatch_interruptibly)
 _TOOLS: list[dict] = []               # 全部工具的 JSON schema(发给模型看)
 
 
 def tool(description: str, parameters: dict | None = None, name: str | None = None,
-         agents: tuple = ("main",)):
+         agents: tuple = ("main",), long_running: bool = False):
     """把一个函数登记为模型可调用的工具,并附上它的 JSON schema。
 
     description 写清楚"什么时候用它",模型选工具主要靠这段文字;parameters 是
@@ -34,6 +38,10 @@ def tool(description: str, parameters: dict | None = None, name: str | None = No
 
     **注意:这不影响发给模型的工具表。** 那张表是全局固定的(见 TOOLS 的注释),
     这里的声明只在**调用时**判 —— 授权是动态的,工具表不能是。
+
+    `long_running` 标的是"这个工具会阻塞好几秒到几分钟"。标了之后循环会把它放进
+    工作线程、主线程轮询等待 —— 不这样的话,等待期间 Ctrl+C 在 Windows 上根本按不动
+    (主线程卡在 C 调用里,中断出不来)。**只标真会久的**:每个工具一个线程,快工具不值得。
     """
     def decorate(fn):
         tool_name = name or fn.__name__
@@ -44,6 +52,7 @@ def tool(description: str, parameters: dict | None = None, name: str | None = No
             raise RuntimeError(f"工具 {tool_name} 的 agents 里有不认识的角色 {'、'.join(bad)}")
         _TOOL_FUNCS[tool_name] = fn
         _TOOL_AGENTS[tool_name] = tuple(agents)
+        _TOOL_LONG_RUNNING[tool_name] = bool(long_running)
         _TOOLS.append({
             "type": "function",
             "function": {
@@ -154,3 +163,72 @@ def dispatch(name: str, arguments: str) -> str:
         return str(func(**json.loads(arguments)))
     except Exception as exc:  # noqa: BLE001 - 任何异常都应该反馈给模型
         return f"错误:{type(exc).__name__}: {exc}"
+
+
+_LONG_POLL = 0.25       # 主线程多久回一次字节码(和 tasks.WAIT_POLL 一致)
+
+
+def is_long_running(name: str) -> bool:
+    """这个工具是不是标了 `long_running=True`(见 tool 的说明)。"""
+    return _TOOL_LONG_RUNNING.get(name, False)
+
+
+def dispatch_interruptibly(name: str, arguments: str) -> str:
+    """在后台线程里执行工具,主线程轮询等待 —— 让 Ctrl+C 在等待期间能落地。
+
+    **为什么需要**:Windows 上主线程阻塞在 C 调用(recv/wait)里时,KeyboardInterrupt
+    要等那个调用返回才会抛出来。容器命令这类长等待会让终端看起来"死了",按 Ctrl+C
+    也没反应(见 README 的「已知限制」)。把阻塞调用挪到工作线程、主线程每 0.25s 回一次
+    字节码,中断就能及时落地。
+
+    **ContextVar 不会跟着新线程走**(见 ctx.py 开头):必须把当前上下文复制过去,否则
+    工具会在**默认上下文**里执行 —— 权限、输出前缀、VM 授权全丢。这是这里最容易被
+    写错的一处。
+
+    取消:主线程被中断后,如果工具在 ctx 上挂了 `cancel` 钩子(容器工具挂的是
+    docker kill),就调它把后台的活停掉;然后**重新抛出** KeyboardInterrupt ——
+    由上层决定"本轮中止",而不是把中断吞掉让模型继续往下做。
+    """
+    me = ctx.current()
+    me.cancel_note = ""                  # 别让上一次的说明漏到这一次
+    box: queue.Queue = queue.Queue()
+    snapshot = contextvars.copy_context()
+
+    def worker() -> None:
+        try:
+            box.put(("ok", snapshot.run(dispatch, name, arguments)))
+        except BaseException as exc:     # noqa: BLE001 - 交给主线程处理
+            box.put(("err", exc))
+
+    threading.Thread(target=worker, daemon=True, name=f"tool-{name}").start()
+    try:
+        while True:
+            try:
+                kind, value = box.get(timeout=_LONG_POLL)
+            except queue.Empty:
+                continue                 # 回到字节码 —— 中断在这里落地
+            if kind == "ok":
+                return value
+            raise value
+    except KeyboardInterrupt:
+        # 结果可能刚好回来:先非阻塞看一眼,别把成功的结果误报成"已取消"。
+        #
+        # 注意 `raise` 的位置:不能写在 `except queue.Empty` 里面 —— 那样裸 `raise`
+        # 重抛的是**Empty**(当前正在处理的异常),真实的 KeyboardInterrupt 就丢了。
+        # 实测就是这么翻的:测试里收到的异常是 _queue.Empty。
+        try:
+            kind, value = box.get_nowait()
+            arrived = True
+        except queue.Empty:
+            arrived = False
+        if arrived:
+            if kind == "ok":
+                return value
+            raise value
+        cancel = getattr(me, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()                 # 容器工具:docker kill;说明由钩子写进 cancel_note
+            except Exception:            # noqa: BLE001 - 取消失败也别再抛一个异常出来
+                pass
+        raise

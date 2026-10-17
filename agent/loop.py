@@ -10,7 +10,7 @@ from .core import (
 from .llm import stream_model, context_ratio, begin_turn
 from .tools.media import inject_pending_images
 from .tools.net import reset_turn_searches
-from .tools.registry import TOOLS, dispatch
+from .tools.registry import TOOLS, dispatch, dispatch_interruptibly, is_long_running
 
 def compact(messages: list[dict], keep_recent: int = 0) -> str:
     """把较早的对话压成一段摘要、替换掉那段历史 —— 释放上下文。
@@ -292,11 +292,15 @@ def run(user_input: str | None, messages: list[dict], max_steps: int | None = No
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # 长任务(容器命令)放工作线程执行,主线程轮询等 —— 否则等待期间
+            # 主线程卡在 C 调用里,Ctrl+C 出不来(见 dispatch_interruptibly)。
+            result = (dispatch_interruptibly(fname, fargs) if is_long_running(fname)
+                      else dispatch(fname, fargs))
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": call.get("id", ""),
-                    "content": dispatch(fname, fargs),
+                    "content": result,
                 }
             )
             _persist(messages[-1])

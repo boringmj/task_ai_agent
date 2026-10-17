@@ -65,6 +65,10 @@
   - 安装:`pip install --target /workspace/.pylibs 库名`(装这一个位置)
   - 使用:之后的 `run_python` 里直接 `import` 即可(已设 PYTHONPATH 指向它)
   - 查看已装:`pip list --path /workspace/.pylibs`
+  - **别用 `pip install --user`**:那是容器里的临时目录,容器一销毁就没了。
+- **命令默认最长跑 180 秒**,装大包/跑测试可以传 `timeout=600`(上限 1800)。
+  - 超时会被强杀,**工作区里可能只写了一半**;需要更多时间就带 `timeout` 重试,别反复用默认值试同一件事。
+  - pip 的下载缓存在工作区的 `.pip-cache` 里(容器销毁也还在),所以重试只补没下完的部分,通常更快。
 - **系统工具(apt 装的 curl/jq 等)你装不了、也留不住** —— 容器非 root(apt 被拒)、且即焚。所以需要系统能力时,**优先用 Python 库替代**:发请求用 `requests`,处理 JSON 用 Python 的 `json`,别找 `curl`/`jq`。别尝试 `apt-get`,会失败。
 - 结果会返回给你,但没有写入位置的文件,要用 `write_file` 之类把它存下来。
 - 容器中执行的代码和命令需要确保是**安全**或**可信任**的,**危险**或**不可信**必须使用虚拟机沙箱执行。

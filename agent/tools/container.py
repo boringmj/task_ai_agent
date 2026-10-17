@@ -24,11 +24,21 @@ from ..skills import CONTAINER_SKILLS_DIR, SKILLS_DIR
 CONTAINER_IMAGE = os.environ.get("DOCKER_IMAGE", "python:3.11-slim")
 # 容器里 pip 的安装目标(相对工作区)。它对**所有** agent 可写,理由见 _workspace_mounts。
 PYLIBS_REL = ".pylibs/"        # 末尾的 / 是"这是目录",见 ctx.FsGrant._within
+# pip 的下载缓存。**必须放在工作区里**:容器的 /tmp 是 tmpfs,容器一销毁缓存就没了 ——
+# 一次超时之后重试只能从头下载,大包会永远卡在时限上(实测默认 PyPI 下 numpy 要 94s,
+# 而容器默认时限是 60s,重试多少次都一样)。放在工作区里,重试只补没下完的部分。
+PIP_CACHE_REL = ".pip-cache/"
+# 可选的 pip 镜像。国内直连 PyPI 很慢(实测同一台机器:numpy 94s vs 清华源 4s),
+# 在 .env 里配 PIP_INDEX_URL 就能把安装时间压到秒级。留空 = 用官方 PyPI。
+PIP_INDEX_URL = os.environ.get("PIP_INDEX_URL", "").strip()
 # 容器内命令的硬超时:用 GNU timeout 在容器内部自我了断。
 # 即使 agent 进程崩溃,容器也能到点自毁并被 --rm 清掉,不会无限残留。
-CONTAINER_CMD_TIMEOUT = int(os.environ.get("DOCKER_CMD_TIMEOUT", "60"))
-# agent 侧再留一个稍长的兜底(subprocess 超时),万一容器内的 timeout 没生效仍能按名 kill。
-CONTAINER_TIMEOUT = CONTAINER_CMD_TIMEOUT + 8
+# 默认 3 分钟:装包、跑测试这类活在 60 秒里经常做不完,而超时被强杀之后重试很浪费时间。
+CONTAINER_CMD_TIMEOUT = int(os.environ.get("DOCKER_CMD_TIMEOUT", "180"))
+# 单条命令允许的上限。再长就别在一次工具调用里等 —— 应该拆开或者丢后台。
+CONTAINER_MAX_TIMEOUT = int(os.environ.get("DOCKER_MAX_TIMEOUT", "1800"))
+# 注:agent 侧的 subprocess 兜底超时不再单独定义 —— 它必须跟着**这一次调用**的
+# budget 走(见 _docker_run),固定成常量会让 `timeout=` 参数失效。
 CONTAINER_OUTPUT_MAX = int(os.environ.get("DOCKER_OUTPUT_MAX", "10000"))  # 输出进上下文的字符上限
 CONTAINER_MEMORY = os.environ.get("DOCKER_MEMORY", "1g")
 CONTAINER_CPUS = os.environ.get("DOCKER_CPUS", "2.0")
@@ -183,6 +193,10 @@ def _workspace_mounts() -> list[str]:
     writable = list(fs.write) + [s for s in fs.scratch if s not in fs.write]
     if PYLIBS_REL not in writable:
         writable.append(PYLIBS_REL)
+    # pip 缓存同理:受限的子 agent 也要能装包,而缓存目录不给写的话,pip 要么报错、
+    # 要么退回不缓存 —— 超时重试就又从零开始。
+    if PIP_CACHE_REL not in writable:
+        writable.append(PIP_CACHE_REL)
     prepare_scopes(tuple(writable))       # 不该由挂载来"顺手建",但漏了也得兜住
     for rel in writable:
         p = (ROOT / rel).resolve()
@@ -193,13 +207,22 @@ def _workspace_mounts() -> list[str]:
     return out
 
 
-def _docker_run(inner: list[str]) -> str:
-    """在容器里执行,安全项硬编码。inner 是镜像之后的命令(如 ['python','-c','...'])。"""
+def _docker_run(inner: list[str], timeout: int | None = None) -> str:
+    """在容器里执行,安全项硬编码。inner 是镜像之后的命令(如 ['python','-c','...'])。
+
+    `timeout` 是这条命令的时限(秒),默认 `CONTAINER_CMD_TIMEOUT`,上限
+    `CONTAINER_MAX_TIMEOUT` —— 装包/跑测试可以传长一点,但也别把一次工具调用拖成
+    半小时:它占着一个容器,而且等待期间 agent 没法继续做别的事。
+    """
     ok, err = docker_health()
     if not ok:
         return f"错误:Docker 不可用 —— {err}(启动 Docker Desktop 后重试)"
 
+    budget = CONTAINER_CMD_TIMEOUT if timeout is None else int(timeout)
+    budget = max(1, min(budget, CONTAINER_MAX_TIMEOUT))
+
     name = f"agent-exec-{uuid.uuid4().hex[:10]}"
+    pip_env = ["-e", f"PIP_INDEX_URL={PIP_INDEX_URL}"] if PIP_INDEX_URL else []
     cmd = [
         "docker", "run", "--rm",
         "--name", name,
@@ -214,6 +237,12 @@ def _docker_run(inner: list[str]) -> str:
         # PYTHONPATH 指向 workspace/.pylibs:agent 用 `pip install --target /workspace/.pylibs`
         # 装一次就永久保留(workspace 是宿主盘,不随容器销毁),之后每次 run_python 都能 import。
         "-e", "PYTHONPATH=/workspace/.pylibs",
+        # pip 的缓存落在工作区里(容器销毁后还在)+ 可选的国内镜像(见顶部说明)。
+        # 少一次版本检查请求、失败多重试几次 —— 都是为一件事:让安装在时限内跑完。
+        "-e", "PIP_CACHE_DIR=/workspace/.pip-cache",
+        "-e", "PIP_DISABLE_PIP_VERSION_CHECK=1",
+        "-e", "PIP_RETRIES=5",
+        *pip_env,
         *_workspace_mounts(), "-w", "/workspace",   # 挂法跟着授权走,见 _workspace_mounts
         # 技能目录**只读**挂进来:`:ro` 保证容器改不了它 —— 技能是项目里的事实来源,
         # 不该被跑在里面的代码篡改。技能自带的脚本因此能在容器里跑:
@@ -224,18 +253,45 @@ def _docker_run(inner: list[str]) -> str:
         # 容器内自毁:到 CONTAINER_CMD_TIMEOUT 由 GNU timeout 终止,不依赖 agent 进程活着。
         # 这样 agent 崩溃也不会留下收不掉的容器(否则 --rm 只会等容器自己退出)。
         # -k 5:若进程忽略了 SIGTERM,5 秒后强制 SIGKILL,避免 timeout 自己也挂住。
-        "timeout", "-k", "5", str(CONTAINER_CMD_TIMEOUT),
+        "timeout", "-k", "5", str(budget),
         *inner,
     ]
+
+    def _kill() -> None:
+        subprocess.run(["docker", "kill", name], capture_output=True, timeout=10)
+
+    me = ctx.current()
+
+    def _cancel() -> None:
+        """Ctrl+C 时由主线程调用(见 registry.dispatch_interruptibly)。"""
+        _kill()
+        # 这条说明会由 _abort_turn 写进 tool 结果 —— 只打在终端上模型是看不见的,
+        # 下一次请求它就会按"没跑成"重试。
+        me.cancel_note = ("（已取消:容器已终止,这条命令没有结果。"
+                          "如果它可能有副作用(写文件、发请求、改状态),"
+                          "继续之前先确认实际发生了什么。)")
+
+    me.cancel = _cancel                 # 阻塞执行期间暴露一个取消钩子
     try:
         r = subprocess.run(
             cmd, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=CONTAINER_TIMEOUT,
+            encoding="utf-8", errors="replace", timeout=budget + 8,
             stdin=subprocess.DEVNULL,  # 容器 stdin 直接给 EOF:交互式命令(input()、无参 cat)立即失败,不傻等
         )
     except subprocess.TimeoutExpired:
-        subprocess.run(["docker", "kill", name], capture_output=True, timeout=10)
-        return f"执行超时(>{CONTAINER_TIMEOUT}s),已终止容器。"
+        _kill()
+        return (f"执行超时({budget}s):容器已终止,这条命令没有结果。\n"
+                f"工作区里的改动可能只写了一半(命令是被强杀的);"
+                f"需要更长时间就带 timeout=... 重试。")
+    finally:
+        me.cancel = None
+
+    # GNU timeout 到点自己退出时返回 124;-k 强杀可能返回 137。两条都按"超时"报,
+    # 别让模型看到一句裸的 "exit 124" 还得自己猜。
+    if r.returncode in (124, 137):
+        return (f"执行超时({budget}s):容器已终止,这条命令没有结果。\n"
+                f"工作区里的改动可能只写了一半(命令是被强杀的);"
+                f"需要更长时间就带 timeout=... 重试。")
 
     out, err = r.stdout.strip(), r.stderr.strip()
     # 成功只返回 stdout(真正的结果);Docker 拉镜像的进度在 stderr,不该混进结果。
@@ -248,12 +304,16 @@ def _docker_run(inner: list[str]) -> str:
 
 @tool(
     agents=("main", "sub"),
+    # 长任务:走 dispatch_interruptibly,等待期间 Ctrl+C 能落地(见 registry)。
+    long_running=True,
     description="在安全的 Docker 隔离容器里执行一段 Python 代码。适合数据分析、计算、"
                 "处理工作区文件 —— 你已有的工具做不到的运算用这个。"
                 "容器只能访问工作区、非 root、无内核特权、资源封顶、超时强杀;"
                 "执行完容器即销毁,不会留下任何东西。"
-                "输出会截断到 1 万字符。需要第三方库时,可以先用 pip 装(容器断网则装不了,"
-                "但网络默认开启,可 pip install --user 所需库)。"
+                "输出会截断到 1 万字符。**要装库就装进持久目录**:"
+                "`pip install --target /workspace/.pylibs 库名` —— 装一次以后每次都能 import"
+                "(`--user` 会装进容器的临时目录,容器一销毁就没了)。下载缓存也在工作区里,"
+                "超时后重试不必从头下。"
                 "注意路径:容器里的工作区在 /workspace,代码里用相对文件名或 /workspace/... 路径,"
                 "别用文件工具返回的宿主路径(如 D:\\...),那在容器里不存在。",
     parameters={
@@ -262,24 +322,33 @@ def _docker_run(inner: list[str]) -> str:
                     "code": {
                         "type": "string",
                         "description": "要执行的 Python 代码,可以多行",
-                    }
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": f"这条命令的时限(秒)。默认 {CONTAINER_CMD_TIMEOUT},"
+                                       f"上限 {CONTAINER_MAX_TIMEOUT}。装包/跑测试可以给长一点",
+                    },
                 },
                 "required": ["code"],
             },
 )
-def run_python(code: str) -> str:
+def run_python(code: str, timeout: int | None = None) -> str:
     """在隔离容器里执行一段 Python 代码,只能访问工作区,不碰宿主其他内容。"""
     if not code.strip():
         raise ValueError("Python 代码不能为空")
-    return _docker_run(["python", "-c", code])
+    return _docker_run(["python", "-c", code], timeout=timeout)
 
 
 @tool(
     agents=("main", "sub"),
+    long_running=True,          # 见 run_python 上面的说明
     description="在安全的 Docker 隔离容器里执行一条 shell 命令。适合在环境里跑工具、"
                 "装包、查看容器内情况。容器只能访问工作区、非 root、无内核特权、资源封顶、"
                 "超时强杀,执行完即销毁。"
-                "输出截断到 1 万字符。注意:命令里访问的工作区之外的路径,是容器自己的文件系统,"
+                "输出截断到 1 万字符。**装 Python 库用**"
+                "`pip install --target /workspace/.pylibs 库名`(不是 `--user`:那是容器里的"
+                "临时目录,容器一销毁就没了)。下载缓存在工作区,超时后重试会更快。"
+                "注意:命令里访问的工作区之外的路径,是容器自己的文件系统,"
                 "不是你宿主的 —— 它动不了宿主。容器里的工作区在 /workspace,用相对名或 /workspace/... 路径,"
                 "别用宿主路径(如 D:\\...)。",
     parameters={
@@ -287,14 +356,20 @@ def run_python(code: str) -> str:
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "要执行的 shell 命令,例如 'ls -la' 或 'pip install --user pandas'",
-                    }
+                        "description": "要执行的 shell 命令,例如 'ls -la' 或 "
+                                       "'pip install --target /workspace/.pylibs pandas'",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": f"这条命令的时限(秒)。默认 {CONTAINER_CMD_TIMEOUT},"
+                                       f"上限 {CONTAINER_MAX_TIMEOUT}。装包/跑测试可以给长一点",
+                    },
                 },
                 "required": ["command"],
             },
 )
-def run_command(command: str) -> str:
+def run_command(command: str, timeout: int | None = None) -> str:
     """在隔离容器里执行一条 shell 命令,同样只访问工作区.给 agent 装包、跑工具。"""
     if not command.strip():
         raise ValueError("命令不能为空")
-    return _docker_run(["/bin/sh", "-c", command])
+    return _docker_run(["/bin/sh", "-c", command], timeout=timeout)

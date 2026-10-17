@@ -139,8 +139,9 @@ def abort_spy(monkeypatch):
     """把收尾动作换成计数器:不碰真实会话存储,也不打印。"""
     seen = {"repair": 0, "render": 0}
 
-    def repair(messages):
+    def repair(messages, note=""):
         seen["repair"] += 1
+        seen["note"] = note
         return 0                     # 没有悬空的 tool_calls
 
     monkeypatch.setattr(cli.session, "repair_dangling", repair)

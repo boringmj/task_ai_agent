@@ -210,7 +210,9 @@ sessions/               会话数据:对话历史 + 每会话一块虚拟机磁�
 | `AGENT_WORKSPACE` | `workspace` | 工作区目录,必须是项目内的子目录(多实例各自跑不同工作区时设它) |
 | `SEARCH_PROVIDER` / `SEARCH_API_KEY` | 无 | `bocha` / `tavily` / `duckduckgo`;不配则 `web_search` 直接报错,其余功能不受影响 |
 | `DOCKER_IMAGE` | `python:3.11-slim` | 容器镜像 |
-| `DOCKER_CMD_TIMEOUT` | `60` | 容器里一条命令的时限(秒) |
+| `DOCKER_CMD_TIMEOUT` | `180` | 容器里一条命令的默认时限(秒);也能在调用里传 `timeout` 临时放宽 |
+| `DOCKER_MAX_TIMEOUT` | `1800` | 单条命令允许的最大时限(秒) |
+| `PIP_INDEX_URL` | 空(官方 PyPI) | 容器里 pip 用的索引。国内建议配清华源 —— 实测 numpy:官方 94s、镜像 4s |
 | `VM_CMD_TIMEOUT` / `VM_LONG_TIMEOUT` | `60` / `600` | 虚拟机里一条命令的默认 / 长任务时限(秒)。**这是「用户愿意等多久」而不是「命令能跑多久」**:等的时候整个会话都停在那儿,再长的活该丢后台 + 轮询日志 |
 | `VM_AUTOSTART` | `0` | 会话启动时是否顺手把虚拟机拉起来 |
 | `VM_ACCEL` | `whpx` | 加速方式;没开 WHPX 就设 `tcg`(慢但通用) |

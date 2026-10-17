@@ -84,7 +84,7 @@ def is_system_message(m: dict) -> bool:
             and m["content"].startswith(SYSTEM_TAG))
 
 
-def repair_dangling(messages: list[dict]) -> int:
+def repair_dangling(messages: list[dict], note: str = "") -> int:
     """把**悬空的工具调用**补上一条结果(原地改),返回补了几条。
 
     什么时候会悬空:模型已经发出了 tool_calls、但结果还没写回对话时被打断了 ——
@@ -98,6 +98,10 @@ def repair_dangling(messages: list[dict]) -> int:
     - 已经跑完的工具调用,结果就在原地,一条都不会少
     - 那个被打断的,补一句"这步的结果未知"——**不编一个成功**,因为编了会让模型
       以为它做过了(而它可能连执行都没执行)
+
+    `note` 用于**比"不知道"更具体**的情形:比如容器命令被取消时已经确认
+    "容器已终止、没有结果"。有 note 就用它(它已经写清了状态),没有再退回到
+    那段通用说明。**这段话会进对话历史**,模型下一轮能看到。
     """
     added = 0
     i = 0
@@ -115,11 +119,13 @@ def repair_dangling(messages: list[dict]) -> int:
         # **补在已有结果之后**(插在 i+1 会把真的结果挤到它后面,顺序就乱了):
         # 工具结果的顺序该和 tool_calls 一致。
         for k, c in enumerate(missing):
+            content = note or (
+                "（这一步被打断了:工具到底执行没执行、结果是什么,都未知。"
+                "如果它可能有副作用(写文件、发请求、改状态),继续之前先确认"
+                "实际发生了什么。)")
             messages.insert(j + k, {
                 "role": "tool", "tool_call_id": c.get("id") or "",
-                "content": "（这一步被打断了:工具到底执行没执行、结果是什么,都未知。"
-                           "如果它可能有副作用(写文件、发请求、改状态),继续之前先确认"
-                           "实际发生了什么。)",
+                "content": content,
             })
             added += 1
         i = j + len(missing)

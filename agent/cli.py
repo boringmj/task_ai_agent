@@ -509,7 +509,13 @@ def _abort_turn(messages: list[dict],
     那个直接发给 API 会 400。对策是补一条说明:已经发生的照原样留着,被打断的那一步
     补一句"结果未知"(不编一个成功 —— 它可能压根没执行)。
     """
-    n = session.repair_dangling(messages)
+    # 长任务被取消时,工具会把**具体状态**挂在 ctx 上(如"容器已终止,这条命令没有
+    # 结果")。把它写进 tool 结果 —— 只打在终端上模型看不见,下一轮就会按"没跑成"重试。
+    me = ctx.current()
+    cancel_note = getattr(me, "cancel_note", "")
+    if cancel_note:
+        me.cancel_note = ""
+    n = session.repair_dangling(messages, note=cancel_note)
     if n:
         session.append_messages(messages[len(messages) - n:], current_session_id())
     console.print(note, style="bold red")
