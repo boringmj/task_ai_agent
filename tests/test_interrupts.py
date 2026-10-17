@@ -64,14 +64,26 @@ def test_a_real_eof_still_exits(monkeypatch):
 
 # ---------------------------------------------------------------- stdin 读线程
 
-class _FakeStdin:
-    """按脚本返回行;脚本用完 = 真 EOF。"""
+class _Stop(BaseException):
+    """让读线程停下来(loop 只 catch Exception,BaseException 会穿出去)。"""
 
-    def __init__(self, script):
+
+class _FakeStdin:
+    """按脚本返回行。脚本用完时:`stop=True` 抛 _Stop(控制台场景,循环不该结束),
+    否则返回空串(管道场景 = 真 EOF)。"""
+
+    def __init__(self, script, tty=False, stop=True):
         self.script = list(script)
+        self.tty = tty
+        self.stop = stop
+
+    def isatty(self):
+        return self.tty
 
     def readline(self):
         if not self.script:
+            if self.stop:
+                raise _Stop
             return ""
         item = self.script.pop(0)
         if isinstance(item, BaseException):
@@ -84,29 +96,38 @@ def _drain_input():
         cli._INPUT.get_nowait()
 
 
-def test_an_interrupted_console_read_is_not_treated_as_eof(monkeypatch):
-    """**这就是"按 Ctrl+C 程序直接退了"的真凶。**
+def test_a_console_empty_read_is_not_eof(monkeypatch):
+    """**"按 Ctrl+C 程序直接退了"的真凶。**
 
-    Ctrl+C 会让控制台的那次读提前返回空串;如果把它当 EOF,读线程会推一个 None
-    然后退出,主循环立刻走 `再见。break` —— 而且之后再按都没用(线程已经没了)。
+    Ctrl+C 会让控制台的那次读返回空串,而且**后续的读也会继续返回空串**。
+    控制台还开着,所以这不能当 EOF:重开 CONIN$ 继续读,绝不能推 None。
     """
     import sys as _sys
     _drain_input()
-    monkeypatch.setattr(_sys, "stdin", _FakeStdin(["", "hello\n"]))
-    cli._stdin_reader_loop()                     # 脚本用完后才遇到真 EOF
+    monkeypatch.setattr(_sys, "stdin", _FakeStdin(["", "hello\n"], tty=True))
+    reopened = {"n": 0}
+
+    def fake_reopen():
+        reopened["n"] += 1
+        return True
+
+    monkeypatch.setattr(cli, "_reopen_console_stdin", fake_reopen)
+    try:
+        cli._stdin_reader_loop()
+    except _Stop:
+        pass                                     # 脚本读完,正常收工
 
     got = []
     while not cli._INPUT.empty():
         got.append(cli._INPUT.get_nowait())
-    # 第一项必须是读到的那一行,不能是 None(假 EOF 被吞掉)
-    assert got[0] == "hello\n"
-    assert got[-1] is None                       # 真正的 EOF 仍然送到
+    assert got == ["hello\n"], "空读被当成 EOF 了"
+    assert reopened["n"] >= 1
 
-
-def test_two_consecutive_empty_reads_are_a_real_eof(monkeypatch):
+def test_a_pipe_empty_read_is_a_real_eof(monkeypatch):
+    """非控制台(管道 / 重定向 / 文件)的空读才是真 EOF —— 脚本输入要靠它收尾。"""
     import sys as _sys
     _drain_input()
-    monkeypatch.setattr(_sys, "stdin", _FakeStdin([]))
+    monkeypatch.setattr(_sys, "stdin", _FakeStdin([], tty=False, stop=False))
     cli._stdin_reader_loop()
     assert cli._INPUT.get_nowait() is None
 

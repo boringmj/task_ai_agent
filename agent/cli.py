@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import atexit
+import os
 import queue
 import signal
 import sys
 import threading
+import time
 from datetime import datetime
 
 from rich.markdown import Markdown
@@ -217,32 +219,49 @@ _IDLE = _Idle()
 _INPUT: "queue.Queue" = queue.Queue()
 
 
+def _reopen_console_stdin() -> bool:
+    """重开控制台输入设备。成功返回 True。
+
+    为什么需要它:Windows 上 Ctrl+C 会把正在进行的那次控制台读打断,`readline()`
+    返回空串 —— **而且后续的读也会立刻返回空串**(实测连续两次,所以"再读一次就知道
+    真假"的办法不管用)。控制台本身并没有关,重开 `CONIN$` 就能继续读。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        enc = getattr(sys.stdin, "encoding", None) or "utf-8"
+        sys.stdin = open("CONIN$", "r", encoding=enc, errors="replace", newline="")
+        return True
+    except OSError:
+        return False
+
+
 def _stdin_reader_loop() -> None:
     """读 stdin,把整行塞进 `_INPUT`;真正的 EOF 塞 `None`。
 
-    **空串不一定是 EOF —— 这是这里最容易写错的一处。** Ctrl+C 会让控制台的那次读
-    提前返回空串(实测:偶发,取决于按下时线程是否正卡在读里)。要是把它当 EOF,
-    主循环就会走"再见。break" —— 表面上就是"按 Ctrl+C 程序直接退了",而且**按几次
-    都一样**,因为读线程已经退出了。
+    **控制台上的空读永远不算 EOF。** 这是踩过两次的坑:Ctrl+C 会把控制台的那次读
+    打断,`readline()` 返回空串,而且之后的读**仍然**返回空串。把它当 EOF,主循环就会
+    走 `再见。break` —— 表现就是"按 Ctrl+C 程序直接退了",怎么改主循环的判断都没用。
+    控制台还在,重开输入设备继续读即可。
 
-    区分办法:立刻**再读一次**。
-      · 真 EOF(stdin 关了 / Ctrl+Z):再读还是立刻返回空串;
-      · 假 EOF(被 Ctrl+C 打断):再读会**阻塞**等下一行 —— 正是我们要的。
-    所以不需要超时、不需要轮询,这个重读本身就区分了两种情况。
+    只有**非控制台**(管道 / 重定向 / 文件)的空串才是真 EOF —— 那种情况下确实没有
+    更多输入了,退出是对的(测试、脚本、`echo ... | agent.py` 都靠这个)。
+
+    代价:控制台上 **Ctrl+Z 不再退出**(它产生的也是一次空读,和被打断的读没法区分)。
+    退出用 `/exit`;管道输入仍然按 EOF 正常结束。
     """
     while True:
         try:
             line = sys.stdin.readline()
-        except Exception:  # noqa: BLE001 - 读崩了按 EOF 处理
+        except Exception:  # noqa: BLE001 - 读崩了也走下面的判断
             line = ""
         if line == "":
-            try:
-                line = sys.stdin.readline()      # 重读一次,见上面的说明
-            except Exception:  # noqa: BLE001
-                line = ""
-            if line == "":
-                _INPUT.put(None)                 # 连续两次空串 → 真 EOF
-                return
+            if sys.stdin.isatty() and _reopen_console_stdin():
+                # 控制台还在:这不是 EOF,是读被打断了(或者是 Ctrl+Z —— 一并忽略)。
+                time.sleep(0.05)          # 极端情况下别空转烧 CPU
+                continue
+            _INPUT.put(None)              # 非控制台 / 重开失败 → 真 EOF
+            return
         _INPUT.put(line)
 
 
@@ -278,8 +297,9 @@ def _read_multiline(prompt: str = "你 > "):
     例外:**第一行本身就是终端指令**(以 / 开头)或裸的 exit/quit 时,回车即执行,
     不必再敲空行 —— 指令天生是单行的,逼人多按一次回车只会烦人。
 
-    **Ctrl+C 只清空当前输入,永不退出程序。** 退出只有两个入口:`/exit`(或裸敲
-    exit/quit)、以及 Ctrl+D / Ctrl+Z 这种真正的 EOF。
+    **Ctrl+C 只清空当前输入,永不退出程序。** 交互式(控制台)下退出只有一个入口:
+    `/exit`(或裸敲 exit/quit)。只有**非控制台**输入(管道 / 重定向 / 文件)结束时,
+    才会通过 EOF 退出 —— 那时确实没有更多输入了。
 
     为什么走到这么绝对:**中断的落点不由用户决定** —— 主线程卡在长阻塞调用里时,
     中断会挂起,等调用返回才落地,而那时程序往往已经回到提示符了(VM 任务/模型请求
@@ -322,7 +342,7 @@ def _read_multiline(prompt: str = "你 > "):
                 if not lines and tasks.attach_settle():
                     console.print(prompt, style="bold cyan", end="", markup=False)
                 continue
-            if line is None:        # EOF(Ctrl+D / Ctrl+Z)
+            if line is None:        # 真 EOF(非控制台输入结束;见 _stdin_reader_loop)
                 sys.stdout.write("\n")
                 return None
             if line in {"\n", "\r\n"}:  # 空行 = 提交
@@ -561,7 +581,7 @@ def _session_loop() -> None:
     except Exception as exc:  # noqa: BLE001
         console.print(f"VM:启动失败(不影响 agent)—— {exc}", style="yellow")
     console.print("多行输入用空行提交;Ctrl+C 只打断当前操作,"
-                  "不会退出程序(退出用 /exit,或 Ctrl+D)。", style="dim")
+                  "不会退出程序(退出用 /exit)。", style="dim")
     console.print("指令:" + "、".join(n for n, *_ in all_commands())
                   + f"(/help 有说明);上下文到 {AUTO_COMPACT_RATIO:.0%} 自动压缩。",
                   style="dim")
