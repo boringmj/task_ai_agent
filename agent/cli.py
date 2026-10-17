@@ -257,15 +257,28 @@ def _read_multiline(prompt: str = "你 > "):
     例外:**第一行本身就是终端指令**(以 / 开头)或裸的 exit/quit 时,回车即执行,
     不必再敲空行 —— 指令天生是单行的,逼人多按一次回车只会烦人。
 
+    **Ctrl+C 只清空当前输入,不退出程序** —— 要连按两次才退(第一次清空并提示,
+    第二次才返回 None)。为什么改成这样:**中断的落点不由用户决定** —— 主线程卡在长
+    阻塞调用里时中断会挂起,等调用返回时往往正好落在提示符上(实测:VM 任务/模型请求
+    期间按的那一下,最后落在这一段)。原来"提示符下 Ctrl+C = 退出",于是用户只是想把
+    刚才那一轮停下来,结果整个程序退了。第一次只清行 + 提示,就把"迟到的中断"降级成
+    一个无害的动作。
+
     返回:输入文本 / `None`(该退出)/ `_IDLE`(先别等了,回去处理子 agent 的事)。
     """
     lines: list[str] = []
-    try:
-        # markup=False:**提示符里会有方括号**(接管时是 "[t2] > ")。开着 markup 的话
-        # rich 会把 `[t2]` 当样式标记、**静默吃掉** —— 实测用户看到的提示符是一个光秃秃的
-        # " > ",完全看不出自己正在接管某个子 agent,于是也就不知道该怎么退出来。
-        console.print(prompt, style="bold cyan", end="", markup=False)
-        while True:
+    armed = False        # 已经按过一次 Ctrl+C;再按一次才真的退出
+    need_prompt = True   # 初次进入、以及每次被打断后,都要补一个提示符
+
+    while True:
+        try:
+            if need_prompt:
+                # markup=False:**提示符里会有方括号**(接管时是 "[t2] > ")。开着 markup 的话
+                # rich 会把 `[t2]` 当样式标记、**静默吃掉** —— 实测用户看到的提示符是一个光秃秃的
+                # " > ",完全看不出自己正在接管某个子 agent,于是也就不知道该怎么退出来。
+                console.print(prompt, style="bold cyan", end="", markup=False)
+                need_prompt = False
+
             line = _take_line(_IDLE_POLL)
             if line is _IDLE:
                 # 等输入的时候定期醒一次,有子 agent 的事就让它插进来。
@@ -291,19 +304,29 @@ def _read_multiline(prompt: str = "你 > "):
             if line in {"\n", "\r\n"}:  # 空行 = 提交
                 break
             lines.append(line.rstrip("\r\n"))
+            armed = False           # 用户又输入了 → 重新计数(不会"隔很久再按一次就退")
             if len(lines) == 1 and (lines[0].lstrip().startswith("/")
                                     or lines[0].strip().lower() in _EXIT_WORDS):
                 break               # 指令:回车即走,连续行提示符都不打
             # 续行提示符用 ASCII 的 "+",别用省略号 —— 那个符号在终端里基本等于
             # "加载中/思考中",看到它会以为程序正忙、在那儿干等一个不会来的回复。
             console.print("+ ", style="dim", end="", markup=False)
-    except KeyboardInterrupt:
-        # 空闲时 Ctrl+C = 退出信号(返回 None)。
-        # 必须包住整个函数(含提示打印),否则中断落在 console.print 里的
-        # os.get_terminal_size() 时(像这次的栈)会从这个函数逃逸,直接崩掉进程。
-        # 恢复打印用裸 write(不走 Rich),避免 get_terminal_size 又被中断引发二次异常。
-        sys.stdout.write("\n")
-        return None
+        except KeyboardInterrupt:
+            # 打断的是"这段输入",不是"整个程序"。恢复打印用裸 write(不走 Rich):
+            # 这时可能刚被打断在 console.print 的 os.get_terminal_size() 里,
+            # 再走一次 Rich 有二次异常的风险。
+            sys.stdout.write("\n")
+            if armed:
+                return None                     # 连按两次 → 真的退出
+            armed = True
+            if lines:
+                lines.clear()
+                sys.stdout.write("(已清空输入;再按一次 Ctrl+C 退出)\n")
+            else:
+                sys.stdout.write("(再按一次 Ctrl+C 退出)\n")
+            need_prompt = True                  # 补回提示符,接着读
+            continue
+
     return "\n".join(lines)
 
 
@@ -428,6 +451,47 @@ def _system_messages() -> list[dict]:
     return messages
 
 
+def _abort_turn(messages: list[dict],
+                note: str = "\n[已取消 —— 上面已经发生的都留着]") -> None:
+    """给「被打断/出错的一轮」收尾:**不回滚,只补合法性**。
+
+    已经说过的话、已经跑完的工具调用全都留着 —— 用户按 Ctrl+C 想停下的是"还在跑的
+    那个东西",不是"把刚才发生的事都抹掉"。
+
+    但半截历史里可能留着一个**没有配对结果的 tool_calls**(正好在工具执行途中被打断),
+    那个直接发给 API 会 400。对策是补一条说明:已经发生的照原样留着,被打断的那一步
+    补一句"结果未知"(不编一个成功 —— 它可能压根没执行)。
+    """
+    n = session.repair_dangling(messages)
+    if n:
+        session.append_messages(messages[len(messages) - n:], current_session_id())
+    console.print(note, style="bold red")
+
+
+def _run_turn(messages: list[dict], text: str | None) -> None:
+    """跑一轮并渲染。**打断和出错都在这里收尾,绝不掀翻整个会话。**
+
+    两条入口共用它,而不是各写一份 try:
+      · 用户发起的(`text` 是输入);
+      · 主 agent 被后台子 agent 叫醒的(`text=None` —— `run(None, …)` 不会追加用户消息)。
+
+    第二个入口原来**完全没被 try 包住**:在那条路上按 Ctrl+C 会直接穿到最外层兜底,
+    于是用户看着 agent 自己干活、想把它停下来,结果整个程序退了(实测报障)。
+    两条路走同一个函数,就不会再出现"一条保护了、另一条忘了"。
+    """
+    try:
+        reply = run(text, messages)
+    except KeyboardInterrupt:
+        _abort_turn(messages)
+        return
+    except Exception as exc:  # noqa: BLE001
+        # 未预期的错误(网络、工具内部崩了……)同样不能掀翻会话。**不回滚**:理由同上,
+        # 而且用户往往正是靠那些已经发生的信息才看得懂出了什么事。
+        _abort_turn(messages, f"\n[出错,本轮中止]{type(exc).__name__}: {exc}")
+        return
+    _render_reply(reply)
+
+
 def _session_loop() -> None:
     _make_stdio_forgiving()
     # stdin 的读取挪到后台线程 —— 主线程才有机会「等输入,但定期醒来看子 agent」
@@ -465,7 +529,8 @@ def _session_loop() -> None:
             console.print(f"VM:{vm_autostart_note()}", style="dim")
     except Exception as exc:  # noqa: BLE001
         console.print(f"VM:启动失败(不影响 agent)—— {exc}", style="yellow")
-    console.print("多行输入用空行提交;执行中 Ctrl+C 取消本轮,空闲时退出。", style="dim")
+    console.print("多行输入用空行提交;执行中 Ctrl+C 取消本轮,"
+                  "提示符下连按两次 Ctrl+C 退出。", style="dim")
     console.print("指令:" + "、".join(n for n, *_ in all_commands())
                   + f"(/help 有说明);上下文到 {AUTO_COMPACT_RATIO:.0%} 自动压缩。",
                   style="dim")
@@ -500,8 +565,9 @@ def _session_loop() -> None:
                 # 免得我们的输出和他的输入糊在同一行上。
                 console.print()
                 console.print("(后台子 agent 有结果,主 agent 主动处理)", style="dim")
-                reply = run(None, messages)
-                _render_reply(reply)
+                # **这条分支必须和用户发起的那条走同一个受保护的入口** ——
+                # 原来它裸着:在这里按 Ctrl+C 会一路穿到最外层兜底,直接退出程序。
+                _run_turn(messages, None)
                 continue
 
             user_input = _read_multiline(f"[{watched}] > " if watched else "你 > ")
@@ -565,42 +631,16 @@ def _session_loop() -> None:
                     break
                 continue
 
-            try:
-                reply = run(text, messages)
-            except KeyboardInterrupt:
-                # 执行中 Ctrl+C:**不回滚,只打断。**
-                # 已经说过的话、已经跑完的工具调用全都留着 —— 用户按 Ctrl+C 想停下的是
-                # "还在跑的那个东西",不是"把刚才发生的事都抹掉"。
-                #
-                # 但半截历史里可能留着一个**没有配对结果的 tool_calls**(正好在工具执行
-                # 途中被打断),那个直接发给 API 会 400 —— 这就是原来回滚的原因。
-                # 对策从"删掉整轮"换成"**补一条说明**":已经发生的照原样留着,被打断的
-                # 那一步补一句"结果未知"(不编一个成功 —— 它可能压根没执行)。
-                n = session.repair_dangling(messages)
-                if n:
-                    session.append_messages(messages[len(messages) - n:], current_session_id())
-                console.print("\n[已取消 —— 上面已经发生的都留着]", style="bold red")
-                continue
-            except Exception as exc:  # noqa: BLE001
-                # 未预期的错误(渲染、网络、工具内部崩了……)绝不能掀翻整个会话。
-                # 同样**不回滚**:理由和上面一样,把已经跑完的丢掉太可惜了,而且用户
-                # 往往正是靠那些信息才看得懂出了什么事。修好历史合法性就够了。
-                n = session.repair_dangling(messages)
-                if n:
-                    session.append_messages(messages[len(messages) - n:], current_session_id())
-                console.print(f"\n[出错,本轮中止]{type(exc).__name__}: {exc}", style="bold red")
-                continue
-
-            # 消息是**产生一条落一条**的(见 loop._persist),所以这里不用再整体落盘 ——
-            # 中途被打断时,已经发生过的那些已经在盘上了。**只有历史被改写过的情况**
-            # (自动压缩)才需要整体重写,那个由 loop 自己在压缩之后做掉。
-
-            _render_reply(reply)
+            # 一轮的**打断/出错收尾都在 _run_turn 里**(两条入口共用,见那里的说明)。
+            # 消息是产生一条落一条的(见 loop._persist),这里不用再整体落盘。
+            _run_turn(messages, text)
         except KeyboardInterrupt:
-            # 兜底:任何没被上面捕获的 Ctrl+C(例如渲染 Markdown 那一下),
-            # 一律干净退出,而不是抛栈崩掉。
-            console.print("\n再见。", style="dim")
-            break
+            # 兜底:任何没被 _run_turn 接住的中断(例如渲染 Markdown 那一下),
+            # **不退出程序**。用户按 Ctrl+C 想停下的是刚才那一轮,不是关掉整个会话;
+            # 而且这种"迟到"的中断多半是阻塞调用期间按的、直到这里才落地 —— 把它
+            # 当成"用户想退出"是误判。真要退出:/exit,或在提示符上连按两次 Ctrl+C。
+            console.print("\n[已打断]", style="dim")
+            continue
 
 
 if __name__ == "__main__":
