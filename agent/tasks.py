@@ -231,9 +231,11 @@ class Task:
     # 用量和"在等什么"。
     ctx: object = None
     thread: object = None        # 它那条线程(退出时要收拢,见 shutdown)
-    # **结果交到主 agent 手上了吗。** 决定它还要不要再被通报一次 —— 主 agent 干等
-    # 拿到的(wait=true)不该回头再收一遍自己的通报。只活在内存里:重启之后重新通报
+    # **这一轮的结果交到主 agent 手上了吗。** 决定它还要不要再被通报一次 —— 主 agent
+    # 干等拿到的(wait=true)不该回头再收一遍自己的通报。只活在内存里:重启之后重新通报
     # 一次是对的(那会儿主 agent 确实不知道)。
+    # **它是按「轮」算的,不是按任务算的**:每开一轮都要归零(见 _start)—— 上一轮
+    # 报的是「它中断了/它问你话」,不代表这一轮的结果也交代过了。
     delivered: bool = False
     # 被叫停时算哪种结局。默认 closed(不要了);换会话时改成 interrupted ——
     # 那是**暂停**不是丢弃(切回去还能接着做),两者在报告里说的话完全不同。
@@ -513,6 +515,12 @@ def dispatch(prompt: str, vm: bool = False, wait: bool = True,
 
 
 def _start(t: Task) -> None:
+    # **新的一轮 = 新的一份结果,必须重新通报。** delivered 记的是「这一轮的结果
+    # 交到主 agent 手上了吗」,不是「这个任务曾经交过一次」—— 上一轮交代的是
+    # 「它被中断了 / 它问你话 / 上一次干完了」,不该替这一轮把话说完。
+    # 不归零的话:主 agent 处理过中断通报,resume 让它接着干,它干完了却一声不吭,
+    # 只能靠用户提醒才想起来去看(实测)。干等拿到结果的那种由 _wait_for 重新置回 True。
+    t.delivered = False
     t.status = "running"
     t.updated = _now()
     _save(t)

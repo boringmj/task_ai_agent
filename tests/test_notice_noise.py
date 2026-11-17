@@ -85,6 +85,36 @@ def test_compaction_renags_what_it_swallowed(model):
     assert any(f"[子 agent {tid}" in str(m.get("content")) for m in messages)
 
 
+def test_a_resumed_run_is_announced_again(model, slow):
+    """被打断的活接着干完,**要再报一次** —— 上一次报的是「它中断了」,不是结果。
+
+    实测现象:主 agent 处理过那条中断通报后,resume_task 让它接着干;它干完了,
+    主 agent 却收不到任何通知,只能等用户提醒才想起来去看报告。
+    根因是 delivered 在上一轮已经置 True,而恢复时没有归零。
+    """
+    slow["delay"] = 0.8
+    model.set(*[("干着。", [model.call("get_current_time")], "")] * 6)
+    tid = tasks.dispatch("干半截就走", fs=helpers.grant(), wait=False)["task_id"]
+    slow["entered"].wait(10)
+
+    tasks.stop_for_switch(tasks._sid())
+    slow["delay"] = 0.0
+    t = helpers.wait_status(tid, ("interrupted",))
+    assert t.status == "interrupted"
+
+    messages: list[dict] = [{"role": "system", "content": "x"}]
+    _announce(messages, tid)
+    assert t.delivered, "前提:中断那条通报已经交给主 agent 了"
+
+    model.reply("这次真做完了。")
+    tasks.resume(tid, answer="接着把剩下的做完", wait=False)
+    t = helpers.wait_status(tid, ("done",))
+    assert t.status == "done"
+
+    assert t in tasks.needs_attention(), (
+        "重新跑完的结果没有被通报 —— 主 agent 只能等用户提醒才去看")
+
+
 def test_closed_tasks_never_come_back(model):
     """已经验收关闭的**永远**不再出现 —— 不管历史怎么样。"""
     tid = _finished_task(model)
