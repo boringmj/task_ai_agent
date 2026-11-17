@@ -7,7 +7,7 @@ from .core import (
     MODEL,
     client,
 )
-from .llm import stream_model, context_ratio, begin_turn
+from .llm import stream_model, context_ratio, begin_turn, session_headers
 from .tools.media import inject_pending_images
 from .tools.net import reset_turn_searches
 from .tools.registry import TOOLS, dispatch, dispatch_interruptibly, is_long_running
@@ -34,10 +34,15 @@ def compact(messages: list[dict], keep_recent: int = 0) -> str:
 
     req = head + [{"role": "user", "content": prompts.load("compact_instruction")}]
     try:
-        resp = client.chat.completions.create(model=MODEL, messages=req, tools=TOOLS)
+        resp = client.chat.completions.create(
+            model=MODEL, messages=req, tools=TOOLS,
+            extra_headers=session_headers(),     # 压缩也是同一段会话里的请求
+        )
         summary = (resp.choices[0].message.content or "").strip()
         if not summary:                      # 模型跑去调工具了 —— 退一步,不带 tools 再试一次
-            resp = client.chat.completions.create(model=MODEL, messages=req)
+            resp = client.chat.completions.create(
+                model=MODEL, messages=req, extra_headers=session_headers(),
+            )
             summary = (resp.choices[0].message.content or "").strip()
     except Exception as exc:  # noqa: BLE001
         return f"压缩失败:{type(exc).__name__}: {exc}"

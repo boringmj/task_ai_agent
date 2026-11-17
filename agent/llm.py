@@ -123,6 +123,19 @@ def usage_detail() -> str:
     )
 
 
+def session_headers() -> dict[str, str]:
+    """每次请求现取的会话标识(OpenCode Go 用它做路由与 prompt 缓存,缺了直接 400)。
+
+    **不能缓存成常量**:`/switch` 会在运行中换掉会话 id(见 session.current_session_id)。
+    子 agent 是另一段独立对话,加任务 id 后缀区分开 —— 共用主会话的 id 会让多个子 agent
+    的路由与缓存互相干扰。
+    """
+    from . import session          # 延迟导入:session 依赖 core,顶层导入容易成环
+    sid = session.current_session_id()
+    c = ctx.current()
+    return {"x-opencode-session": f"{sid}-{c.task_id}" if c.is_sub and c.task_id else sid}
+
+
 def stream_model(messages: list[dict]) -> tuple[str, list[dict], str]:
     """流式调用模型:实时显示思考(reasoning_content),返回 (正文, tool_calls, 思考文本)。
 
@@ -147,6 +160,7 @@ def stream_model(messages: list[dict]) -> tuple[str, list[dict], str]:
     stream = client.chat.completions.create(
         model=MODEL, messages=messages, tools=TOOLS, stream=True,
         stream_options={"include_usage": True},  # 让末尾那一帧带上 token 用量,供上下文统计
+        extra_headers=session_headers(),         # 每个请求都要带,见该函数的说明
     )
     for chunk in stream:
         _record_usage(getattr(chunk, "usage", None))

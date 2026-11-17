@@ -18,6 +18,12 @@ load_dotenv()
 
 # 模型名称
 MODEL = os.environ.get("MODEL", "deepseek-flash")
+# 模型服务地址(OpenAI 兼容接口)。**只填到 /v1 为止**,SDK 会自己拼 /chat/completions;
+# 填成 .../v1/responses 之类的完整端点会拼出一条不存在的路径(实测 404)。
+# 默认是 OpenCode Go 的基址;换服务商只改 .env,不用动代码。
+BASE_URL = os.environ.get(
+    "OPENAI_BASE_URL", "https://opencode.ai/inference/go/openai/v1"
+)
 # 模型支持的上下文窗口大小
 MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "128000"))
 # 自动压缩阈值大小百分比
@@ -171,10 +177,13 @@ def is_system_dir(path: Path) -> bool:
 
 
 
-# DeepSeek 兼容 OpenAI 协议,只需要换 base_url
+# 兼容 OpenAI 协议的服务都走这一条客户端,换服务商只改 OPENAI_BASE_URL
 client = OpenAI(
     api_key=os.environ["DEEPSEEK_API_KEY"],
-    base_url="https://api.deepseek.com",
+    base_url=BASE_URL,
+    # OpenCode Go 要求客户端自报身份(不能是通用 SDK/HTTP 库名),否则流量会被当成滥用。
+    # 会话标识不放在这里 —— 它会随 /switch 变,所以每次请求现取(见 llm.session_headers)。
+    default_headers={"User-Agent": "task-ai-agent/1.0"},
 )
 
 # 负责终端渲染:Markdown 排版、代码高亮,以及 Windows 老控制台的 ANSI 支持
